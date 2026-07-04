@@ -21,21 +21,6 @@ built-in player. Just a feed URL.
 > Status: MVP + v1 feature-complete (library scan, web UI, cover art, MP3 folders,
 > Tier-2 formats, chapter sidecars, security hardening). See [CHANGELOG](CHANGELOG.md).
 
-## Why not just use Audiobookshelf / Bokskog / audio-feeder?
-
-Podspine is deliberately *not* a media server. It does one thing — files in,
-per-chapter feed out — and does it well. If you want a full library app with a
-player, use Audiobookshelf; Podspine is for people who specifically don't.
-
-| Tool | What it is | Why you might want Podspine instead |
-|---|---|---|
-| **Audiobookshelf** | Full audiobook/podcast media server | Wants you in its own app/UI; M4B-chapters-as-episodes is still an [open request (#4541)](https://github.com/advplyr/audiobookshelf/issues/4541), not the default. Much bigger scope. |
-| **Bokskog** | Folder → RSS, no app | No UI, manual JSON config, needs a Node/TS runtime installed. |
-| **audio-feeder** | Flask app, per-book feeds, splits M4B, QR | Untouched for years; feels unfinished/unmaintained. |
-| **Podspine** | Folder → per-chapter feed + tiny browse/QR UI | Single static binary or one container, zero-config, correct sequential chapters, actively scoped to this one job. |
-
-<!-- Maintainer: this table is drawn from the validated competitor analysis; tweak claims/links as you see fit before release. -->
-
 ## Quick start
 
 ### Docker (recommended)

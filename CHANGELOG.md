@@ -8,10 +8,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
-## [1.0.0] - 2026-07-04
-
-> Maintainer: confirm the version/date when you cut the tag; this section is the
-> prepared first-release entry.
+## [1.0.0]
 
 First tagged release: a zero-config, self-hosted server that turns a folder of
 audiobooks into per-chapter podcast RSS feeds any podcatcher can play.
