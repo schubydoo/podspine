@@ -24,7 +24,12 @@ async fn main() -> Result<()> {
 
     scan_library(&config.library, &config.data_dir, &index);
 
-    let state = AppState::new(index, config.base_url.clone(), &config.data_dir);
+    let state = AppState::new(
+        index,
+        config.base_url.clone(),
+        &config.data_dir,
+        config.default_cover_url.clone(),
+    );
     serve(config.bind, state).await.context("serving")?;
     Ok(())
 }

@@ -78,7 +78,14 @@ async fn serves_feed_and_range_audio() {
     let book = scan_book(&input, &data, &index).unwrap();
     let slug = book.slug.clone();
 
-    let state = AppState::new(index, "http://test".to_string(), &data);
+    // The synthetic book has no embedded cover, so configure a feed-level
+    // fallback to exercise the Task 3.4 default-cover path.
+    let state = AppState::new(
+        index,
+        "http://test".to_string(),
+        &data,
+        Some("http://test/default-cover.png".to_string()),
+    );
     let app = router(state);
 
     // healthz
@@ -109,6 +116,9 @@ async fn serves_feed_and_range_audio() {
     assert_eq!(xml.matches("<item>").count(), 3);
     assert!(xml.contains("<itunes:duration>"));
     assert!(xml.contains(&format!("http://test/audio/{slug}/1")));
+    // No embedded cover -> feed-level fallback image is emitted.
+    assert!(xml.contains("<itunes:image"));
+    assert!(xml.contains("http://test/default-cover.png"));
 
     // unknown slug + missing .xml -> 404
     for uri in ["/feed/nope.xml".to_string(), format!("/feed/{slug}")] {

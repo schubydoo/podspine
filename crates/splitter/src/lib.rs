@@ -106,6 +106,93 @@ pub enum SplitError {
     },
 }
 
+/// Failure modes of a cover extraction. A book with no cover is *not* an error —
+/// the caller checks `has_cover` first; these only cover a genuine ffmpeg failure.
+#[derive(Debug, thiserror::Error)]
+pub enum CoverError {
+    /// `ffmpeg` could not be launched.
+    #[error("failed to launch ffmpeg (is it installed and on PATH?): {0}")]
+    Spawn(#[source] std::io::Error),
+    /// `ffmpeg` ran but exited non-zero. `stderr` is for logs only (never HTTP).
+    #[error("ffmpeg cover extraction failed (exit {code:?}): {stderr}")]
+    Ffmpeg {
+        /// Process exit code, if not killed by a signal.
+        code: Option<i32>,
+        /// Trimmed ffmpeg stderr.
+        stderr: String,
+    },
+    /// The cover file is missing or empty after a "successful" ffmpeg run.
+    #[error("cover extraction produced no output at {path:?}")]
+    OutputMissing {
+        /// Where the cover was expected.
+        path: PathBuf,
+    },
+    /// Could not create the output directory.
+    #[error("could not create output directory {path:?}: {source}")]
+    CreateDir {
+        /// The directory that could not be created.
+        path: PathBuf,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// Extract the embedded cover image of `input` into `out_dir/cover.<ext>` by
+/// **stream copy** (no re-encode), returning the written path. `ext` should match
+/// the cover codec (`"jpg"` for mjpeg, `"png"` for png). The source is only read.
+///
+/// Maps only the first video (attached-picture) stream, so no audio is written.
+pub fn extract_cover(input: &Path, out_dir: &Path, ext: &str) -> Result<PathBuf, CoverError> {
+    fs::create_dir_all(out_dir).map_err(|source| CoverError::CreateDir {
+        path: out_dir.to_path_buf(),
+        source,
+    })?;
+
+    let out_path = out_dir.join(format!("cover.{ext}"));
+    let args = build_cover_args(input, &out_path);
+
+    let output = Command::new("ffmpeg")
+        .args(&args)
+        .output()
+        .map_err(CoverError::Spawn)?;
+    if !output.status.success() {
+        return Err(CoverError::Ffmpeg {
+            code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+
+    let ok = fs::metadata(&out_path)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false);
+    if !ok {
+        return Err(CoverError::OutputMissing { path: out_path });
+    }
+    Ok(out_path)
+}
+
+/// Build the ffmpeg argv for a stream-copy cover extraction (argv vector, never a
+/// shell string). Factored out for a hermetic unit test.
+fn build_cover_args(input: &Path, output: &Path) -> Vec<OsString> {
+    vec![
+        "-nostdin".into(),
+        "-y".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-i".into(),
+        input.as_os_str().to_os_string(),
+        // First (attached-picture) video stream only — drops audio, one frame.
+        "-map".into(),
+        "0:v:0".into(),
+        "-frames:v".into(),
+        "1".into(),
+        "-c".into(),
+        "copy".into(),
+        output.as_os_str().to_os_string(),
+    ]
+}
+
 /// Split every chapter of `input` into `out_dir`, returning one [`SplitEpisode`]
 /// per chapter (fails fast on the first error). Creates `out_dir` if needed and
 /// never modifies `input`.
@@ -260,6 +347,26 @@ mod tests {
             "must move moov atom to head"
         );
         assert_eq!(args.last().unwrap(), "out.m4a", "output path is last");
+    }
+
+    #[test]
+    fn cover_args_copy_first_video_stream_to_named_output() {
+        let args: Vec<String> = build_cover_args(Path::new("in.m4b"), Path::new("out/cover.jpg"))
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let pair = |a: &str, b: &str| args.windows(2).any(|w| w[0] == a && w[1] == b);
+        assert!(
+            pair("-map", "0:v:0"),
+            "must map the attached-picture stream"
+        );
+        assert!(
+            pair("-c", "copy"),
+            "must stream-copy the cover (no re-encode)"
+        );
+        assert!(pair("-frames:v", "1"), "one frame only");
+        assert!(!args.iter().any(|a| a == "-to"));
+        assert_eq!(args.last().unwrap(), "out/cover.jpg", "output path is last");
     }
 
     #[test]

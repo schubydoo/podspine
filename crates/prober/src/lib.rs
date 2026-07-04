@@ -48,6 +48,9 @@ pub struct ProbedBook {
     pub duration_sec: f64,
     /// Whether the file carries an embedded cover-art stream.
     pub has_cover: bool,
+    /// Codec of the embedded cover stream (e.g. `"mjpeg"`, `"png"`), if any.
+    /// Lets the extractor stream-copy the cover to the right file extension.
+    pub cover_codec: Option<String>,
     /// Embedded chapters in file order. Empty for a chapter-less file.
     pub chapters: Vec<Chapter>,
 }
@@ -130,6 +133,7 @@ mod raw {
     #[derive(Deserialize)]
     pub struct Stream {
         pub codec_type: Option<String>,
+        pub codec_name: Option<String>,
         pub duration: Option<String>,
         #[serde(default)]
         pub disposition: Disposition,
@@ -174,10 +178,12 @@ pub fn parse_probe_json(json: &str) -> Result<ProbedBook, ProbeError> {
         return Err(ProbeError::NoAudioStream);
     }
 
-    let has_cover = probe
+    let cover_stream = probe
         .streams
         .iter()
-        .any(|s| s.codec_type.as_deref() == Some("video") && s.disposition.attached_pic == 1);
+        .find(|s| s.codec_type.as_deref() == Some("video") && s.disposition.attached_pic == 1);
+    let has_cover = cover_stream.is_some();
+    let cover_codec = cover_stream.and_then(|s| s.codec_name.clone());
 
     let mut chapters = Vec::with_capacity(probe.chapters.len());
     for (idx, c) in probe.chapters.iter().enumerate() {
@@ -209,6 +215,7 @@ pub fn parse_probe_json(json: &str) -> Result<ProbedBook, ProbeError> {
     Ok(ProbedBook {
         duration_sec,
         has_cover,
+        cover_codec,
         chapters,
     })
 }
@@ -251,6 +258,7 @@ mod tests {
         let book = parse_probe_json(THREE_CHAPTERS).unwrap();
         assert_eq!(book.chapters.len(), 3);
         assert!(book.has_cover);
+        assert_eq!(book.cover_codec.as_deref(), Some("mjpeg"));
         assert!((book.duration_sec - 95.0).abs() < 1e-9);
 
         let c0 = &book.chapters[0];

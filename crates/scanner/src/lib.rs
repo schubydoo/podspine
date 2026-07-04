@@ -22,7 +22,7 @@ use std::time::UNIX_EPOCH;
 use podspine_feed::{episode_guid, pubdate_epoch};
 use podspine_index::{BookRow, EpisodeRow, Index, IndexError};
 use podspine_prober::{ProbeError, probe};
-use podspine_splitter::{ChapterCut, SplitError, split_book};
+use podspine_splitter::{ChapterCut, SplitError, extract_cover, split_book};
 
 /// Extensions we refuse to ingest (DRM). Matched case-insensitively.
 const DRM_EXTENSIONS: &[&str] = &["aax", "aaxc", "aa", "odm"];
@@ -128,12 +128,27 @@ pub fn scan_book_as(
     let cuts: Vec<ChapterCut> = specs.iter().map(|(cut, _)| cut.clone()).collect();
     let episodes = split_book(input, &book_out, &cuts)?;
 
+    // Extract the embedded cover, if any. A missing cover is a normal case, and
+    // an extraction failure never fails the book — we just serve no cover art.
+    let cover_path = if probed.has_cover {
+        let ext = cover_ext(probed.cover_codec.as_deref());
+        match extract_cover(input, &book_out, ext) {
+            Ok(path) => Some(path.to_string_lossy().into_owned()),
+            Err(err) => {
+                tracing::warn!(error = %err, id = %id, "cover extraction failed; serving no cover");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let book = BookRow {
         id: id.clone(),
         slug: id.clone(),
         title: file_stem(input),
         author: None,
-        cover_path: None,
+        cover_path,
         source_path: input.to_string_lossy().into_owned(),
         source_mtime,
         status: "ready".to_string(),
@@ -320,6 +335,15 @@ fn ext_lower(p: &Path) -> Option<String> {
         .map(|e| e.to_ascii_lowercase())
 }
 
+/// File extension for an extracted cover, from its ffprobe codec name. Cover art
+/// is almost always MJPEG or PNG; anything else defaults to `jpg`.
+fn cover_ext(codec: Option<&str>) -> &'static str {
+    match codec {
+        Some("png") => "png",
+        _ => "jpg", // mjpeg/mjpg/jpeg and any unknown codec
+    }
+}
+
 /// Whether a path has a DRM extension we refuse to ingest.
 fn is_drm(p: &Path) -> bool {
     p.extension()
@@ -423,6 +447,70 @@ mod tests {
     fn touch(path: &Path) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, b"x").unwrap();
+    }
+
+    /// Synthesize an AAC file with an embedded (attached-picture) cover.
+    fn synth_with_cover(dir: &Path) -> PathBuf {
+        let input = dir.join("cover.m4a");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=6",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=blue:s=120x120:d=0.1",
+                "-map",
+                "0:a",
+                "-map",
+                "1:v",
+                "-frames:v",
+                "1",
+                "-c:a",
+                "aac",
+                "-c:v",
+                "mjpeg",
+                "-disposition:v:0",
+                "attached_pic",
+            ])
+            .arg(&input)
+            .status()
+            .expect("spawn ffmpeg");
+        assert!(status.success(), "ffmpeg cover synth failed");
+        input
+    }
+
+    #[test]
+    fn cover_ext_by_codec() {
+        assert_eq!(cover_ext(Some("mjpeg")), "jpg");
+        assert_eq!(cover_ext(Some("jpeg")), "jpg");
+        assert_eq!(cover_ext(Some("png")), "png");
+        assert_eq!(cover_ext(None), "jpg");
+    }
+
+    #[test]
+    fn scans_and_extracts_an_embedded_cover() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not available");
+            return;
+        }
+        let dir = scratch("cover");
+        let input = synth_with_cover(&dir);
+        let data = dir.join("data");
+        let index = Index::open_in_memory().unwrap();
+
+        let book = scan_book(&input, &data, &index).unwrap();
+        let cover = book.cover_path.expect("cover extracted");
+        assert!(cover.ends_with("cover.jpg"), "got {cover}");
+        let meta = std::fs::metadata(&cover).expect("cover file on disk");
+        assert!(meta.len() > 0, "cover file non-empty");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

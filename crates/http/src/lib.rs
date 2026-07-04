@@ -49,11 +49,18 @@ pub struct AppState {
     pub base_url: String,
     /// Canonical data dir — resolved audio paths must stay under it.
     pub data_dir: PathBuf,
+    /// Feed-level fallback cover URL for books with no embedded art.
+    pub default_cover_url: Option<String>,
 }
 
 impl AppState {
     /// Build state, canonicalizing the data dir for the path-safety check.
-    pub fn new(index: Index, base_url: String, data_dir: &FsPath) -> Self {
+    pub fn new(
+        index: Index,
+        base_url: String,
+        data_dir: &FsPath,
+        default_cover_url: Option<String>,
+    ) -> Self {
         let data_dir = data_dir
             .canonicalize()
             .unwrap_or_else(|_| data_dir.to_path_buf());
@@ -61,6 +68,7 @@ impl AppState {
             index: Arc::new(Mutex::new(index)),
             base_url,
             data_dir,
+            default_cover_url,
         }
     }
 }
@@ -223,12 +231,19 @@ fn build_feed_xml(state: &AppState, slug: &str) -> Result<String, AppError> {
     };
 
     let base = &state.base_url;
+    // Per-book cover served at /cover/{slug} when extracted; otherwise the
+    // configured feed-level fallback (or no image at all). See Task 3.4.
+    let cover_url = book
+        .cover_path
+        .as_ref()
+        .map(|_| format!("{base}/cover/{slug}"))
+        .or_else(|| state.default_cover_url.clone());
     let feed_book = FeedBook {
         id: book.id,
         title: book.title,
         author: book.author,
         description: None,
-        cover_url: None, // cover serving lands in Task 3.4
+        cover_url,
         source_mtime: book.source_mtime,
         self_url: format!("{base}/feed/{slug}.xml"),
         episodes: episodes

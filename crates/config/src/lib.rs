@@ -36,6 +36,9 @@ pub struct Cli {
     /// External base URL for feed/enclosure links (defaults to the bind address).
     #[arg(long, env = "PODSPINE_BASE_URL")]
     pub base_url: Option<String>,
+    /// Feed-level fallback cover image URL, used for books with no embedded art.
+    #[arg(long, env = "PODSPINE_DEFAULT_COVER_URL")]
+    pub default_cover_url: Option<String>,
     /// Optional TOML config file.
     #[arg(long, env = "PODSPINE_CONFIG")]
     pub config: Option<PathBuf>,
@@ -53,6 +56,8 @@ pub struct FileConfig {
     pub bind: Option<String>,
     /// External base URL.
     pub base_url: Option<String>,
+    /// Feed-level fallback cover image URL.
+    pub default_cover_url: Option<String>,
 }
 
 /// Fully resolved, validated configuration.
@@ -66,6 +71,9 @@ pub struct Config {
     pub bind: SocketAddr,
     /// External base URL, no trailing slash.
     pub base_url: String,
+    /// Feed-level fallback cover image URL for books with no embedded art
+    /// (`None` = emit no `itunes:image` when a book has no cover).
+    pub default_cover_url: Option<String>,
 }
 
 /// Configuration failures — all fatal, all reported at startup.
@@ -162,11 +170,17 @@ impl Config {
             .trim_end_matches('/')
             .to_string();
 
+        let default_cover_url = cli
+            .default_cover_url
+            .clone()
+            .or_else(|| file.default_cover_url.clone());
+
         Ok(Self {
             library,
             data_dir,
             bind,
             base_url,
+            default_cover_url,
         })
     }
 
@@ -289,6 +303,26 @@ mod tests {
     }
 
     #[test]
+    fn default_cover_url_resolves_from_cli_over_file_and_defaults_none() {
+        // Unset everywhere -> None.
+        let c = Config::resolve(&cli(Some("/books")), &FileConfig::default()).unwrap();
+        assert_eq!(c.default_cover_url, None);
+
+        // CLI wins over the TOML layer.
+        let file = FileConfig {
+            default_cover_url: Some("http://toml/cover.png".to_string()),
+            ..Default::default()
+        };
+        let mut cl = cli(Some("/books"));
+        cl.default_cover_url = Some("http://cli/cover.png".to_string());
+        let resolved = Config::resolve(&cl, &file).unwrap();
+        assert_eq!(
+            resolved.default_cover_url.as_deref(),
+            Some("http://cli/cover.png")
+        );
+    }
+
+    #[test]
     fn bad_bind_address_is_rejected() {
         let mut c = cli(Some("/books"));
         c.bind = Some("not-an-address".to_string());
@@ -312,6 +346,7 @@ mod tests {
             data_dir: std::env::temp_dir().join("podspine-cfg-test"),
             bind: "0.0.0.0:8080".parse().unwrap(),
             base_url: "http://localhost:8080".to_string(),
+            default_cover_url: None,
         };
         assert!(matches!(c.validate(), Err(ConfigError::LibraryNotFound(_))));
     }
@@ -327,6 +362,7 @@ mod tests {
             data_dir: data.clone(),
             bind: "0.0.0.0:8080".parse().unwrap(),
             base_url: "http://localhost:8080".to_string(),
+            default_cover_url: None,
         };
         c.validate().unwrap();
         assert!(data.is_dir(), "data dir created");
