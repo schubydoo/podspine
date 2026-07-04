@@ -17,8 +17,10 @@
 //! per-chapter MP3s ingested as one episode per file with **no splitting and no
 //! re-encode** (byte-copied into the data dir, ordered by track number and
 //! falling back to filename order). It assigns collision-free slugs
-//! deterministically and never lets one bad book abort the whole scan. Richer
-//! format tiers come later (Task 3.9).
+//! deterministically and never lets one bad book abort the whole scan. Tier-2
+//! inputs (Ogg Vorbis/Opus/FLAC) are stream-copied into a matching container
+//! (Task 3.9); DRM inputs (AAX/AAXC/`.aa`/`.odm`) are skipped with a logged
+//! notice (PRD W5).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -126,6 +128,10 @@ pub fn scan_book_as(
 
     // Chapters -> (cut, title). Chapter-less -> a single episode over the file.
     let specs: Vec<(ChapterCut, String)> = if resolved.chapters.is_empty() {
+        tracing::warn!(
+            id = %id,
+            "no chapters (embedded or sidecar) — emitting a single-episode feed"
+        );
         vec![(
             ChapterCut {
                 idx: 0,
@@ -154,7 +160,9 @@ pub fn scan_book_as(
     };
     let n = specs.len();
     let cuts: Vec<ChapterCut> = specs.iter().map(|(cut, _)| cut.clone()).collect();
-    let episodes = split_book(input, &book_out, &cuts)?;
+    // Stream-copy into a container matching the source codec (Task 3.9).
+    let out_ext = output_ext(probed.audio_codec.as_deref());
+    let episodes = split_book(input, &book_out, &cuts, out_ext)?;
 
     // Extract the embedded cover, if any. A missing cover is a normal case, and
     // an extraction failure never fails the book — we just serve no cover art.
@@ -389,9 +397,10 @@ impl BookSource {
     }
 }
 
-/// Audio extensions we recognize at the library level. DRM is rejected deeper,
-/// in [`scan_book_as`]; richer tiers (Ogg/Opus/FLAC) arrive in Task 3.9.
-const AUDIO_EXTENSIONS: &[&str] = &["m4b", "m4a", "mp3"];
+/// Audio extensions we recognize at the library level: Tier-1 (M4B/M4A/MP3) and
+/// Tier-2 (Ogg Vorbis/Opus/FLAC, Task 3.9). DRM inputs (AAX/AAXC/`.aa`/`.odm`)
+/// are deliberately absent and logged as skipped during discovery (PRD W5).
+const AUDIO_EXTENSIONS: &[&str] = &["m4b", "m4a", "mp3", "ogg", "oga", "opus", "flac"];
 
 /// Scan a library root of many audiobooks into `index`, writing each book's
 /// episodes under `<data_dir>/books/<slug>/`. One independent book per top-level
@@ -458,8 +467,15 @@ fn discover(library: &Path) -> Vec<BookSource> {
 
     let mut sources = Vec::new();
     for path in entries {
-        if path.is_file() && is_audio(&path) {
-            sources.push(BookSource::File(path));
+        if path.is_file() {
+            if is_drm(&path) {
+                tracing::warn!(
+                    path = %path.display(),
+                    "skipping DRM-protected file (Podspine ships no circumvention)"
+                );
+            } else if is_audio(&path) {
+                sources.push(BookSource::File(path));
+            }
         } else if path.is_dir()
             && let Some(src) = classify_dir(&path)
         {
@@ -528,6 +544,19 @@ fn ext_lower(p: &Path) -> Option<String> {
     p.extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase())
+}
+
+/// Stream-copy output container extension for an audio codec. Each Tier-2 codec
+/// needs its own container (mp4 can't hold FLAC/Vorbis); unknown codecs default
+/// to `m4a` (the Tier-1 case). No re-encode — this only names the muxer.
+fn output_ext(codec: Option<&str>) -> &'static str {
+    match codec {
+        Some("mp3") => "mp3",
+        Some("flac") => "flac",
+        Some("vorbis") => "ogg",
+        Some("opus") => "opus",
+        _ => "m4a", // aac/alac and any unknown codec
+    }
 }
 
 /// File extension for an extracted cover, from its ffprobe codec name. Cover art
@@ -815,6 +844,122 @@ mod tests {
             "force_embedded uses the 3 embedded chapters"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Synthesize an audio file with a specific encoder. `None` if the ffmpeg
+    /// build lacks that encoder (test then skips).
+    fn synth_encoded(dir: &Path, name: &str, enc: &[&str], dur: u32) -> Option<PathBuf> {
+        std::fs::create_dir_all(dir).unwrap();
+        let out = dir.join(name);
+        let ok = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("sine=frequency=300:duration={dur}"),
+            ])
+            .args(enc)
+            .arg(&out)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        ok.then_some(out)
+    }
+
+    #[test]
+    fn output_ext_by_codec() {
+        assert_eq!(output_ext(Some("aac")), "m4a");
+        assert_eq!(output_ext(Some("alac")), "m4a");
+        assert_eq!(output_ext(Some("mp3")), "mp3");
+        assert_eq!(output_ext(Some("flac")), "flac");
+        assert_eq!(output_ext(Some("vorbis")), "ogg");
+        assert_eq!(output_ext(Some("opus")), "opus");
+        assert_eq!(output_ext(None), "m4a");
+    }
+
+    #[test]
+    fn flac_with_cue_splits_by_sidecar_no_reencode() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not available");
+            return;
+        }
+        let dir = scratch("flac-cue");
+        // FLAC has no titled embedded chapters, so it leans on a .cue (PRD S7).
+        let Some(flac) = synth_encoded(&dir, "book.flac", &["-c:a", "flac"], 20) else {
+            eprintln!("skipping: no flac encoder");
+            return;
+        };
+        std::fs::write(
+            flac.with_extension("cue"),
+            "TRACK 01 AUDIO\n  TITLE \"One\"\n  INDEX 01 00:00:00\n\
+             TRACK 02 AUDIO\n  TITLE \"Two\"\n  INDEX 01 00:10:00\n",
+        )
+        .unwrap();
+        let data = dir.join("data");
+        let index = Index::open_in_memory().unwrap();
+
+        let book = scan_book(&flac, &data, &index).unwrap();
+        let eps = index.episodes_for_book(&book.id).unwrap();
+        assert_eq!(eps.len(), 2, "cue defines two chapters");
+        for e in &eps {
+            assert!(
+                e.file_path.ends_with(".flac"),
+                "flac container: {}",
+                e.file_path
+            );
+            assert!(Path::new(&e.file_path).exists());
+            assert!(e.byte_length > 0);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flac_without_cue_degrades_to_single_episode() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not available");
+            return;
+        }
+        let dir = scratch("flac-plain");
+        let Some(flac) = synth_encoded(&dir, "plain.flac", &["-c:a", "flac"], 8) else {
+            eprintln!("skipping: no flac encoder");
+            return;
+        };
+        let data = dir.join("data");
+        let index = Index::open_in_memory().unwrap();
+        let book = scan_book(&flac, &data, &index).unwrap();
+        let eps = index.episodes_for_book(&book.id).unwrap();
+        assert_eq!(eps.len(), 1, "no chapters/cue -> single episode");
+        assert!(eps[0].file_path.ends_with(".flac"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn opus_single_file_ingests_to_opus_container() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not available");
+            return;
+        }
+        let dir = scratch("opus");
+        let flac = synth_encoded(&dir, "b.opus", &["-c:a", "libopus"], 6)
+            .or_else(|| synth_encoded(&dir, "b.opus", &["-c:a", "opus", "-strict", "-2"], 6));
+        let Some(opus) = flac else {
+            eprintln!("skipping: no opus encoder");
+            return;
+        };
+        let data = dir.join("data");
+        let index = Index::open_in_memory().unwrap();
+        let book = scan_book(&opus, &data, &index).unwrap();
+        let eps = index.episodes_for_book(&book.id).unwrap();
+        assert_eq!(eps.len(), 1);
+        assert!(
+            eps[0].file_path.ends_with(".opus"),
+            "got {}",
+            eps[0].file_path
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

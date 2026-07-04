@@ -341,6 +341,8 @@ fn mime_for(path: &str) -> &'static str {
         .as_deref()
     {
         Some("mp3") => "audio/mpeg",
+        Some("flac") => "audio/flac",
+        Some("ogg") | Some("oga") | Some("opus") => "audio/ogg",
         _ => "audio/mp4", // .m4a/.m4b and default
     }
 }
@@ -390,6 +392,9 @@ mod tests {
     fn mime_by_extension() {
         assert_eq!(mime_for("/x/001.m4a"), "audio/mp4");
         assert_eq!(mime_for("/x/001.MP3"), "audio/mpeg");
+        assert_eq!(mime_for("/x/001.flac"), "audio/flac");
+        assert_eq!(mime_for("/x/001.ogg"), "audio/ogg");
+        assert_eq!(mime_for("/x/001.opus"), "audio/ogg");
         assert_eq!(mime_for("/x/blob"), "audio/mp4");
     }
 

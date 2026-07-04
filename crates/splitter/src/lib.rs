@@ -61,7 +61,7 @@ pub struct ChapterCut {
 pub struct SplitEpisode {
     /// Zero-based chapter position this came from.
     pub idx: usize,
-    /// Path to the written `.m4a`.
+    /// Path to the written episode file (container matches `out_ext`).
     pub path: PathBuf,
     /// Real output size in bytes (`fs::metadata().len()`) — for `enclosure length`.
     pub byte_length: u64,
@@ -323,11 +323,13 @@ fn build_cover_args(input: &Path, output: &Path) -> Vec<OsString> {
 
 /// Split every chapter of `input` into `out_dir`, returning one [`SplitEpisode`]
 /// per chapter (fails fast on the first error). Creates `out_dir` if needed and
-/// never modifies `input`.
+/// never modifies `input`. `out_ext` selects the stream-copy output container to
+/// match the source codec (e.g. `"m4a"`, `"mp3"`, `"flac"`, `"ogg"`, `"opus"`).
 pub fn split_book(
     input: &Path,
     out_dir: &Path,
     chapters: &[ChapterCut],
+    out_ext: &str,
 ) -> Result<Vec<SplitEpisode>, SplitError> {
     fs::create_dir_all(out_dir).map_err(|source| SplitError::CreateDir {
         path: out_dir.to_path_buf(),
@@ -336,23 +338,24 @@ pub fn split_book(
 
     let mut episodes = Vec::with_capacity(chapters.len());
     for ch in chapters {
-        episodes.push(split_chapter(input, out_dir, ch)?);
+        episodes.push(split_chapter(input, out_dir, ch, out_ext)?);
     }
     Ok(episodes)
 }
 
-/// Cut a single chapter. Output is `out_dir/{idx+1:03}.m4a`.
+/// Cut a single chapter. Output is `out_dir/{idx+1:03}.{out_ext}`.
 pub fn split_chapter(
     input: &Path,
     out_dir: &Path,
     ch: &ChapterCut,
+    out_ext: &str,
 ) -> Result<SplitEpisode, SplitError> {
     let duration_sec = ch.end_sec - ch.start_sec;
     if duration_sec <= 0.0 {
         return Err(SplitError::EmptyChapter { idx: ch.idx });
     }
 
-    let out_path = out_dir.join(format!("{:03}.m4a", ch.idx + 1));
+    let out_path = out_dir.join(format!("{:03}.{out_ext}", ch.idx + 1));
     let args = build_ffmpeg_args(input, &out_path, ch.start_sec, ch.end_sec);
 
     match run_ffmpeg(&args) {
@@ -394,9 +397,11 @@ pub fn split_chapter(
 ///
 /// Factored out so the ordering invariants (`-ss` before `-i`, `-t` not `-to`,
 /// `-c copy`, `+faststart`) can be asserted in a unit test without ffmpeg.
+/// `+faststart` is an mp4-family muxer option, so it is emitted only for
+/// `.m4a`/`.m4b`/`.mp4` outputs (Tier-2 `.flac`/`.ogg`/`.opus` reject it).
 fn build_ffmpeg_args(input: &Path, output: &Path, start_sec: f64, end_sec: f64) -> Vec<OsString> {
     let duration = (end_sec - start_sec).max(0.0);
-    vec![
+    let mut args: Vec<OsString> = vec![
         "-nostdin".into(),
         "-y".into(),
         "-loglevel".into(),
@@ -415,10 +420,26 @@ fn build_ffmpeg_args(input: &Path, output: &Path, start_sec: f64, end_sec: f64) 
         "-1".into(),
         "-c".into(),
         "copy".into(),
-        "-movflags".into(),
-        "+faststart".into(),
-        output.as_os_str().to_os_string(),
-    ]
+    ];
+    if is_mp4_family(output) {
+        args.push("-movflags".into());
+        args.push("+faststart".into());
+    }
+    args.push(output.as_os_str().to_os_string());
+    args
+}
+
+/// Whether an output path uses an mp4-family container (where `+faststart`
+/// applies). Tier-2 containers (flac/ogg/opus) do not.
+fn is_mp4_family(output: &Path) -> bool {
+    matches!(
+        output
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("m4a" | "m4b" | "mp4")
+    )
 }
 
 /// Format seconds for ffmpeg (fixed decimal, no scientific notation).
@@ -475,6 +496,25 @@ mod tests {
             "must move moov atom to head"
         );
         assert_eq!(args.last().unwrap(), "out.m4a", "output path is last");
+    }
+
+    #[test]
+    fn tier2_output_omits_mp4_only_faststart() {
+        // A .flac output must not carry the mp4-only -movflags option.
+        let args: Vec<String> =
+            build_ffmpeg_args(Path::new("in.flac"), Path::new("out/001.flac"), 0.0, 5.0)
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+        assert!(args.iter().any(|a| a == "copy"), "still stream-copies");
+        assert!(
+            !args.iter().any(|a| a == "-movflags"),
+            "no -movflags for flac"
+        );
+        assert_eq!(args.last().unwrap(), "out/001.flac", "output path is last");
+        // Positive control: mp4 family keeps it.
+        assert!(is_mp4_family(Path::new("x.m4a")));
+        assert!(!is_mp4_family(Path::new("x.ogg")));
     }
 
     #[test]
@@ -570,8 +610,13 @@ mod tests {
             start_sec: 5.0,
             end_sec: 5.0,
         };
-        let err = split_chapter(Path::new("does-not-exist.m4b"), Path::new("/tmp"), &ch)
-            .expect_err("zero-length chapter must error");
+        let err = split_chapter(
+            Path::new("does-not-exist.m4b"),
+            Path::new("/tmp"),
+            &ch,
+            "m4a",
+        )
+        .expect_err("zero-length chapter must error");
         assert!(matches!(err, SplitError::EmptyChapter { idx: 3 }));
     }
 }

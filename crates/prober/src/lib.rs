@@ -46,6 +46,9 @@ impl Chapter {
 pub struct ProbedBook {
     /// Total duration in seconds.
     pub duration_sec: f64,
+    /// Codec of the first audio stream (e.g. `"aac"`, `"mp3"`, `"flac"`,
+    /// `"vorbis"`, `"opus"`). Picks the stream-copy output container (Task 3.9).
+    pub audio_codec: Option<String>,
     /// Whether the file carries an embedded cover-art stream.
     pub has_cover: bool,
     /// Codec of the embedded cover stream (e.g. `"mjpeg"`, `"png"`), if any.
@@ -188,9 +191,10 @@ pub fn parse_probe_json(json: &str) -> Result<ProbedBook, ProbeError> {
         .streams
         .iter()
         .find(|s| s.codec_type.as_deref() == Some("audio"));
-    if audio_stream.is_none() {
+    let Some(audio_stream) = audio_stream else {
         return Err(ProbeError::NoAudioStream);
-    }
+    };
+    let audio_codec = audio_stream.codec_name.clone();
 
     let cover_stream = probe
         .streams
@@ -220,7 +224,8 @@ pub fn parse_probe_json(json: &str) -> Result<ProbedBook, ProbeError> {
         .and_then(|d| d.parse::<f64>().ok())
         .or_else(|| {
             audio_stream
-                .and_then(|s| s.duration.as_deref())
+                .duration
+                .as_deref()
                 .and_then(|d| d.parse::<f64>().ok())
         })
         .or_else(|| chapters.last().map(|c| c.end_sec))
@@ -239,6 +244,7 @@ pub fn parse_probe_json(json: &str) -> Result<ProbedBook, ProbeError> {
 
     Ok(ProbedBook {
         duration_sec,
+        audio_codec,
         has_cover,
         cover_codec,
         track,
@@ -293,6 +299,7 @@ mod tests {
         assert_eq!(book.chapters.len(), 3);
         assert!(book.has_cover);
         assert_eq!(book.cover_codec.as_deref(), Some("mjpeg"));
+        assert_eq!(book.audio_codec.as_deref(), Some("aac"));
         assert!((book.duration_sec - 95.0).abs() < 1e-9);
 
         let c0 = &book.chapters[0];

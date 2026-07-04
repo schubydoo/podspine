@@ -82,7 +82,7 @@ fn run(args: &Args) -> Result<()> {
     };
 
     let cuts: Vec<ChapterCut> = specs.iter().map(|(cut, _)| cut.clone()).collect();
-    let episodes = split_book(&args.input, &book_out, &cuts)
+    let episodes = split_book(&args.input, &book_out, &cuts, "m4a")
         .with_context(|| format!("splitting {}", args.input.display()))?;
 
     let feed_episodes: Vec<FeedEpisode> = episodes

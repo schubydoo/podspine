@@ -50,7 +50,7 @@ fn splits_real_chapters_without_2x_bug_and_leaves_source_untouched() {
     let _ = std::fs::remove_dir_all(&out_dir);
 
     let before = source_fingerprint(&input);
-    let episodes = split_book(&input, &out_dir, &cuts).expect("split first 3 chapters");
+    let episodes = split_book(&input, &out_dir, &cuts, "m4a").expect("split first 3 chapters");
     let after = source_fingerprint(&input);
 
     // Source file must be byte-for-byte untouched.
