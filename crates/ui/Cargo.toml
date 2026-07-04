@@ -1,0 +1,12 @@
+[package]
+name = "podspine-ui"
+description = "maud server-rendered pages: book grid, per-book copy-feed-URL + QR, and per-app 'how to add this' panel. Not a player."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]

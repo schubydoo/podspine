@@ -1,0 +1,75 @@
+# Podspine pre-commit — shift-left quality gate for the Rust/Cargo workspace.
+#
+#   commit stage : fast hygiene + fmt --check + clippy (-D warnings) + lib unit tests   (~seconds)
+#   push  stage  : full workspace test suite (incl. ffmpeg-backed integration tests)
+#
+# cargo audit / cargo deny run in CI only — they need the online advisory DB and are
+# not installed locally. Hook commands mirror .github/workflows/ci.yml exactly so the
+# local gate and CI never drift. Bypass a hook deliberately with SKIP=<id> or --no-verify.
+minimum_pre_commit_version: "3.2.0"
+default_install_hook_types: [pre-commit, pre-push]
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: '^LICENSE$'          # keep the AGPL text byte-exact
+      - id: end-of-file-fixer
+        exclude: '^LICENSE$'
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: detect-private-key
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: check-added-large-files    # nothing big sneaks in next to 500MB+ fixtures
+        args: [--maxkb=1024]
+
+  - repo: local
+    hooks:
+      # Guard: audiobook media must never be committed (fixtures live outside the repo).
+      - id: no-audio-fixtures
+        name: block audio media files
+        entry: "Audio media must not be committed — keep fixtures outside the repo (e.g. /home/claude/audiobooks). Override with: git add -f + SKIP=no-audio-fixtures."
+        language: fail
+        files: '\.(m4b|m4a|mp3|flac|ogg|opus|aax|aaxc|aa)$'
+
+      # ---- commit stage: fast feedback on every commit ----
+      - id: cargo-fmt
+        name: cargo fmt --check
+        entry: cargo fmt --all -- --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy (deny warnings)
+        entry: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-test-unit
+        name: cargo test (lib unit tests)
+        entry: cargo test --workspace --lib
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      # ---- push stage: full suite before code leaves the machine ----
+      - id: cargo-test-full
+        name: cargo test (full workspace suite)
+        entry: cargo test --workspace --all-features
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-push]
+
+      # ---- push stage: CLI end-to-end (uncomment once podspine-cli lands — Task 1.6) ----
+      # - id: e2e-cli
+      #   name: CLI end-to-end smoke tests
+      #   entry: bash scripts/e2e_test.sh
+      #   language: system
+      #   pass_filenames: false
+      #   stages: [pre-push]

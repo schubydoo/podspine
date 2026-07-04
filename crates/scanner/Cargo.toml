@@ -1,0 +1,12 @@
+[package]
+name = "podspine-scanner"
+description = "Watches/scans the library root, classifies inputs by format tier, skips DRM'd files, orchestrates chapters -> splitter -> index."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]

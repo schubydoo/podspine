@@ -1,0 +1,20 @@
+# Rust build artifacts (Cargo.lock IS committed — this is a binary/app)
+/target/
+**/*.rs.bk
+
+# Scratch space — uncommitted docs, data, and scratch files
+/scratch/
+
+# Source planning docs (kept local, not committed for now)
+/idea.md
+/validate.md
+/architecture.md
+
+# Skill-generated planning docs (kept local while iterating)
+/prd.md
+/tad.md
+/tasks.md
+
+# Agent config (normally committed; kept local while planning skills run)
+/CLAUDE.md
+/.claude/

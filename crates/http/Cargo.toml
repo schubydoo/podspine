@@ -1,0 +1,12 @@
+[package]
+name = "podspine-http"
+description = "Axum router: feed, audio (Range), UI, and health routes with tower-http timeout/limit/concurrency layers."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]

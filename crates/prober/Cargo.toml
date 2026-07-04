@@ -1,0 +1,12 @@
+[package]
+name = "podspine-prober"
+description = "Thin ffprobe wrapper: reads embedded chapters, format duration, and cover-art presence."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]

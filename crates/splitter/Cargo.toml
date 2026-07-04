@@ -1,0 +1,12 @@
+[package]
+name = "podspine-splitter"
+description = "ffmpeg wrapper that stream-copies each chapter into a per-episode file; byte length read from the real output."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]

@@ -1,0 +1,12 @@
+[package]
+name = "podspine-feed"
+description = "Builds one podcast RSS channel per book (sequential pubDates, itunes/podcast tags, real enclosure length) with a built-in self-check."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]

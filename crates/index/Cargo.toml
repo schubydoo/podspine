@@ -1,0 +1,12 @@
+[package]
+name = "podspine-index"
+description = "rusqlite access layer (bundled SQLite): book/episode/feed_token schema with idempotent upserts."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]

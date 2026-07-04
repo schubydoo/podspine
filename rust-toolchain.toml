@@ -1,0 +1,6 @@
+[toolchain]
+# Pin to a concrete version once the team wants byte-reproducible builds;
+# `stable` keeps local dev and CI (dtolnay/rust-toolchain@stable) aligned for now.
+# Edition 2024 requires >= 1.85.
+channel = "stable"
+components = ["rustfmt", "clippy"]

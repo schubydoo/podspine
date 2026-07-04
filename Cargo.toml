@@ -1,0 +1,66 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "AGPL-3.0-only"
+repository = "https://github.com/schubydoo/podspine"
+authors = ["schubydoo"]
+
+# Pinned per TAD §3 (verified 2026-07-03). Member crates opt in as each pipeline
+# stage lands (`axum.workspace = true`, etc.); unreferenced entries stay inert.
+[workspace.dependencies]
+# http / serving
+axum = "0.8.9"
+axum-range = "1.0.0"
+axum-extra = { version = "0.12.6", features = ["typed-header"] }
+tower-http = { version = "0.7", features = ["fs", "timeout", "limit", "trace"] }
+tokio = { version = "1.52", features = ["full"] }
+# feed
+rss = "2.1.0"
+# probe / chapters (ffprobe is primary; mp4ameta is the pure-Rust fallback)
+mp4ameta = "0.13.0"
+# index / storage (bundled SQLite compiles into the static binary)
+rusqlite = { version = "0.32", features = ["bundled"] }
+# ui
+maud = "0.26"
+qrcode = "0.14"
+# tokens (v1.5)
+getrandom = "0.2"
+base64 = "0.22"
+blake3 = "1.5"
+# scanning / watching
+notify = "6"
+walkdir = "2"
+# config / cli
+clap = { version = "4", features = ["derive", "env"] }
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# errors
+thiserror = "2"
+anyhow = "1"
+
+[package]
+name = "podspine"
+description = "Self-hosted server that turns audiobook files into per-chapter podcast RSS feeds."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "podspine"
+path = "src/main.rs"
+
+[dependencies]
+# Wired in Sprint 2 (config -> scanner -> http). Empty during the POC scaffold.
