@@ -10,3 +10,6 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+rss = { workspace = true }
+blake3 = { workspace = true }
+time = { workspace = true }
