@@ -1,0 +1,138 @@
+# Podspine
+
+**Turn your audiobook files into per-chapter podcast feeds any podcatcher can play.**
+
+Podspine is a small self-hosted server. Point it at a folder of audiobooks and it
+gives each book its own podcast RSS feed — one episode per chapter, in the right
+order — that you subscribe to in Apple Podcasts, Pocket Casts, Overcast,
+AntennaPod, or anything else that reads RSS. No accounts, no separate app, no
+built-in player. Just a feed URL.
+
+- **Chapters as episodes, in order.** The #1 bug in naive attempts is episodes
+  playing out of order; Podspine emits sequential `pubDate`s (oldest = chapter 1)
+  and `itunes:episode` numbers, and refuses to serve a feed that fails its own
+  self-check.
+- **Zero-config.** `docker run` with your library mounted just works.
+- **Copy-first, no quality loss.** Chapters are split by stream copy (no
+  re-encode) at ingest.
+- **Your files stay yours.** DRM-free input only — Podspine ships no DRM
+  circumvention.
+
+> Status: MVP + v1 feature-complete (library scan, web UI, cover art, MP3 folders,
+> Tier-2 formats, chapter sidecars, security hardening). See [CHANGELOG](CHANGELOG.md).
+
+## Why not just use Audiobookshelf / Bokskog / audio-feeder?
+
+Podspine is deliberately *not* a media server. It does one thing — files in,
+per-chapter feed out — and does it well. If you want a full library app with a
+player, use Audiobookshelf; Podspine is for people who specifically don't.
+
+| Tool | What it is | Why you might want Podspine instead |
+|---|---|---|
+| **Audiobookshelf** | Full audiobook/podcast media server | Wants you in its own app/UI; M4B-chapters-as-episodes is still an [open request (#4541)](https://github.com/advplyr/audiobookshelf/issues/4541), not the default. Much bigger scope. |
+| **Bokskog** | Folder → RSS, no app | No UI, manual JSON config, needs a Node/TS runtime installed. |
+| **audio-feeder** | Flask app, per-book feeds, splits M4B, QR | Untouched for years; feels unfinished/unmaintained. |
+| **Podspine** | Folder → per-chapter feed + tiny browse/QR UI | Single static binary or one container, zero-config, correct sequential chapters, actively scoped to this one job. |
+
+<!-- Maintainer: this table is drawn from the validated competitor analysis; tweak claims/links as you see fit before release. -->
+
+## Quick start
+
+### Docker (recommended)
+
+```bash
+docker run \
+  -v /path/to/audiobooks:/library:ro \
+  -v podspine-data:/data \
+  -p 8080:8080 \
+  -e PODSPINE_BASE_URL=http://<your-lan-ip>:8080 \
+  ghcr.io/schubydoo/podspine:latest
+```
+
+Then open <http://localhost:8080> to browse your books and copy feed URLs.
+
+> **Set `PODSPINE_BASE_URL`** to the address podcatchers will actually reach
+> (your LAN IP or public hostname). It defaults to `http://localhost:8080`, which
+> only works from the same machine — feed and audio URLs are built from it.
+
+`ffmpeg`/`ffprobe` are bundled in the image. The image runs as a non-root user;
+`/data` holds the SQLite index and the split episode files, so keep it on a
+persistent volume.
+
+### Prebuilt binary
+
+Static (musl) binaries for `linux/amd64` and `linux/arm64` are attached to each
+[release](https://github.com/schubydoo/podspine/releases). `ffmpeg` and `ffprobe`
+must be on your `PATH`.
+
+```bash
+podspine --library /path/to/audiobooks --base-url http://<your-lan-ip>:8080
+# → http://localhost:8080
+```
+
+### From source
+
+```bash
+cargo run -- --library ./sample-books
+```
+
+## Configuration
+
+The library path is the only required input; everything else has a default. Each
+option can be set by CLI flag, environment variable, or a TOML file (`--config`),
+in that precedence.
+
+| Flag | Env var | Default | Purpose |
+|---|---|---|---|
+| `--library` | `PODSPINE_LIBRARY` | — (required) | Folder of audiobooks to scan. |
+| `--data-dir` | `PODSPINE_DATA_DIR` | `./data` | SQLite index + split episode files. |
+| `--bind` | `PODSPINE_BIND` | `0.0.0.0:8080` | Address to listen on. |
+| `--base-url` | `PODSPINE_BASE_URL` | `http://localhost:<port>` | External URL used to build feed/audio links. |
+| `--default-cover-url` | `PODSPINE_DEFAULT_COVER_URL` | none | Feed-level fallback cover for books with no embedded art. |
+| `--force-embedded-chapters` | `PODSPINE_FORCE_EMBEDDED_CHAPTERS` | off | Ignore `.cue`/`.ffmeta` sidecars, use embedded chapters. |
+| `--config` | `PODSPINE_CONFIG` | none | Path to an optional TOML config file. |
+
+Endpoints: `/` (browse UI), `/book/{slug}` (feed URL + QR), `/feed/{slug}.xml`
+(the podcast feed), `/audio/{slug}/{n}` (episode audio, HTTP Range), `/healthz`.
+
+## Supported formats
+
+Point Podspine at a folder; each audiobook becomes its own feed. A book can be a
+single file or a per-book subfolder.
+
+| Tier | Formats | Chapter source |
+|---|---|---|
+| **1** | M4B / M4A (AAC/ALAC), single-file MP3, **folder of per-chapter MP3s** | embedded chapters / file (track) order |
+| **2** | OGG Vorbis, Opus, FLAC | embedded chapters, or a `.cue` sidecar (FLAC needs one) |
+
+**Chapter sidecars.** A companion file beside the audio is preferred over
+embedded chapters, in priority order: **`.cue`** (`INDEX 01`, 75 frames/sec) →
+**`.ffmeta`** → embedded. `.opf` / `.nfo` / `.odm` are never treated as chapter
+sources. Use `--force-embedded-chapters` to ignore sidecars.
+
+**DRM.** DRM-protected files — Audible `.aax`/`.aaxc`/`.aa`, OverDrive `.odm` —
+are **skipped** with a logged notice. Podspine ships no DRM circumvention. If you
+own such files, convert them to a DRM-free format (M4B/MP3/FLAC/…) with your own
+tools first, then drop the result in your library.
+
+## Adding a feed to your podcast app
+
+Open the Podspine UI, click a book, and copy its feed URL (or scan the QR code).
+Then see the per-app steps and troubleshooting in **[docs/importing.md](docs/importing.md)**.
+
+## Development
+
+Rust workspace, one crate per pipeline stage. Requires `ffmpeg`/`ffprobe` on
+`PATH`.
+
+```bash
+cargo build           # build
+cargo test --workspace
+cargo clippy --all-targets -- -D warnings
+cargo fmt
+```
+
+## License
+
+[AGPL-3.0-only](LICENSE). Podspine shells out to `ffmpeg`/`ffprobe` as separate
+processes (no linking) and ships no DRM circumvention.
