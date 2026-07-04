@@ -10,3 +10,7 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+clap = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
