@@ -1,18 +1,31 @@
 name: Release
 
-# Cut a release by pushing a tag: `git tag v1.0.0 && git push origin v1.0.0`.
-# This builds static musl binaries for amd64 + arm64, attaches them (with
-# checksums) to a GitHub Release, and pushes a multi-arch image to GHCR. TAD §6.4.
+# On a `v*` tag: build static musl binaries (amd64 + arm64), generate SBOMs,
+# sign the checksums with keyless cosign, attach a SLSA build-provenance file,
+# publish a GitHub Release, and push a multi-arch image to GHCR (with provenance +
+# SBOM, and a cosign signature). TAD §6.4.
+#
+# OpenSSF Scorecard: Signed-Releases — cosign `.sigstore.json` signatures plus a
+# `*.intoto.jsonl` SLSA provenance file; SBOM — CycloneDX SBOMs as release assets.
+#
+# Cut a release: `git tag v1.0.0 && git push origin v1.0.0`.
+#
+# NOTE: action refs are version tags for readability; a Renovate digest-pinning
+# rule (renovate.json) converts them to commit SHAs (Scorecard Pinned-Dependencies).
+
 on:
   push:
-    tags: ['v*']
+    tags: ["v*"]
 
+# Least privilege by default; jobs elevate explicitly.
 permissions:
-  contents: write # create the release + upload binary assets
-  packages: write # push the image to GHCR
+  contents: read
 
-env:
-  CARGO_TERM_COLOR: always
+concurrency:
+  # Releases must not cancel each other — a half-published release is worse than
+  # letting two runs serialize.
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   binaries:
@@ -27,13 +40,13 @@ jobs:
             arch: arm64
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
       # cargo-zigbuild uses zig as the cross linker, so both musl targets build
-      # from an x86_64 runner (incl. rusqlite's bundled SQLite C). Simpler and
-      # more uniform than mixing musl-tools + a separate arm64 toolchain.
+      # from an x86_64 runner (incl. rusqlite's bundled SQLite C).
       - uses: goto-bus-stop/setup-zig@v2
         with:
           version: 0.13.0
@@ -41,33 +54,85 @@ jobs:
         run: cargo install cargo-zigbuild --locked
       - name: Build
         run: cargo zigbuild --release --target ${{ matrix.target }} --bin podspine
-      - name: Stage artifact + checksum
+      - name: Stage binary
         run: |
           mkdir -p "dist/${{ matrix.arch }}"
           cp "target/${{ matrix.target }}/release/podspine" "dist/${{ matrix.arch }}/podspine"
-          cp "dist/${{ matrix.arch }}/podspine" "podspine-${{ github.ref_name }}-linux-${{ matrix.arch }}"
-          sha256sum "podspine-${{ github.ref_name }}-linux-${{ matrix.arch }}" \
-            > "podspine-${{ github.ref_name }}-linux-${{ matrix.arch }}.sha256"
-      # Pass the binary to the image job (matches the Dockerfile's dist/<arch>/).
-      - name: Upload binary for the image build
+      - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.arch }}
           path: dist/${{ matrix.arch }}/podspine
           retention-days: 1
-      - name: Attach to the GitHub Release
+
+  release:
+    name: Sign + provenance + GitHub Release
+    needs: binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release + upload assets
+      id-token: write # Sigstore keyless (Fulcio OIDC) + provenance
+      attestations: write # actions/attest-build-provenance
+    steps:
+      - name: Fetch built binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+      - name: Install syft (SBOMs)
+        uses: anchore/sbom-action/download-syft@v0
+      - name: Assemble, SBOM, checksum, and sign
+        id: assemble
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          cp "artifacts/dist-amd64/podspine" "release/podspine-${TAG}-linux-amd64"
+          cp "artifacts/dist-arm64/podspine" "release/podspine-${TAG}-linux-arm64"
+          cd release
+          for f in podspine-*-linux-*; do
+            syft "$f" -o "cyclonedx-json=${f}.sbom.cdx.json"
+          done
+          # One checksums file over binaries + SBOMs; cosign signs it, so a
+          # verifier trusts every artifact transitively through its hash.
+          sha256sum podspine-*-linux-* *.sbom.cdx.json > checksums.txt
+          cosign sign-blob --bundle checksums.txt.sigstore.json checksums.txt --yes
+      - name: SLSA build provenance
+        id: provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-checksums: release/checksums.txt
+      - name: Attach provenance as a release asset
+        env:
+          BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          [ -s "$BUNDLE" ] || { echo "no provenance bundle produced" >&2; exit 1; }
+          cp "$BUNDLE" release/podspine.intoto.jsonl
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            podspine-${{ github.ref_name }}-linux-${{ matrix.arch }}
-            podspine-${{ github.ref_name }}-linux-${{ matrix.arch }}.sha256
+            release/podspine-*-linux-*
+            release/checksums.txt
+            release/checksums.txt.sigstore.json
+            release/podspine.intoto.jsonl
 
   image:
-    name: Multi-arch image → GHCR
+    name: Multi-arch image → GHCR (provenance + signed)
     needs: binaries
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push to GHCR
+      id-token: write # cosign keyless
+      attestations: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Fetch prebuilt binaries
         uses: actions/download-artifact@v4
         with:
@@ -80,6 +145,8 @@ jobs:
           chmod +x dist/amd64/podspine dist/arm64/podspine
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
@@ -96,6 +163,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -103,3 +171,9 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          provenance: true # SLSA provenance attestation in the registry
+          sbom: true
+      - name: Sign the image (keyless)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "ghcr.io/${{ github.repository }}@${DIGEST}"
