@@ -22,7 +22,12 @@ async fn main() -> Result<()> {
     let config = Config::load().context("resolving configuration")?;
     let index = Index::open(config.data_dir.join("podspine.db")).context("opening the index")?;
 
-    scan_library(&config.library, &config.data_dir, &index);
+    scan_library(
+        &config.library,
+        &config.data_dir,
+        &index,
+        config.force_embedded_chapters,
+    );
 
     let state = AppState::new(
         index,

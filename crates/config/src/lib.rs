@@ -39,6 +39,9 @@ pub struct Cli {
     /// Feed-level fallback cover image URL, used for books with no embedded art.
     #[arg(long, env = "PODSPINE_DEFAULT_COVER_URL")]
     pub default_cover_url: Option<String>,
+    /// Force embedded chapters, ignoring any `.cue`/`.ffmeta` sidecar.
+    #[arg(long, env = "PODSPINE_FORCE_EMBEDDED_CHAPTERS")]
+    pub force_embedded_chapters: bool,
     /// Optional TOML config file.
     #[arg(long, env = "PODSPINE_CONFIG")]
     pub config: Option<PathBuf>,
@@ -58,6 +61,8 @@ pub struct FileConfig {
     pub base_url: Option<String>,
     /// Feed-level fallback cover image URL.
     pub default_cover_url: Option<String>,
+    /// Force embedded chapters, ignoring sidecars.
+    pub force_embedded_chapters: Option<bool>,
 }
 
 /// Fully resolved, validated configuration.
@@ -74,6 +79,8 @@ pub struct Config {
     /// Feed-level fallback cover image URL for books with no embedded art
     /// (`None` = emit no `itunes:image` when a book has no cover).
     pub default_cover_url: Option<String>,
+    /// Ignore `.cue`/`.ffmeta` sidecars and always use embedded chapters.
+    pub force_embedded_chapters: bool,
 }
 
 /// Configuration failures — all fatal, all reported at startup.
@@ -175,12 +182,16 @@ impl Config {
             .clone()
             .or_else(|| file.default_cover_url.clone());
 
+        let force_embedded_chapters =
+            cli.force_embedded_chapters || file.force_embedded_chapters.unwrap_or(false);
+
         Ok(Self {
             library,
             data_dir,
             bind,
             base_url,
             default_cover_url,
+            force_embedded_chapters,
         })
     }
 
@@ -347,6 +358,7 @@ mod tests {
             bind: "0.0.0.0:8080".parse().unwrap(),
             base_url: "http://localhost:8080".to_string(),
             default_cover_url: None,
+            force_embedded_chapters: false,
         };
         assert!(matches!(c.validate(), Err(ConfigError::LibraryNotFound(_))));
     }
@@ -363,6 +375,7 @@ mod tests {
             bind: "0.0.0.0:8080".parse().unwrap(),
             base_url: "http://localhost:8080".to_string(),
             default_cover_url: None,
+            force_embedded_chapters: false,
         };
         c.validate().unwrap();
         assert!(data.is_dir(), "data dir created");

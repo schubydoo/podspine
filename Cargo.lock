@@ -984,6 +984,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "podspine-chapters"
+version = "0.1.0"
+dependencies = [
+ "podspine-prober",
+ "tracing",
+]
+
+[[package]]
 name = "podspine-cli"
 version = "0.1.0"
 dependencies = [
@@ -1053,6 +1061,7 @@ dependencies = [
 name = "podspine-scanner"
 version = "0.1.0"
 dependencies = [
+ "podspine-chapters",
  "podspine-feed",
  "podspine-index",
  "podspine-prober",

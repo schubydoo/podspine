@@ -11,6 +11,7 @@ publish = false
 
 [dependencies]
 podspine-prober = { path = "../prober" }
+podspine-chapters = { path = "../chapters" }
 podspine-splitter = { path = "../splitter" }
 podspine-index = { path = "../index" }
 podspine-feed = { path = "../feed" }

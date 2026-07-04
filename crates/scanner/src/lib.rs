@@ -1,7 +1,9 @@
 //! `scanner` — orchestrate `prober -> splitter -> index`.
 //!
-//! [`scan_book`] probes one audio file, splits its chapters into
-//! `<data>/books/<id>/`, and persists a book + episodes to the index. It:
+//! [`scan_book`] probes one audio file, resolves its chapter source (a sibling
+//! `.cue`/`.ffmeta` sidecar wins over embedded markers unless `force_embedded`,
+//! Task 3.8), splits those chapters into `<data>/books/<id>/`, and persists a
+//! book + episodes to the index. It:
 //! - falls back to a single episode for a chapter-less file,
 //! - is **idempotent**: an unchanged source that is already fully indexed is not
 //!   re-split (guids/pubDates are stable),
@@ -73,18 +75,22 @@ pub enum ScanError {
 /// name. Convenience wrapper over [`scan_book_as`] for single-book callers.
 pub fn scan_book(input: &Path, data_dir: &Path, index: &Index) -> Result<BookRow, ScanError> {
     let id = slugify(&file_stem(input));
-    scan_book_as(input, &id, data_dir, index)
+    scan_book_as(input, &id, data_dir, index, false)
 }
 
 /// Scan one audiobook `input` into `index` under the explicit `id` (also used as
 /// the slug), writing split episodes under `<data_dir>/books/<id>/`. Returns the
 /// persisted [`BookRow`]. The library scanner uses this to assign collision-free
 /// slugs; single-book callers should use [`scan_book`].
+///
+/// `force_embedded` skips sidecar (`.cue`/`.ffmeta`) chapter resolution and uses
+/// the embedded chapters even when a sidecar exists (Task 3.8).
 pub fn scan_book_as(
     input: &Path,
     id: &str,
     data_dir: &Path,
     index: &Index,
+    force_embedded: bool,
 ) -> Result<BookRow, ScanError> {
     if !input.is_file() {
         return Err(ScanError::NotAFile(input.to_path_buf()));
@@ -110,8 +116,16 @@ pub fn scan_book_as(
 
     let probed = probe(input)?;
 
+    // Resolve the chapter source: a sibling `.cue`/`.ffmeta` sidecar wins over
+    // embedded markers unless overridden (Task 3.8).
+    let resolved =
+        podspine_chapters::resolve(input, &probed.chapters, probed.duration_sec, force_embedded);
+    if resolved.source != podspine_chapters::ChapterSource::Embedded {
+        tracing::info!(id = %id, source = ?resolved.source, "using sidecar chapters");
+    }
+
     // Chapters -> (cut, title). Chapter-less -> a single episode over the file.
-    let specs: Vec<(ChapterCut, String)> = if probed.chapters.is_empty() {
+    let specs: Vec<(ChapterCut, String)> = if resolved.chapters.is_empty() {
         vec![(
             ChapterCut {
                 idx: 0,
@@ -121,7 +135,7 @@ pub fn scan_book_as(
             file_stem(input),
         )]
     } else {
-        probed
+        resolved
             .chapters
             .iter()
             .map(|c| {
@@ -383,7 +397,12 @@ const AUDIO_EXTENSIONS: &[&str] = &["m4b", "m4a", "mp3"];
 /// episodes under `<data_dir>/books/<slug>/`. One independent book per top-level
 /// audio file or per-book subfolder. Slugs are collision-free and deterministic
 /// across re-scans; a single failing book is logged and skipped, never fatal.
-pub fn scan_library(library: &Path, data_dir: &Path, index: &Index) -> ScanSummary {
+pub fn scan_library(
+    library: &Path,
+    data_dir: &Path,
+    index: &Index,
+    force_embedded: bool,
+) -> ScanSummary {
     let sources = discover(library);
 
     let mut seen = HashSet::new();
@@ -393,16 +412,18 @@ pub fn scan_library(library: &Path, data_dir: &Path, index: &Index) -> ScanSumma
         // slug is stable across re-scans regardless of siblings' outcomes.
         let slug = unique_slug(&slugify(&source.base_name()), &mut seen);
         match source {
-            BookSource::File(path) => match scan_book_as(&path, &slug, data_dir, index) {
-                Ok(book) => {
-                    summary.indexed += 1;
-                    tracing::info!(slug = %book.slug, title = %book.title, "indexed book");
+            BookSource::File(path) => {
+                match scan_book_as(&path, &slug, data_dir, index, force_embedded) {
+                    Ok(book) => {
+                        summary.indexed += 1;
+                        tracing::info!(slug = %book.slug, title = %book.title, "indexed book");
+                    }
+                    Err(err) => {
+                        summary.skipped += 1;
+                        tracing::warn!(error = %err, path = %path.display(), "skipped");
+                    }
                 }
-                Err(err) => {
-                    summary.skipped += 1;
-                    tracing::warn!(error = %err, path = %path.display(), "skipped");
-                }
-            },
+            }
             BookSource::Mp3Folder(dir) => match scan_mp3_folder(&dir, &slug, data_dir, index) {
                 Ok(book) => {
                     summary.indexed += 1;
@@ -701,7 +722,7 @@ mod tests {
 
         let data = root.join("data");
         let index = Index::open_in_memory().unwrap();
-        let summary = scan_library(&root, &data, &index);
+        let summary = scan_library(&root, &data, &index, false);
         assert_eq!(summary.indexed, 1);
         assert_eq!(summary.skipped, 0);
 
@@ -748,7 +769,7 @@ mod tests {
 
         let data = root.join("data");
         let index = Index::open_in_memory().unwrap();
-        assert_eq!(scan_library(&root, &data, &index).indexed, 1);
+        assert_eq!(scan_library(&root, &data, &index, false).indexed, 1);
         let books = index.list_books().unwrap();
         let eps = index.episodes_for_book(&books[0].id).unwrap();
         assert_eq!(eps.len(), 2);
@@ -757,6 +778,44 @@ mod tests {
         assert!((eps[1].duration_sec - 4.0).abs() < 0.6, "02-body second");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cue_sidecar_overrides_embedded_chapters() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not available");
+            return;
+        }
+        // synth() embeds THREE 10s chapters. A sibling .cue defines only TWO
+        // chapters (0–5s, 5–30s), which must win.
+        let dir = scratch("cue-sidecar");
+        let input = synth(&dir, true); // chapters.m4a, 3 embedded chapters
+        std::fs::write(
+            input.with_extension("cue"),
+            "TRACK 01 AUDIO\n  TITLE \"Front\"\n  INDEX 01 00:00:00\n\
+             TRACK 02 AUDIO\n  TITLE \"Back\"\n  INDEX 01 00:05:00\n",
+        )
+        .unwrap();
+        let data = dir.join("data");
+        let index = Index::open_in_memory().unwrap();
+
+        let book = scan_book(&input, &data, &index).unwrap();
+        let eps = index.episodes_for_book(&book.id).unwrap();
+        assert_eq!(eps.len(), 2, "cue's 2 chapters win over 3 embedded");
+        assert_eq!(eps[0].title, "Front");
+        assert_eq!(eps[1].title, "Back");
+
+        // force_embedded ignores the sidecar -> back to 3 embedded chapters.
+        let data2 = dir.join("data2");
+        let index2 = Index::open_in_memory().unwrap();
+        let book2 = scan_book_as(&input, "forced", &data2, &index2, true).unwrap();
+        assert_eq!(
+            index2.episodes_for_book(&book2.id).unwrap().len(),
+            3,
+            "force_embedded uses the 3 embedded chapters"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -851,7 +910,7 @@ mod tests {
 
         let data = root.join("data");
         let index = Index::open_in_memory().unwrap();
-        let summary = scan_library(&root, &data, &index);
+        let summary = scan_library(&root, &data, &index, false);
 
         assert_eq!(summary.indexed, 2, "both books indexed");
         assert_eq!(summary.skipped, 0);
@@ -880,7 +939,7 @@ mod tests {
 
         let data = root.join("data");
         let index = Index::open_in_memory().unwrap();
-        let summary = scan_library(&root, &data, &index);
+        let summary = scan_library(&root, &data, &index, false);
 
         assert_eq!(summary.indexed, 1, "only the good book");
         assert_eq!(summary.skipped, 2, "unprobeable file + MP3 folder skipped");

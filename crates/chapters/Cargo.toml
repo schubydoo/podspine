@@ -1,0 +1,14 @@
+[package]
+name = "podspine-chapters"
+description = "Chapter-source resolution: prefer a companion sidecar (.cue default, .ffmeta) over embedded chapters."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+podspine-prober = { path = "../prober" }
+tracing = { workspace = true }
