@@ -66,6 +66,22 @@ repos:
         pass_filenames: false
         stages: [pre-push]
 
+      # Supply-chain checks — mirror CI's supply-chain job. No `types` filter:
+      # advisories/licenses can change independent of your source files. Need network.
+      - id: cargo-audit
+        name: cargo audit (RustSec advisories)
+        entry: cargo audit
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: cargo-deny
+        name: cargo deny (licenses/bans/sources/advisories)
+        entry: cargo deny check
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+
       # ---- push stage: CLI end-to-end (uncomment once podspine-cli lands — Task 1.6) ----
       # - id: e2e-cli
       #   name: CLI end-to-end smoke tests
