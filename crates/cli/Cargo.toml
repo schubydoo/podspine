@@ -1,0 +1,21 @@
+[package]
+name = "podspine-cli"
+description = "POC CLI: split one audiobook into per-chapter episodes and emit a self-checked podcast feed."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "podspine-cli"
+path = "src/main.rs"
+
+[dependencies]
+podspine-prober = { path = "../prober" }
+podspine-splitter = { path = "../splitter" }
+podspine-feed = { path = "../feed" }
+clap = { workspace = true }
+anyhow = { workspace = true }
