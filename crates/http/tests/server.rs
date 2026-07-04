@@ -61,6 +61,83 @@ async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
         .to_vec()
 }
 
+/// Synthesize an AAC file with an embedded (attached-picture) cover.
+fn synth_with_cover(dir: &Path) -> PathBuf {
+    let input = dir.join("cover.m4a");
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=6",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=blue:s=120x120:d=0.1",
+            "-map",
+            "0:a",
+            "-map",
+            "1:v",
+            "-frames:v",
+            "1",
+            "-c:a",
+            "aac",
+            "-c:v",
+            "mjpeg",
+            "-disposition:v:0",
+            "attached_pic",
+        ])
+        .arg(&input)
+        .status()
+        .expect("spawn ffmpeg");
+    assert!(status.success(), "ffmpeg cover synth failed");
+    input
+}
+
+#[tokio::test]
+async fn serves_cover_when_present() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+    let dir = std::env::temp_dir().join("podspine-http-cover");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let data = dir.join("data");
+
+    let index = Index::open_in_memory().unwrap();
+    let input = synth_with_cover(&dir);
+    let book = scan_book(&input, &data, &index).unwrap();
+    let slug = book.slug.clone();
+    assert!(
+        book.cover_path.is_some(),
+        "cover should have been extracted"
+    );
+
+    let state = AppState::new(index, "http://test".to_string(), &data, None);
+    let app = router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/cover/{slug}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get(header::CONTENT_TYPE).unwrap(),
+        "image/jpeg"
+    );
+    assert!(!body_bytes(resp).await.is_empty(), "cover bytes served");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn serves_feed_and_range_audio() {
     if !ffmpeg_available() {

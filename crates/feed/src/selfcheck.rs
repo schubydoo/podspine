@@ -258,4 +258,72 @@ mod tests {
         let xml = crate::render_checked(&sample(2)).expect("valid book renders");
         assert!(xml.contains("<itunes:duration>"));
     }
+
+    #[test]
+    fn missing_enclosure_is_rejected() {
+        let mut channel = build_channel(&sample(2));
+        let mut items = channel.items().to_vec();
+        items[0].set_enclosure(None::<rss::Enclosure>);
+        channel.set_items(items);
+        let errors = check(&channel).unwrap_err();
+        assert!(
+            has(&errors, |e| matches!(
+                e,
+                SelfCheckError::MissingEnclosure { idx: 0 }
+            )),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn empty_enclosure_url_is_rejected() {
+        let mut channel = build_channel(&sample(2));
+        let mut items = channel.items().to_vec();
+        let mut enc = items[0].enclosure().unwrap().clone();
+        enc.url = String::new();
+        items[0].set_enclosure(enc);
+        channel.set_items(items);
+        let errors = check(&channel).unwrap_err();
+        assert!(
+            has(&errors, |e| matches!(
+                e,
+                SelfCheckError::MissingEnclosureUrl { idx: 0 }
+            )),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn missing_itunes_episode_is_rejected() {
+        let mut channel = build_channel(&sample(2));
+        let mut items = channel.items().to_vec();
+        let mut it = items[0].itunes_ext().unwrap().clone();
+        it.set_episode(None::<String>);
+        items[0].set_itunes_ext(Some(it));
+        channel.set_items(items);
+        let errors = check(&channel).unwrap_err();
+        assert!(
+            has(&errors, |e| matches!(
+                e,
+                SelfCheckError::MissingItunesEpisode { idx: 0 }
+            )),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_pubdate_is_rejected() {
+        let mut channel = build_channel(&sample(2));
+        let mut items = channel.items().to_vec();
+        items[0].set_pub_date(Some("not a real date".to_string()));
+        channel.set_items(items);
+        let errors = check(&channel).unwrap_err();
+        assert!(
+            has(&errors, |e| matches!(
+                e,
+                SelfCheckError::BadPubDate { idx: 0, .. }
+            )),
+            "{errors:?}"
+        );
+    }
 }

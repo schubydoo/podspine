@@ -451,6 +451,14 @@ fn fmt_secs(v: f64) -> String {
 mod tests {
     use super::*;
 
+    fn have_ffmpeg() -> bool {
+        Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
     fn args_as_strings(start: f64, end: f64) -> Vec<String> {
         build_ffmpeg_args(Path::new("in.m4b"), Path::new("out.m4a"), start, end)
             .iter()
@@ -618,5 +626,47 @@ mod tests {
         )
         .expect_err("zero-length chapter must error");
         assert!(matches!(err, SplitError::EmptyChapter { idx: 3 }));
+    }
+
+    #[test]
+    fn split_maps_a_nonzero_ffmpeg_exit_to_a_split_error() {
+        if !have_ffmpeg() {
+            eprintln!("skipping: ffmpeg not available");
+            return;
+        }
+        // A positive-duration cut on a non-audio input: ffmpeg fails to read it
+        // and exits non-zero, exercising run_ffmpeg's failure path + the mapping.
+        let dir = std::env::temp_dir().join("podspine-split-fail");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bad = dir.join("notaudio.m4a");
+        std::fs::write(&bad, b"definitely not an audio stream").unwrap();
+        let ch = ChapterCut {
+            idx: 0,
+            start_sec: 0.0,
+            end_sec: 5.0,
+        };
+        let err = split_book(&bad, &dir.join("out"), std::slice::from_ref(&ch), "m4a")
+            .expect_err("bad input must fail");
+        assert!(matches!(err, SplitError::Ffmpeg { idx: 0, .. }), "{err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_cover_maps_a_nonzero_ffmpeg_exit_to_a_cover_error() {
+        if !have_ffmpeg() {
+            eprintln!("skipping: ffmpeg not available");
+            return;
+        }
+        // No video stream to map -> ffmpeg exits non-zero -> CoverError::Ffmpeg.
+        let dir = std::env::temp_dir().join("podspine-cover-fail");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bad = dir.join("notaudio.m4a");
+        std::fs::write(&bad, b"no video here").unwrap();
+        let err =
+            extract_cover(&bad, &dir.join("out"), "jpg").expect_err("no cover stream must fail");
+        assert!(matches!(err, CoverError::Ffmpeg { .. }), "{err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -45,7 +45,7 @@ jobs:
         run: cargo deny check
 
   coverage:
-    name: coverage (>= 88% lines)
+    name: coverage (>= 90% lines)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -60,7 +60,7 @@ jobs:
       # cargo-llvm-cov writes lcov.info before the threshold check, so the upload
       # below still runs on a floor failure — surfacing a drop when it matters.
       - name: Coverage (lcov + line floor)
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info --fail-under-lines 88
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info --fail-under-lines 90
       # Codecov is informational (PR comment + trends + per-crate breakdown, see
       # codecov.yml); tokenless for public repos, never fails CI on upload hiccups.
       - name: Upload to Codecov

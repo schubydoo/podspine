@@ -355,4 +355,21 @@ mod tests {
             .unwrap();
         assert!(idx.episodes_for_book("b1").unwrap().is_empty());
     }
+
+    #[test]
+    fn open_persists_to_a_file_across_reopen() {
+        let dir = std::env::temp_dir().join("podspine-index-file");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("podspine.db");
+
+        let idx = Index::open(&db).unwrap();
+        idx.upsert_book(&book("b1", "a-book", "A Book")).unwrap();
+        drop(idx);
+
+        // Reopen the same file: the row (and schema) survived.
+        let reopened = Index::open(&db).unwrap();
+        assert_eq!(reopened.get_book("b1").unwrap().unwrap().title, "A Book");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

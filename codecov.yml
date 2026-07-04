@@ -1,7 +1,7 @@
 # Codecov config. Coverage is REPORTED here for visibility (PR comment + trend
 # graphs + per-crate breakdown); the REAL gate is the CI line floor in
-# .github/workflows/ci.yml (the `coverage (>= 88% lines)` job runs
-# `cargo llvm-cov --fail-under-lines 88`). The `project` status is informational
+# .github/workflows/ci.yml (the `coverage (>= 90% lines)` job runs
+# `cargo llvm-cov --fail-under-lines 90`). The `project` status is informational
 # (a nudge, never a block); `patch` is a real pass/fail traffic light on new-code
 # coverage — but neither is a *required* check unless it's added to branch
 # protection. Coverage uploads from ONE Linux cell, so flags / carryforward /
@@ -10,8 +10,9 @@
 # Rust note: Codecov ingests the lcov that `cargo llvm-cov --lcov` emits directly
 # — no cobertura conversion step.
 #
-# Baseline at setup: ~91% lines (feed/ui/prober/index high; splitter/config the
-# lowest crates; src/main.rs is 0% — it's the live server wiring, not unit-tested).
+# Baseline: ~94% lines excluding src/main.rs (feed/selfcheck/ui/prober/chapters/
+# index all ≥98%; splitter/cli the lowest; src/main.rs is 0% — the live server
+# wiring, not unit-testable — and is excluded from the report via `ignore` below).
 #
 # Validate before deploying changes:
 #   curl -X POST --data-binary @codecov.yml https://api.codecov.io/validate
@@ -28,11 +29,11 @@ codecov:
 coverage:
   precision: 2
   round: down # a strict floor rounds down, matching the CI --fail-under-lines gate
-  range: "85...95" # red->green band around the ~91% baseline
+  range: "88...96" # red->green band around the ~94% baseline
   status:
     project:
       default:
-        target: 88% # mirror the ci.yml line floor
+        target: 90% # mirror the ci.yml line floor
         threshold: 1% # tolerate sub-1% drift before flagging
         informational: true # nudge, never block — ci.yml is the source of truth
     patch:

@@ -387,4 +387,60 @@ mod tests {
         // CI and dev both have ffmpeg on PATH.
         preflight().expect("ffmpeg/ffprobe present");
     }
+
+    #[test]
+    fn resolve_takes_data_dir_bind_base_url_from_the_file_layer() {
+        let file = FileConfig {
+            library: Some(PathBuf::from("/lib")),
+            data_dir: Some(PathBuf::from("/from-toml-data")),
+            bind: Some("127.0.0.1:9999".to_string()),
+            base_url: Some("https://toml.example/".to_string()),
+            default_cover_url: Some("https://toml/cover.png".to_string()),
+            force_embedded_chapters: Some(true),
+        };
+        let c = Config::resolve(&cli(None), &file).unwrap();
+        assert_eq!(c.data_dir, PathBuf::from("/from-toml-data"));
+        assert_eq!(c.bind, "127.0.0.1:9999".parse().unwrap());
+        assert_eq!(c.base_url, "https://toml.example"); // trailing slash trimmed
+        assert_eq!(
+            c.default_cover_url.as_deref(),
+            Some("https://toml/cover.png")
+        );
+        assert!(c.force_embedded_chapters);
+    }
+
+    #[test]
+    fn load_file_none_is_the_empty_default() {
+        let f = load_file(None).unwrap();
+        assert!(f.library.is_none() && f.bind.is_none());
+    }
+
+    #[test]
+    fn load_file_reads_a_toml_file() {
+        let dir = std::env::temp_dir().join("podspine-cfg-load");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("podspine.toml");
+        std::fs::write(&path, "library = \"/books\"\nbind = \"0.0.0.0:3000\"\n").unwrap();
+        let f = load_file(Some(&path)).unwrap();
+        assert_eq!(f.library, Some(PathBuf::from("/books")));
+        assert_eq!(f.bind.as_deref(), Some("0.0.0.0:3000"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_file_missing_path_is_a_read_error() {
+        let err = load_file(Some(Path::new("/no/such/dir/podspine.toml"))).unwrap_err();
+        assert!(matches!(err, ConfigError::ReadConfig { .. }));
+    }
+
+    #[test]
+    fn load_file_malformed_is_a_parse_error() {
+        let dir = std::env::temp_dir().join("podspine-cfg-bad");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.toml");
+        std::fs::write(&path, "this is = not valid = toml").unwrap();
+        let err = load_file(Some(&path)).unwrap_err();
+        assert!(matches!(err, ConfigError::ParseConfig { .. }));
+        let _ = std::fs::remove_file(&path);
+    }
 }

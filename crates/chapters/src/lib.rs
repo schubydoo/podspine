@@ -358,4 +358,40 @@ FILE "book.m4b" WAVE
         assert_eq!(r.source, ChapterSource::Embedded);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn parse_ffmeta_handles_sections_and_edge_keys() {
+        // A trailing [STREAM] section ends the open chapter; an unknown key is
+        // ignored; a zero-denominator TIMEBASE is rejected (default 1/1000
+        // stays); a chapter with no END is dropped.
+        let meta = ";FFMETADATA1\n\
+            [CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=2000\ntitle=One\nARTIST=ignored\n\
+            [CHAPTER]\nTIMEBASE=0/0\nSTART=2000\nEND=6000\ntitle=Two\n\
+            [CHAPTER]\nSTART=6000\ntitle=NoEnd\n\
+            [STREAM]\ncodec=aac\n";
+        let ch = parse_ffmeta(meta);
+        assert_eq!(ch.len(), 2, "the END-less chapter is dropped");
+        assert_eq!(ch[0].end_sec, 2.0);
+        assert_eq!(ch[1].start_sec, 2.0); // TIMEBASE 0/0 rejected -> 1/1000 default
+        assert_eq!(ch[1].end_sec, 6.0);
+    }
+
+    #[test]
+    fn resolve_falls_through_an_empty_cue_to_ffmeta() {
+        let dir = std::env::temp_dir().join("podspine-chapters-fallthrough");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let audio = dir.join("book.m4b");
+        std::fs::write(&audio, b"x").unwrap();
+        // A .cue with no INDEX parses to zero chapters -> fall through to .ffmeta.
+        std::fs::write(dir.join("book.cue"), "REM nothing usable here\n").unwrap();
+        std::fs::write(
+            dir.join("book.ffmeta"),
+            ";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=5000\ntitle=A\n",
+        )
+        .unwrap();
+        let r = resolve(&audio, &embedded(), 100.0, false);
+        assert_eq!(r.source, ChapterSource::Ffmeta);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
