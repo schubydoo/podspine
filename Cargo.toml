@@ -47,6 +47,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # errors
 thiserror = "2"
 anyhow = "1"
+# process control (sync per-child timeout+kill for ffmpeg — the splitter is sync)
+wait-timeout = "0.2"
 
 [package]
 name = "podspine"

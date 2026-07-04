@@ -11,6 +11,7 @@ publish = false
 
 [dependencies]
 thiserror = { workspace = true }
+wait-timeout = { workspace = true }
 
 [dev-dependencies]
 # Integration tests probe the real fixture to get chapters and verify output durations.

@@ -12,10 +12,13 @@
 //!
 //! Book/episode keys are resolved server-side through the index; the file path
 //! served comes from the database (written at scan time), never built from user
-//! input. As defense-in-depth the resolved path is canonicalized and asserted to
-//! live under the data dir. Errors never leak filesystem paths (that detail is
-//! logged, not returned). See TAD §4/§7. Concurrency limits + full traversal
-//! hardening are Task 3.5.
+//! input. Hardening (Task 3.5, TAD §7): every slug is validated against an
+//! allow-list charset ([`valid_slug`]) so `..`/separators/absolute markers 404
+//! before touching the DB or filesystem; as defense-in-depth the resolved audio
+//! path is still canonicalized and asserted to live under the data dir; a
+//! `ConcurrencyLimitLayer` bounds in-flight requests alongside the timeout and
+//! body-limit layers. Errors never leak filesystem paths or ffmpeg stderr (that
+//! detail is logged, collapsed to a bare status for the client). See TAD §4/§7.
 
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
@@ -31,6 +34,7 @@ use axum_extra::TypedHeader;
 use axum_extra::headers::Range;
 use axum_range::{KnownSize, Ranged};
 use tokio::fs::File;
+use tower::limit::ConcurrencyLimitLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
@@ -38,6 +42,23 @@ use tower_http::trace::TraceLayer;
 use podspine_feed::{FeedBook, FeedEpisode, render_checked};
 use podspine_index::Index;
 use podspine_ui::{BookCard, BookDetail, book_page, index_page};
+
+/// Max concurrent in-flight requests before backpressure (DoS guard). Generous
+/// for a homelab tool; only bounds a pathological flood.
+const MAX_INFLIGHT_REQUESTS: usize = 512;
+
+/// Whether a URL slug is safe to use as an opaque index key. Allow-list only:
+/// non-empty and `[a-z0-9-]` — exactly what the scanner's `slugify` produces.
+/// This rejects `..`, `/`, `\`, absolute markers, dots, and any other
+/// separator-bearing or traversal input *before* it reaches the DB or the
+/// filesystem. Callers 404 on rejection (no 403 oracle). Belt to the path
+/// canonicalization suspenders in [`resolve_audio_path`]. See TAD §7 (A01).
+fn valid_slug(slug: &str) -> bool {
+    !slug.is_empty()
+        && slug
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
 
 /// Shared server state.
 #[derive(Clone)]
@@ -89,6 +110,9 @@ pub fn router(state: AppState) -> Router {
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(30),
         ))
+        // Bound in-flight requests (DoS guard); excess requests wait rather than
+        // exhaust resources (NFR-S3, TAD §7).
+        .layer(ConcurrencyLimitLayer::new(MAX_INFLIGHT_REQUESTS))
         // We accept no request bodies; keep them tiny.
         .layer(RequestBodyLimitLayer::new(16 * 1024))
         .with_state(state)
@@ -112,6 +136,9 @@ async fn feed(
     Path(slug_xml): Path<String>,
 ) -> Result<Response, AppError> {
     let slug = slug_xml.strip_suffix(".xml").ok_or(AppError::NotFound)?;
+    if !valid_slug(slug) {
+        return Err(AppError::NotFound);
+    }
     let xml = build_feed_xml(&state, slug)?;
     Ok((
         StatusCode::OK,
@@ -144,6 +171,9 @@ async fn book(
     State(state): State<AppState>,
     Path(slug): Path<String>,
 ) -> Result<Html<String>, AppError> {
+    if !valid_slug(&slug) {
+        return Err(AppError::NotFound);
+    }
     let (book, episode_count) = {
         let index = state.index.lock().map_err(AppError::internal)?;
         let book = index
@@ -175,6 +205,9 @@ async fn cover(
     State(state): State<AppState>,
     Path(slug): Path<String>,
 ) -> Result<Response, AppError> {
+    if !valid_slug(&slug) {
+        return Err(AppError::NotFound);
+    }
     let cover_path = {
         let index = state.index.lock().map_err(AppError::internal)?;
         index
@@ -267,6 +300,9 @@ fn build_feed_xml(state: &AppState, slug: &str) -> Result<String, AppError> {
 
 /// Resolve `(slug, episode number)` to a validated on-disk path.
 fn resolve_audio_path(state: &AppState, slug: &str, number: u32) -> Result<PathBuf, AppError> {
+    if !valid_slug(slug) {
+        return Err(AppError::NotFound);
+    }
     let idx = number.checked_sub(1).ok_or(AppError::NotFound)? as i64;
 
     let file_path = {
@@ -355,6 +391,31 @@ mod tests {
         assert_eq!(mime_for("/x/001.m4a"), "audio/mp4");
         assert_eq!(mime_for("/x/001.MP3"), "audio/mpeg");
         assert_eq!(mime_for("/x/blob"), "audio/mp4");
+    }
+
+    #[test]
+    fn valid_slug_allow_list() {
+        // Accepts exactly what slugify produces.
+        assert!(valid_slug("dune"));
+        assert!(valid_slug("dune-2"));
+        assert!(valid_slug("a1b2-c3"));
+        // Rejects traversal / separators / absolute / case / dots / empty.
+        for bad in [
+            "",
+            "..",
+            "../etc/passwd",
+            "a/b",
+            "a\\b",
+            "/abs",
+            "C:",
+            "Dune",
+            "a.b",
+            "a b",
+            "a%2e",
+            "café",
+        ] {
+            assert!(!valid_slug(bad), "must reject {bad:?}");
+        }
     }
 
     #[test]

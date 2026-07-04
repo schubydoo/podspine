@@ -19,14 +19,28 @@
 //!   never prorated from a bitrate.
 //! - The source file is only ever read; every output lands in `out_dir`.
 //!
-//! The split is synchronous (`std::process::Command`); bounding concurrent jobs
-//! with a semaphore and a per-child timeout/kill is a later, server-side concern
-//! (scanner / Task 3.5), not needed for the CLI POC.
+//! ## Hardening (Task 3.5)
+//! Every ffmpeg spawn goes through [`run_ffmpeg`], which (a) acquires a permit
+//! from a process-wide counting semaphore sized to the CPU count, so concurrent
+//! ffmpeg jobs are bounded, and (b) enforces a per-child wall-clock timeout,
+//! killing a hung child. The splitter is **synchronous** (`std::process`), so
+//! this uses a `std`-built semaphore + the `wait-timeout` crate rather than the
+//! `tokio` primitives the TAD sketched — same guarantees, no async ripple.
 
 use std::ffi::OsString;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::Duration;
+
+use wait_timeout::ChildExt;
+
+/// Per-child ffmpeg wall-clock timeout. A stream-copy of one chapter is seconds;
+/// splitting a whole 10h book is ≤2min (NFR-P1), so any single child running
+/// past this is hung, not slow.
+const FFMPEG_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// A chapter to cut: its position and its `[start, end)` in seconds.
 ///
@@ -78,6 +92,12 @@ pub enum SplitError {
         /// Trimmed ffmpeg stderr.
         stderr: String,
     },
+    /// `ffmpeg` exceeded the per-child timeout and was killed.
+    #[error("ffmpeg timed out on chapter {idx} and was killed")]
+    TimedOut {
+        /// Zero-based chapter position.
+        idx: usize,
+    },
     /// The output file is missing or empty after a "successful" ffmpeg run.
     #[error("chapter {idx} produced no output at {path:?}")]
     OutputMissing {
@@ -121,6 +141,9 @@ pub enum CoverError {
         /// Trimmed ffmpeg stderr.
         stderr: String,
     },
+    /// `ffmpeg` exceeded the per-child timeout and was killed.
+    #[error("ffmpeg timed out extracting the cover and was killed")]
+    TimedOut,
     /// The cover file is missing or empty after a "successful" ffmpeg run.
     #[error("cover extraction produced no output at {path:?}")]
     OutputMissing {
@@ -138,6 +161,113 @@ pub enum CoverError {
     },
 }
 
+/// A minimal `std`-only counting semaphore used to bound how many ffmpeg
+/// children run at once (the splitter is sync, so `tokio::sync::Semaphore` would
+/// not fit). A dropped [`Permit`] releases and wakes one waiter.
+struct Semaphore {
+    permits: Mutex<usize>,
+    cv: Condvar,
+}
+
+struct Permit<'a>(&'a Semaphore);
+
+impl Semaphore {
+    fn acquire(&self) -> Permit<'_> {
+        let mut n = self.permits.lock().unwrap();
+        while *n == 0 {
+            n = self.cv.wait(n).unwrap();
+        }
+        *n -= 1;
+        Permit(self)
+    }
+}
+
+impl Drop for Permit<'_> {
+    fn drop(&mut self) {
+        *self.0.permits.lock().unwrap() += 1;
+        self.0.cv.notify_one();
+    }
+}
+
+/// The process-wide ffmpeg concurrency gate, sized to the CPU count (min 1).
+fn ffmpeg_gate() -> &'static Semaphore {
+    static GATE: OnceLock<Semaphore> = OnceLock::new();
+    GATE.get_or_init(|| {
+        let n = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        Semaphore {
+            permits: Mutex::new(n),
+            cv: Condvar::new(),
+        }
+    })
+}
+
+/// Outcome of a single guarded, time-bounded ffmpeg run.
+enum RunError {
+    /// Could not launch the process.
+    Spawn(std::io::Error),
+    /// Exited non-zero; stderr captured (for logs only).
+    Failed {
+        /// Exit code, if not signalled.
+        code: Option<i32>,
+        /// Trimmed stderr.
+        stderr: String,
+    },
+    /// Exceeded [`FFMPEG_TIMEOUT`] and was killed.
+    TimedOut,
+}
+
+/// Run one ffmpeg invocation under the concurrency gate with a per-child
+/// timeout+kill. stdout is discarded; stderr is captured (small under
+/// `-loglevel error`) so a failure can be logged without leaking it to clients.
+fn run_ffmpeg(args: &[OsString]) -> Result<(), RunError> {
+    let _permit = ffmpeg_gate().acquire();
+
+    let mut child = Command::new("ffmpeg")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(RunError::Spawn)?;
+
+    // Drain stderr on a side thread so a chatty child can't fill the pipe buffer
+    // and stall before exit (which would masquerade as a timeout).
+    let stderr_drain = child.stderr.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = pipe.read_to_string(&mut s);
+            s
+        })
+    });
+    let stderr = || {
+        stderr_drain
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+
+    match child
+        .wait_timeout(FFMPEG_TIMEOUT)
+        .map_err(RunError::Spawn)?
+    {
+        Some(status) if status.success() => Ok(()),
+        Some(status) => Err(RunError::Failed {
+            code: status.code(),
+            stderr: stderr(),
+        }),
+        None => {
+            // Hung child: kill and reap so we don't leak a zombie; the drain
+            // thread then hits EOF and its handle is dropped.
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(RunError::TimedOut)
+        }
+    }
+}
+
 /// Extract the embedded cover image of `input` into `out_dir/cover.<ext>` by
 /// **stream copy** (no re-encode), returning the written path. `ext` should match
 /// the cover codec (`"jpg"` for mjpeg, `"png"` for png). The source is only read.
@@ -152,15 +282,13 @@ pub fn extract_cover(input: &Path, out_dir: &Path, ext: &str) -> Result<PathBuf,
     let out_path = out_dir.join(format!("cover.{ext}"));
     let args = build_cover_args(input, &out_path);
 
-    let output = Command::new("ffmpeg")
-        .args(&args)
-        .output()
-        .map_err(CoverError::Spawn)?;
-    if !output.status.success() {
-        return Err(CoverError::Ffmpeg {
-            code: output.status.code(),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        });
+    match run_ffmpeg(&args) {
+        Ok(()) => {}
+        Err(RunError::Spawn(e)) => return Err(CoverError::Spawn(e)),
+        Err(RunError::Failed { code, stderr }) => {
+            return Err(CoverError::Ffmpeg { code, stderr });
+        }
+        Err(RunError::TimedOut) => return Err(CoverError::TimedOut),
     }
 
     let ok = fs::metadata(&out_path)
@@ -227,17 +355,17 @@ pub fn split_chapter(
     let out_path = out_dir.join(format!("{:03}.m4a", ch.idx + 1));
     let args = build_ffmpeg_args(input, &out_path, ch.start_sec, ch.end_sec);
 
-    let output = Command::new("ffmpeg")
-        .args(&args)
-        .output()
-        .map_err(SplitError::Spawn)?;
-
-    if !output.status.success() {
-        return Err(SplitError::Ffmpeg {
-            idx: ch.idx,
-            code: output.status.code(),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        });
+    match run_ffmpeg(&args) {
+        Ok(()) => {}
+        Err(RunError::Spawn(e)) => return Err(SplitError::Spawn(e)),
+        Err(RunError::Failed { code, stderr }) => {
+            return Err(SplitError::Ffmpeg {
+                idx: ch.idx,
+                code,
+                stderr,
+            });
+        }
+        Err(RunError::TimedOut) => return Err(SplitError::TimedOut { idx: ch.idx }),
     }
 
     // enclosure length MUST come from the real file, never prorated.
@@ -367,6 +495,70 @@ mod tests {
         assert!(pair("-frames:v", "1"), "one frame only");
         assert!(!args.iter().any(|a| a == "-to"));
         assert_eq!(args.last().unwrap(), "out/cover.jpg", "output path is last");
+    }
+
+    #[test]
+    fn semaphore_bounds_and_releases_permits() {
+        let sem = Semaphore {
+            permits: Mutex::new(1),
+            cv: Condvar::new(),
+        };
+        {
+            let _p = sem.acquire();
+            assert_eq!(*sem.permits.lock().unwrap(), 0, "permit taken");
+        }
+        assert_eq!(*sem.permits.lock().unwrap(), 1, "permit released on drop");
+        // Sized to at least one CPU.
+        assert!(*ffmpeg_gate().permits.lock().unwrap() >= 1);
+    }
+
+    #[test]
+    fn hung_ffmpeg_is_killed_by_the_timeout() {
+        fn ffmpeg_available() -> bool {
+            Command::new("ffmpeg")
+                .arg("-version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not available");
+            return;
+        }
+        // A real-time, unbounded encode that never terminates on its own; the
+        // per-child timeout must kill it. Uses a deliberately tiny timeout via a
+        // direct argv, bypassing the 5-min production constant.
+        let args: Vec<OsString> = [
+            "-nostdin",
+            "-loglevel",
+            "error",
+            "-re",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440",
+            "-f",
+            "null",
+            "-",
+        ]
+        .iter()
+        .map(Into::into)
+        .collect();
+
+        let _permit = ffmpeg_gate().acquire();
+        let mut child = Command::new("ffmpeg")
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn ffmpeg");
+        let waited = child
+            .wait_timeout(Duration::from_millis(300))
+            .expect("wait_timeout");
+        assert!(waited.is_none(), "unbounded encode must still be running");
+        child.kill().expect("kill");
+        assert!(child.wait().is_ok(), "reaped after kill");
     }
 
     #[test]

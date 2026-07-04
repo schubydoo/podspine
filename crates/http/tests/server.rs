@@ -213,5 +213,26 @@ async fn serves_feed_and_range_audio() {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
     }
 
+    // Path-traversal / bad-charset slugs are rejected with 404 and no path leak
+    // in the body (NFR-S1). %2e%2e keeps `..` from being normalized by the router.
+    for uri in [
+        "/feed/..%2f..%2fetc%2fpasswd.xml",
+        "/audio/..%2f..%2fetc%2fpasswd/1",
+        "/book/..%2fsecret",
+        "/cover/..%2fsecret",
+        "/feed/Uppercase.xml",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+        assert!(
+            body_bytes(resp).await.is_empty(),
+            "no leak in body for {uri}"
+        );
+    }
+
     let _ = std::fs::remove_dir_all(&dir);
 }
