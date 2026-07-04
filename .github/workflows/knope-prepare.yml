@@ -1,0 +1,77 @@
+name: Prepare Release
+
+# knope's "release PR" half. On push to main, if the Conventional-Commit history
+# since the last tag warrants a release, knope bumps the version + CHANGELOG,
+# resyncs Cargo.lock, force-pushes the `release` branch, and opens/refreshes a
+# `chore: prepare release X.Y.Z` PR. Merging that PR is the approval gate; the
+# merge triggers knope-release.yml.
+#
+# GATED OFF: every job is skipped until the `KNOPE_ENABLED` repo variable is
+# 'true'. Flip it on once the flow is proven. Needs the `podspine-ci` GitHub App
+# (PODSPINE_CI_APP_ID / PODSPINE_CI_APP_PRIVATE_KEY secrets).
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: knope-prepare-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare-release:
+    if: ${{ vars.KNOPE_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      # Short-lived podspine-ci App token. Its identity is what lets the release
+      # PR's eventual merge tag trigger release.yml (a GITHUB_TOKEN-pushed tag
+      # would not, by GitHub's recursion suppression).
+      - name: Mint podspine-ci App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.PODSPINE_CI_APP_ID }}
+          private-key: ${{ secrets.PODSPINE_CI_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Verify App token was minted
+        if: ${{ steps.app-token.outputs.token == '' }}
+        run: |
+          echo "::error::podspine-ci App token mint produced an empty token; check the PODSPINE_CI_APP_ID / PODSPINE_CI_APP_PRIVATE_KEY secrets and the App installation."
+          exit 1
+      # Full history + tags so knope can find the last release tag; persist the App
+      # token so knope's `git push` of the release branch runs as the App identity.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: true
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Configure git identity (podspine-ci App)
+        run: |
+          # Use the App bot's real "<numeric-id>+podspine-ci[bot]@users.noreply.github.com"
+          # once the App exists, so commits attribute to the bot account.
+          git config user.name "podspine-ci[bot]"
+          git config user.email "podspine-ci[bot]@users.noreply.github.com"
+      - name: Install knope
+        uses: knope-dev/action@v2
+        with:
+          version: 0.23.0
+      - name: Open or refresh the release PR (no-op if nothing to release)
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set +e
+          out=$(knope prepare-release --verbose 2>&1); code=$?
+          echo "$out"
+          if [ "$code" -ne 0 ]; then
+            # A "nothing to release" exit on an ordinary push is expected — succeed.
+            echo "$out" | grep -qiE "nothing to release|no changes" && { echo "nothing to release"; exit 0; }
+            exit "$code"
+          fi

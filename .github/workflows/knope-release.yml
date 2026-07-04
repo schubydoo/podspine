@@ -1,0 +1,69 @@
+name: Knope Release
+
+# knope's "publish" half. When the `chore: prepare release X.Y.Z` PR (opened by
+# knope-prepare.yml from the `release` branch) merges, knope creates the GitHub
+# Release + tag from the CHANGELOG notes. Because the tag is pushed as the
+# podspine-ci App (not GITHUB_TOKEN), it triggers release.yml — which does the
+# actual signed build (binaries + SLSA provenance + SBOM + GHCR image). So this
+# workflow deliberately does NOT build or sign anything.
+#
+# GATED OFF behind the `KNOPE_ENABLED` repo variable. Triggered on the release PR
+# MERGING (head branch `release`), not a commit-message marker (squash subjects
+# are editable). Tags the squash commit that actually landed on main.
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+  workflow_dispatch: # manual fallback; run from main once Cargo.toml holds the version
+
+permissions:
+  contents: read
+
+concurrency:
+  group: knope-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: >-
+      ${{ vars.KNOPE_ENABLED == 'true'
+          && ((github.event_name == 'pull_request'
+               && github.event.pull_request.merged == true
+               && github.head_ref == 'release')
+              || (github.event_name == 'workflow_dispatch'
+                  && github.ref == 'refs/heads/main')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Mint podspine-ci App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.PODSPINE_CI_APP_ID }}
+          private-key: ${{ secrets.PODSPINE_CI_APP_PRIVATE_KEY }}
+          permission-contents: write
+      - name: Verify App token was minted
+        if: ${{ steps.app-token.outputs.token == '' }}
+        run: |
+          echo "::error::podspine-ci App token mint produced an empty token; check the PODSPINE_CI_APP_ID / PODSPINE_CI_APP_PRIVATE_KEY secrets and the App installation."
+          exit 1
+      # Tag the squash commit that landed on main (merge_commit_sha), not the
+      # orphaned PR head. Full history + tags for knope's version comparison.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install knope
+        uses: knope-dev/action@v2
+        with:
+          version: 0.23.0
+      # knope creates the GitHub Release + tag as the App token, which triggers
+      # release.yml (the signed build). No-op if the version already has a release.
+      - name: Create the tag + GitHub Release
+        run: knope release --verbose
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
