@@ -17,6 +17,7 @@ tower-http = { workspace = true }
 tokio = { workspace = true }
 podspine-index = { path = "../index" }
 podspine-feed = { path = "../feed" }
+podspine-ui = { path = "../ui" }
 tracing = { workspace = true }
 
 [dev-dependencies]

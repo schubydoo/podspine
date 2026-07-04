@@ -160,5 +160,48 @@ async fn serves_feed_and_range_audio() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
+    // UI: home grid lists the book and links to its page.
+    let resp = app
+        .clone()
+        .oneshot(Request::get("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/html")
+    );
+    let home = String::from_utf8(body_bytes(resp).await).unwrap();
+    assert!(home.contains(&format!("/book/{slug}")));
+
+    // UI: book page carries the exact working feed URL + an inline QR SVG.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/book/{slug}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let page = String::from_utf8(body_bytes(resp).await).unwrap();
+    assert!(page.contains(&format!("http://test/feed/{slug}.xml")));
+    assert!(page.contains("<svg"));
+
+    // Unknown book -> 404; cover with no extracted art (Task 3.4) -> 404.
+    for uri in ["/book/nope".to_string(), format!("/cover/{slug}")] {
+        let resp = app
+            .clone()
+            .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+    }
+
     let _ = std::fs::remove_dir_all(&dir);
 }

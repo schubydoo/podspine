@@ -2,6 +2,9 @@
 //!
 //! Routes:
 //! - `GET /healthz` — liveness.
+//! - `GET /` — the browsable book grid (UI).
+//! - `GET /book/{slug}` — a book's page: copy-feed-URL, QR, how-to panel (UI).
+//! - `GET /cover/{slug}` — the book's cover image (once extracted, Task 3.4).
 //! - `GET /feed/{slug}.xml` — the podcast feed, built from the index and passed
 //!   through the feed self-check before serving.
 //! - `GET /audio/{slug}/{number}` — an episode file with HTTP Range support
@@ -22,7 +25,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum_extra::TypedHeader;
 use axum_extra::headers::Range;
@@ -34,6 +37,7 @@ use tower_http::trace::TraceLayer;
 
 use podspine_feed::{FeedBook, FeedEpisode, render_checked};
 use podspine_index::Index;
+use podspine_ui::{BookCard, BookDetail, book_page, index_page};
 
 /// Shared server state.
 #[derive(Clone)]
@@ -65,6 +69,9 @@ impl AppState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/", get(index))
+        .route("/book/{slug}", get(book))
+        .route("/cover/{slug}", get(cover))
         .route("/feed/{slug}", get(feed))
         .route("/audio/{slug}/{number}", get(audio))
         .layer(TraceLayer::new_for_http())
@@ -102,6 +109,88 @@ async fn feed(
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/rss+xml; charset=utf-8")],
         xml,
+    )
+        .into_response())
+}
+
+/// `GET /` — the browsable book grid.
+async fn index(State(state): State<AppState>) -> Result<Html<String>, AppError> {
+    let books = {
+        let index = state.index.lock().map_err(AppError::internal)?;
+        index.list_books().map_err(AppError::internal)?
+    };
+    let cards: Vec<BookCard> = books
+        .into_iter()
+        .map(|b| BookCard {
+            slug: b.slug,
+            title: b.title,
+            author: b.author,
+            has_cover: b.cover_path.is_some(),
+        })
+        .collect();
+    Ok(Html(index_page(&cards).into_string()))
+}
+
+/// `GET /book/{slug}` — a book's page: copy-feed-URL, QR, how-to panel.
+async fn book(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+) -> Result<Html<String>, AppError> {
+    let (book, episode_count) = {
+        let index = state.index.lock().map_err(AppError::internal)?;
+        let book = index
+            .get_book_by_slug(&slug)
+            .map_err(AppError::internal)?
+            .ok_or(AppError::NotFound)?;
+        let count = index
+            .episodes_for_book(&book.id)
+            .map_err(AppError::internal)?
+            .len();
+        (book, count)
+    };
+
+    let detail = BookDetail {
+        feed_url: format!("{}/feed/{}.xml", state.base_url, book.slug),
+        slug: book.slug,
+        title: book.title,
+        author: book.author,
+        has_cover: book.cover_path.is_some(),
+        episode_count,
+    };
+    Ok(Html(book_page(&detail).into_string()))
+}
+
+/// `GET /cover/{slug}` — the book's cover image. Covers are populated by cover
+/// extraction (Task 3.4); until then books have no cover and this 404s. The
+/// stored path is canonicalized and confirmed under the data dir before serving.
+async fn cover(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+) -> Result<Response, AppError> {
+    let cover_path = {
+        let index = state.index.lock().map_err(AppError::internal)?;
+        index
+            .get_book_by_slug(&slug)
+            .map_err(AppError::internal)?
+            .ok_or(AppError::NotFound)?
+            .cover_path
+            .ok_or(AppError::NotFound)?
+    };
+
+    let canonical = PathBuf::from(&cover_path)
+        .canonicalize()
+        .map_err(|_| AppError::NotFound)?;
+    if !canonical.starts_with(&state.data_dir) {
+        tracing::warn!(slug, "resolved cover path escaped the data dir");
+        return Err(AppError::NotFound);
+    }
+    let bytes = tokio::fs::read(&canonical)
+        .await
+        .map_err(|_| AppError::NotFound)?;
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, image_mime(&cover_path))],
+        bytes,
     )
         .into_response())
 }
@@ -205,6 +294,20 @@ fn mime_for(path: &str) -> &'static str {
     }
 }
 
+/// Hardcoded image MIME by extension for cover serving (no content sniffing).
+fn image_mime(path: &str) -> &'static str {
+    match FsPath::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("webp") => "image/webp",
+        _ => "image/jpeg", // .jpg/.jpeg and default
+    }
+}
+
 /// Handler error — maps to a status code and never leaks internals.
 #[derive(Debug)]
 enum AppError {
@@ -237,5 +340,14 @@ mod tests {
         assert_eq!(mime_for("/x/001.m4a"), "audio/mp4");
         assert_eq!(mime_for("/x/001.MP3"), "audio/mpeg");
         assert_eq!(mime_for("/x/blob"), "audio/mp4");
+    }
+
+    #[test]
+    fn image_mime_by_extension() {
+        assert_eq!(image_mime("/x/cover.jpg"), "image/jpeg");
+        assert_eq!(image_mime("/x/cover.JPEG"), "image/jpeg");
+        assert_eq!(image_mime("/x/cover.png"), "image/png");
+        assert_eq!(image_mime("/x/cover.webp"), "image/webp");
+        assert_eq!(image_mime("/x/blob"), "image/jpeg");
     }
 }

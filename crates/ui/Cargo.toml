@@ -10,3 +10,5 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+maud = { workspace = true }
+qrcode = { workspace = true }
