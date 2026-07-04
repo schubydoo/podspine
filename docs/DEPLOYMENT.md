@@ -74,8 +74,11 @@ volumes:
 ## Prebuilt binary + systemd
 
 Download the static musl binary for your architecture from the
-[releases](https://github.com/schubydoo/podspine/releases) (verify it against its
-`.sha256`), and make sure `ffmpeg`/`ffprobe` are installed. Example unit:
+[releases](https://github.com/schubydoo/podspine/releases) and make sure
+`ffmpeg`/`ffprobe` are installed. Releases are signed — verify before running:
+`cosign verify-blob --bundle checksums.txt.sigstore.json checksums.txt` then
+`sha256sum -c checksums.txt` (see [SECURITY.md](../SECURITY.md#release-artifacts)).
+Example unit:
 
 ```ini
 # /etc/systemd/system/podspine.service

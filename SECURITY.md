@@ -49,5 +49,15 @@ operator can manage their own host," are generally out of scope.
 
 ## Release artifacts
 
-Release binaries ship with **SHA-256 checksums** (the `.sha256` files attached to
-each GitHub Release) — verify a download against its checksum before running.
+Releases are built in GitHub Actions and signed. Each GitHub Release includes a
+`checksums.txt` over the binaries and SBOMs, a keyless **cosign** signature
+(`checksums.txt.sigstore.json`), and a **SLSA build-provenance** file
+(`podspine.intoto.jsonl`); a CycloneDX SBOM is attached per binary. The GHCR
+image carries SLSA provenance plus a cosign signature. Verify before running:
+
+```bash
+cosign verify-blob --bundle checksums.txt.sigstore.json checksums.txt
+sha256sum -c checksums.txt          # then check your download against it
+```
+
+(and `cosign verify` / `gh attestation verify` for the container image).
