@@ -63,6 +63,24 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-features
 
+  test-windows:
+    # Informational: Podspine has no Windows release target and its tests have
+    # never run there. This surfaces the status honestly (green/red) but is
+    # deliberately NOT in the required-checks aggregator, so it can't block
+    # merges. Promote it into the `test` matrix once it's reliably green.
+    name: test (windows, informational)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install ffmpeg
+        run: choco install ffmpeg -y
+      - name: Test
+        run: cargo test --workspace --all-features
+
   coverage:
     name: coverage (>= 90% lines)
     runs-on: ubuntu-latest

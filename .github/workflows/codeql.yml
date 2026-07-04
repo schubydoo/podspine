@@ -1,0 +1,49 @@
+name: CodeQL
+
+# Static analysis (SAST) for Rust via CodeQL — runs on pushes to main, PRs, and
+# a weekly schedule; results land in the Security tab (Code scanning). Not wired
+# into the CI required-checks aggregator, so a new alert never blocks a merge on
+# its own (branch protection can add `code_scanning` separately if wanted).
+#
+# NOTE: action refs are version tags for readability; a Renovate digest-pinning
+# rule (renovate.json) converts them to commit SHAs (Scorecard Pinned-Dependencies).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "27 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: analyze (rust)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      security-events: write # upload results to code scanning
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: rust
+          # Rust extraction is source-based; if analysis ever comes back
+          # incomplete, switch to `build-mode: manual` + a `cargo build` step.
+          build-mode: none
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:rust"
