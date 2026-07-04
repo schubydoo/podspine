@@ -51,6 +51,12 @@ pub struct ProbedBook {
     /// Codec of the embedded cover stream (e.g. `"mjpeg"`, `"png"`), if any.
     /// Lets the extractor stream-copy the cover to the right file extension.
     pub cover_codec: Option<String>,
+    /// Container-level track number (`format.tags.track`, leading integer of
+    /// e.g. `"3"` or `"3/12"`). Used to order per-chapter MP3 folders (Task 3.3).
+    pub track: Option<u32>,
+    /// Container-level title tag (`format.tags.title`), if non-empty. A nicer
+    /// per-episode title than the filename for MP3-folder tracks.
+    pub title: Option<String>,
     /// Embedded chapters in file order. Empty for a chapter-less file.
     pub chapters: Vec<Chapter>,
 }
@@ -161,6 +167,14 @@ mod raw {
     #[derive(Deserialize)]
     pub struct Format {
         pub duration: Option<String>,
+        #[serde(default)]
+        pub tags: FormatTags,
+    }
+
+    #[derive(Deserialize, Default)]
+    pub struct FormatTags {
+        pub track: Option<String>,
+        pub title: Option<String>,
     }
 }
 
@@ -212,12 +226,32 @@ pub fn parse_probe_json(json: &str) -> Result<ProbedBook, ProbeError> {
         .or_else(|| chapters.last().map(|c| c.end_sec))
         .ok_or(ProbeError::DurationUnavailable)?;
 
+    let (track, title) = probe
+        .format
+        .as_ref()
+        .map(|f| {
+            (
+                parse_track(f.tags.track.as_deref()),
+                f.tags.title.clone().filter(|t| !t.is_empty()),
+            )
+        })
+        .unwrap_or((None, None));
+
     Ok(ProbedBook {
         duration_sec,
         has_cover,
         cover_codec,
+        track,
+        title,
         chapters,
     })
+}
+
+/// Parse a track tag (`"3"`, `"03"`, `"3/12"`) into its leading integer.
+fn parse_track(raw: Option<&str>) -> Option<u32> {
+    let s = raw?.trim();
+    let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse::<u32>().ok()
 }
 
 /// Parse a decimal-seconds string (ffprobe `start_time`/`end_time`) into `f64`.
@@ -277,6 +311,28 @@ mod tests {
         for w in book.chapters.windows(2) {
             assert!(w[0].start_sec < w[1].start_sec);
         }
+    }
+
+    #[test]
+    fn parses_track_and_title_tags() {
+        let json = r#"{
+            "streams": [{"codec_type": "audio", "disposition": {"attached_pic": 0}}],
+            "chapters": [],
+            "format": {"duration": "180.0", "tags": {"track": "3/12", "title": "The Third"}}
+        }"#;
+        let book = parse_probe_json(json).unwrap();
+        assert_eq!(book.track, Some(3));
+        assert_eq!(book.title.as_deref(), Some("The Third"));
+    }
+
+    #[test]
+    fn track_parsing_handles_edge_cases() {
+        assert_eq!(parse_track(Some("3")), Some(3));
+        assert_eq!(parse_track(Some("03")), Some(3));
+        assert_eq!(parse_track(Some("7/20")), Some(7));
+        assert_eq!(parse_track(Some("")), None);
+        assert_eq!(parse_track(Some("none")), None);
+        assert_eq!(parse_track(None), None);
     }
 
     #[test]

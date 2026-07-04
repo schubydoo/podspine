@@ -10,10 +10,13 @@
 //!
 //! [`scan_library`] walks a library root of many audiobooks (Task 3.1): each
 //! top-level audio file and each per-book subfolder becomes one independent
-//! book. It distinguishes single-file books (`.m4b`/`.m4a`, or a lone `.mp3`)
-//! from multi-track MP3 folders (recognized here, ingested in Task 3.3), assigns
-//! collision-free slugs deterministically, and never lets one bad book abort the
-//! whole scan. Richer format tiers come later (Task 3.9).
+//! book. It distinguishes single-file books (`.m4b`/`.m4a`, or a lone `.mp3`),
+//! split by chapters, from multi-track **MP3 folders** (Task 3.3) — a folder of
+//! per-chapter MP3s ingested as one episode per file with **no splitting and no
+//! re-encode** (byte-copied into the data dir, ordered by track number and
+//! falling back to filename order). It assigns collision-free slugs
+//! deterministically and never lets one bad book abort the whole scan. Richer
+//! format tiers come later (Task 3.9).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -40,6 +43,17 @@ pub enum ScanError {
     #[error("could not read source mtime for {path}: {source}")]
     Mtime {
         /// The path.
+        path: PathBuf,
+        /// I/O error.
+        source: std::io::Error,
+    },
+    /// An MP3 folder held no ingestable (probeable) audio.
+    #[error("no ingestable audio in folder: {0}")]
+    EmptyFolder(PathBuf),
+    /// A filesystem operation (copy, mkdir, stat) failed during MP3-folder ingest.
+    #[error("i/o error on {path}: {source}")]
+    Io {
+        /// The path involved.
         path: PathBuf,
         /// I/O error.
         source: std::io::Error,
@@ -171,6 +185,163 @@ pub fn scan_book_as(
     Ok(book)
 }
 
+/// One per-chapter MP3 track discovered in a folder, with the metadata needed to
+/// order and index it.
+struct Mp3Track {
+    /// Source path in the library.
+    path: PathBuf,
+    /// Duration in seconds (from ffprobe).
+    duration_sec: f64,
+    /// Track number tag, if present.
+    track: Option<u32>,
+    /// Episode title (ID3 `title` tag, else the file stem).
+    title: String,
+}
+
+/// Ingest a folder of per-chapter MP3s as one book under `id`: one episode per
+/// file, **no splitting and no re-encode** — each MP3 is byte-copied into
+/// `<data_dir>/books/<id>/NNN.mp3` (keeping all served audio under the data dir).
+/// Files are ordered by track number when every track is present and distinct,
+/// otherwise by filename with a warning. Idempotent on an unchanged folder.
+fn scan_mp3_folder(
+    dir: &Path,
+    id: &str,
+    data_dir: &Path,
+    index: &Index,
+) -> Result<BookRow, ScanError> {
+    let files = collect_mp3s(dir);
+    if files.is_empty() {
+        return Err(ScanError::EmptyFolder(dir.to_path_buf()));
+    }
+
+    // Book mtime = newest track mtime: stable while unchanged, bumps on replace.
+    let source_mtime = files
+        .iter()
+        .map(|f| mtime_epoch(f))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+    let book_out = data_dir.join("books").join(id);
+
+    // Idempotency: unchanged and fully present -> no re-probe / re-copy.
+    if let Some(existing) = index.get_book(id)?
+        && existing.source_mtime == source_mtime
+    {
+        let eps = index.episodes_for_book(id)?;
+        if !eps.is_empty() && eps.iter().all(|e| Path::new(&e.file_path).exists()) {
+            return Ok(existing);
+        }
+    }
+
+    // Probe each track for duration/track/title; a corrupt file is skipped, not
+    // fatal to the book.
+    let mut tracks: Vec<Mp3Track> = Vec::new();
+    for path in &files {
+        match probe(path) {
+            Ok(p) => tracks.push(Mp3Track {
+                duration_sec: p.duration_sec,
+                track: p.track,
+                title: p.title.unwrap_or_else(|| file_stem(path)),
+                path: path.clone(),
+            }),
+            Err(err) => {
+                tracing::warn!(error = %err, path = %path.display(), "skipping unprobeable mp3")
+            }
+        }
+    }
+    if tracks.is_empty() {
+        return Err(ScanError::EmptyFolder(dir.to_path_buf()));
+    }
+    order_mp3_tracks(&mut tracks, dir);
+
+    let book = BookRow {
+        id: id.to_string(),
+        slug: id.to_string(),
+        title: dir_name(dir),
+        author: None,
+        cover_path: None,
+        source_path: dir.to_string_lossy().into_owned(),
+        source_mtime,
+        status: "ready".to_string(),
+    };
+    index.upsert_book(&book)?;
+
+    let n = tracks.len();
+    std::fs::create_dir_all(&book_out).map_err(|source| ScanError::Io {
+        path: book_out.clone(),
+        source,
+    })?;
+    for (idx, t) in tracks.iter().enumerate() {
+        let dest = book_out.join(format!("{:03}.mp3", idx + 1));
+        std::fs::copy(&t.path, &dest).map_err(|source| ScanError::Io {
+            path: dest.clone(),
+            source,
+        })?;
+        let byte_length = std::fs::metadata(&dest)
+            .map_err(|source| ScanError::Io {
+                path: dest.clone(),
+                source,
+            })?
+            .len();
+        index.upsert_episode(&EpisodeRow {
+            guid: episode_guid(id, idx, source_mtime),
+            book_id: id.to_string(),
+            idx: idx as i64,
+            title: t.title.clone(),
+            file_path: dest.to_string_lossy().into_owned(),
+            byte_length: byte_length as i64,
+            duration_sec: t.duration_sec,
+            pubdate_epoch: pubdate_epoch(source_mtime, idx, n),
+        })?;
+    }
+
+    Ok(book)
+}
+
+/// Order tracks by track number when every one is present and the numbers are
+/// distinct; otherwise fall back to a case-insensitive filename sort (warning).
+fn order_mp3_tracks(tracks: &mut [Mp3Track], dir: &Path) {
+    let numbers: Option<Vec<u32>> = tracks.iter().map(|t| t.track).collect();
+    let usable = numbers.as_ref().is_some_and(|v| {
+        let distinct: HashSet<u32> = v.iter().copied().collect();
+        distinct.len() == v.len()
+    });
+    if usable {
+        tracks.sort_by_key(|t| t.track.unwrap());
+    } else {
+        tracing::warn!(
+            path = %dir.display(),
+            "MP3 folder has missing or duplicate track numbers; ordering by filename"
+        );
+        tracks.sort_by_key(|t| {
+            t.path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default()
+        });
+    }
+}
+
+/// Collect the top-level `.mp3` files in `dir` (unordered; the caller sorts).
+fn collect_mp3s(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && ext_lower(p).as_deref() == Some("mp3"))
+        .collect()
+}
+
+/// A directory's own name (fallback `"book"`), used as an MP3-folder book title.
+fn dir_name(dir: &Path) -> String {
+    dir.file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "book".to_string())
+}
+
 /// Outcome of a library scan (counts only — a library of thousands of books is
 /// never held in memory; each is indexed and dropped in turn, NFR-P4).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -232,13 +403,16 @@ pub fn scan_library(library: &Path, data_dir: &Path, index: &Index) -> ScanSumma
                     tracing::warn!(error = %err, path = %path.display(), "skipped");
                 }
             },
-            BookSource::Mp3Folder(dir) => {
-                summary.skipped += 1;
-                tracing::info!(
-                    path = %dir.display(),
-                    "recognized MP3-folder book; ingest lands in Task 3.3, skipping for now"
-                );
-            }
+            BookSource::Mp3Folder(dir) => match scan_mp3_folder(&dir, &slug, data_dir, index) {
+                Ok(book) => {
+                    summary.indexed += 1;
+                    tracing::info!(slug = %book.slug, title = %book.title, "indexed MP3-folder book");
+                }
+                Err(err) => {
+                    summary.skipped += 1;
+                    tracing::warn!(error = %err, path = %dir.display(), "skipped");
+                }
+            },
         }
     }
     tracing::info!(
@@ -483,6 +657,106 @@ mod tests {
             .expect("spawn ffmpeg");
         assert!(status.success(), "ffmpeg cover synth failed");
         input
+    }
+
+    /// Synthesize a real MP3 with an optional `track` tag. Returns `None` if the
+    /// ffmpeg build has no MP3 encoder (test then skips).
+    fn synth_mp3(dir: &Path, name: &str, track: Option<u32>, dur: u32) -> Option<PathBuf> {
+        std::fs::create_dir_all(dir).unwrap();
+        let out = dir.join(name);
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args([
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("sine=frequency=300:duration={dur}"),
+        ]);
+        if let Some(t) = track {
+            cmd.args(["-metadata", &format!("track={t}")]);
+        }
+        cmd.args(["-c:a", "libmp3lame"]).arg(&out);
+        let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
+        ok.then_some(out)
+    }
+
+    #[test]
+    fn mp3_folder_ingests_in_track_order_by_copy() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not available");
+            return;
+        }
+        let root = scratch("mp3-order");
+        let book = root.join("A Folder Book");
+        // Filenames are deliberately NOT in track order; durations tag each track.
+        let a = synth_mp3(&book, "z-first.mp3", Some(1), 2);
+        let b = synth_mp3(&book, "a-second.mp3", Some(2), 4);
+        let c = synth_mp3(&book, "m-third.mp3", Some(3), 2);
+        if a.is_none() || b.is_none() || c.is_none() {
+            eprintln!("skipping: ffmpeg has no libmp3lame encoder");
+            return;
+        }
+
+        let data = root.join("data");
+        let index = Index::open_in_memory().unwrap();
+        let summary = scan_library(&root, &data, &index);
+        assert_eq!(summary.indexed, 1);
+        assert_eq!(summary.skipped, 0);
+
+        let books = index.list_books().unwrap();
+        assert_eq!(books.len(), 1);
+        let eps = index.episodes_for_book(&books[0].id).unwrap();
+        assert_eq!(eps.len(), 3, "one episode per MP3");
+
+        // Track order (1,2,3) => durations ~2,4,2. Filename order would be ~4,2,2.
+        assert!(
+            (eps[1].duration_sec - 4.0).abs() < 0.6,
+            "middle is track 2 (4s)"
+        );
+        for (i, e) in eps.iter().enumerate() {
+            assert_eq!(e.idx, i as i64);
+            let p = PathBuf::from(&e.file_path);
+            assert!(p.exists(), "copied file on disk");
+            assert!(p.starts_with(&data), "served copy lives under data dir");
+            assert!(e.file_path.ends_with(".mp3"));
+            assert!(e.byte_length > 0);
+        }
+        for w in eps.windows(2) {
+            assert!(w[0].pubdate_epoch < w[1].pubdate_epoch, "pubDates increase");
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mp3_folder_falls_back_to_filename_order_on_missing_track() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not available");
+            return;
+        }
+        let root = scratch("mp3-fallback");
+        let book = root.join("Mixed Book");
+        // One track tagged, one missing -> mixed -> filename sort (01 before 02).
+        let a = synth_mp3(&book, "01-intro.mp3", None, 2);
+        let b = synth_mp3(&book, "02-body.mp3", Some(5), 4);
+        if a.is_none() || b.is_none() {
+            eprintln!("skipping: ffmpeg has no libmp3lame encoder");
+            return;
+        }
+
+        let data = root.join("data");
+        let index = Index::open_in_memory().unwrap();
+        assert_eq!(scan_library(&root, &data, &index).indexed, 1);
+        let books = index.list_books().unwrap();
+        let eps = index.episodes_for_book(&books[0].id).unwrap();
+        assert_eq!(eps.len(), 2);
+        // Filename order: 01-intro (2s) then 02-body (4s).
+        assert!((eps[0].duration_sec - 2.0).abs() < 0.6, "01-intro first");
+        assert!((eps[1].duration_sec - 4.0).abs() < 0.6, "02-body second");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
