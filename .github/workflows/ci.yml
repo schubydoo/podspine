@@ -1,41 +1,105 @@
 name: CI
 
+# fmt + clippy, the full test suite across platforms, coverage (with a line
+# floor), and supply-chain audit. A single aggregator job — `ci required checks
+# passed` — is what branch protection should require; extend it by adding jobs to
+# its `needs`.
+
 on:
   push:
-    branches: [main, master]
+    branches: [main]
   pull_request:
 
+# Least privilege by default (OpenSSF Scorecard Token-Permissions). Jobs that
+# need more request it explicitly.
+permissions:
+  contents: read
+
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  quality:
-    name: fmt · clippy · test
+  lint:
+    name: fmt · clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Podspine ships Linux-only (musl + Docker); macOS is the dev platform.
+        # Add windows-latest here if a Windows target is ever wanted.
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install ffmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install ffmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
       - name: Test
         run: cargo test --workspace --all-features
+
+  coverage:
+    name: coverage (>= 90% lines)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      # Enforce the line floor (the real gate; baseline ~94%) and emit lcov.
+      # cargo-llvm-cov writes lcov.info before the threshold check, so the upload
+      # below still runs on a floor failure — surfacing a drop when it matters.
+      - name: Coverage (lcov + line floor)
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info --fail-under-lines 90
+      # Codecov is informational (see codecov.yml); tokenless for public repos,
+      # and never fails CI on an upload hiccup.
+      - name: Upload to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
 
   supply-chain:
     name: audit · deny
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-audit and cargo-deny
         run: cargo install cargo-audit cargo-deny --locked
@@ -44,28 +108,27 @@ jobs:
       - name: Deny
         run: cargo deny check
 
-  coverage:
-    name: coverage (>= 90% lines)
+  ci-required-checks:
+    # The single status branch protection should require. Aggregates every job
+    # whose failure must block merging — add new required jobs to `needs`.
+    name: ci required checks passed
+    if: always()
+    needs: [lint, test, coverage, supply-chain]
     runs-on: ubuntu-latest
+    timeout-minutes: 2
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
-      # Enforce the line floor (the real gate; baseline ~91%) and emit lcov.
-      # cargo-llvm-cov writes lcov.info before the threshold check, so the upload
-      # below still runs on a floor failure — surfacing a drop when it matters.
-      - name: Coverage (lcov + line floor)
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info --fail-under-lines 90
-      # Codecov is informational (PR comment + trends + per-crate breakdown, see
-      # codecov.yml); tokenless for public repos, never fails CI on upload hiccups.
-      - name: Upload to Codecov
-        if: ${{ !cancelled() }}
-        uses: codecov/codecov-action@v5
-        with:
-          files: lcov.info
-          fail_ci_if_error: false
+      - name: Check required jobs passed
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          failing=$(echo "$NEEDS_JSON" | jq -r '
+            to_entries[]
+            | select(.value.result != "success" and .value.result != "skipped")
+            | "\(.key): \(.value.result)"
+          ')
+          if [ -n "$failing" ]; then
+            echo "Failed or cancelled jobs:"
+            echo "$failing"
+            exit 1
+          fi
+          echo "All required jobs passed."
