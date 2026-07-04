@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 
 use podspine_feed::{FeedBook, FeedEpisode, render_checked};
@@ -41,43 +41,56 @@ fn main() -> Result<()> {
 fn run(args: &Args) -> Result<()> {
     let probed = probe(&args.input).with_context(|| format!("probing {}", args.input.display()))?;
 
-    if probed.chapters.is_empty() {
-        // The single-episode fallback for chapter-less input lands in Task 1.7.
-        bail!(
-            "{} has no embedded chapters (single-episode fallback is Task 1.7)",
-            args.input.display()
-        );
-    }
-
     let base = args.base_url.trim_end_matches('/');
     let id = slugify(&file_stem(&args.input));
     let source_mtime = mtime_epoch(&args.input)?;
     let book_out = args.out.join("books").join(&id);
 
-    // prober chapters -> splitter cuts.
-    let cuts: Vec<ChapterCut> = probed
-        .chapters
-        .iter()
-        .map(|c| ChapterCut {
-            idx: c.idx,
-            start_sec: c.start_sec,
-            end_sec: c.end_sec,
-        })
-        .collect();
+    // Chapters -> (cut, title). A chapter-less book degrades to a single episode
+    // spanning the whole file, with a surfaced warning (Task 1.7). Corrupt input
+    // never reaches here — probe() already returned a typed error above.
+    let specs: Vec<(ChapterCut, String)> = if probed.chapters.is_empty() {
+        eprintln!(
+            "warning: {} has no embedded chapters — emitting a single-episode feed",
+            args.input.display()
+        );
+        vec![(
+            ChapterCut {
+                idx: 0,
+                start_sec: 0.0,
+                end_sec: probed.duration_sec,
+            },
+            file_stem(&args.input),
+        )]
+    } else {
+        probed
+            .chapters
+            .iter()
+            .map(|c| {
+                (
+                    ChapterCut {
+                        idx: c.idx,
+                        start_sec: c.start_sec,
+                        end_sec: c.end_sec,
+                    },
+                    c.title
+                        .clone()
+                        .unwrap_or_else(|| format!("Chapter {}", c.idx + 1)),
+                )
+            })
+            .collect()
+    };
 
+    let cuts: Vec<ChapterCut> = specs.iter().map(|(cut, _)| cut.clone()).collect();
     let episodes = split_book(&args.input, &book_out, &cuts)
         .with_context(|| format!("splitting {}", args.input.display()))?;
 
-    // split outputs + chapter titles -> feed episodes.
     let feed_episodes: Vec<FeedEpisode> = episodes
         .iter()
-        .zip(&probed.chapters)
-        .map(|(ep, ch)| FeedEpisode {
+        .zip(&specs)
+        .map(|(ep, (_, title))| FeedEpisode {
             idx: ep.idx,
-            title: ch
-                .title
-                .clone()
-                .unwrap_or_else(|| format!("Chapter {}", ep.idx + 1)),
+            title: title.clone(),
             audio_url: format!("{base}/audio/{id}/{:03}.m4a", ep.idx + 1),
             byte_length: ep.byte_length,
             duration_sec: ep.duration_sec,
