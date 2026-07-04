@@ -45,6 +45,14 @@ coverage:
         informational: false # a real pass/fail traffic light (still a non-required check)
         if_not_found: success # docs-only PRs upload no diff → don't block them
 
+# src/main.rs is the server's live wiring (resolve config, open the index, scan,
+# bind the socket, serve) — exercised by running the app, not by unit tests. It
+# can't be meaningfully unit-tested, so exclude it from the REPORTED coverage so
+# the dashboard reflects testable code. (The CI line floor still measures the full
+# tree; it carries enough headroom to absorb this ~0.8% of lines.)
+ignore:
+  - "src/main.rs"
+
 # The per-line PR annotations are mostly visual clutter; the comment + dashboard
 # carry the signal.
 github_checks:
