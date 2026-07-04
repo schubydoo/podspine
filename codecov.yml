@@ -1,0 +1,102 @@
+# Codecov config. Coverage is REPORTED here for visibility (PR comment + trend
+# graphs + per-crate breakdown); the REAL gate is the CI line floor in
+# .github/workflows/ci.yml (the `coverage (>= 88% lines)` job runs
+# `cargo llvm-cov --fail-under-lines 88`). The `project` status is informational
+# (a nudge, never a block); `patch` is a real pass/fail traffic light on new-code
+# coverage — but neither is a *required* check unless it's added to branch
+# protection. Coverage uploads from ONE Linux cell, so flags / carryforward /
+# report-merging aren't needed.
+#
+# Rust note: Codecov ingests the lcov that `cargo llvm-cov --lcov` emits directly
+# — no cobertura conversion step.
+#
+# Baseline at setup: ~91% lines (feed/ui/prober/index high; splitter/config the
+# lowest crates; src/main.rs is 0% — it's the live server wiring, not unit-tested).
+#
+# Validate before deploying changes:
+#   curl -X POST --data-binary @codecov.yml https://api.codecov.io/validate
+
+codecov:
+  # ci.yml uploads coverage even when the floor step FAILS (the `!cancelled()`
+  # guard), on purpose: a coverage drop should surface exactly when a change
+  # breaks the floor. So don't gate the Codecov status on CI passing.
+  require_ci_to_pass: false
+  notify:
+    wait_for_ci: false
+    after_n_builds: 1 # single Ubuntu coverage cell
+
+coverage:
+  precision: 2
+  round: down # a strict floor rounds down, matching the CI --fail-under-lines gate
+  range: "85...95" # red->green band around the ~91% baseline
+  status:
+    project:
+      default:
+        target: 88% # mirror the ci.yml line floor
+        threshold: 1% # tolerate sub-1% drift before flagging
+        informational: true # nudge, never block — ci.yml is the source of truth
+    patch:
+      default:
+        # New-code (diff) coverage gate. 80% sits below the repo's ~91% overall
+        # so it flags under-tested new code without chronic red; raise it if new
+        # PRs comfortably clear a higher bar.
+        target: 80%
+        threshold: 0% # no slack — new code meets the target or the status goes red
+        informational: false # a real pass/fail traffic light (still a non-required check)
+        if_not_found: success # docs-only PRs upload no diff → don't block them
+
+# The per-line PR annotations are mostly visual clutter; the comment + dashboard
+# carry the signal.
+github_checks:
+  annotations: false
+
+comment:
+  # No flags are uploaded (single cell), so show the per-crate breakdown instead.
+  layout: "condensed_header, diff, components, files"
+  behavior: default # update the existing comment in place
+  require_changes: true # only comment when coverage actually moves
+  hide_project_coverage: false
+
+# Per-crate coverage breakdown in the dashboard + PR comment. No `statuses` are
+# defined, so components add VISIBILITY only — no extra per-component PR checks.
+# Keep paths in sync as crates are added (one crate per pipeline stage).
+component_management:
+  individual_components:
+    - component_id: scanner
+      name: scanner (library + orchestration)
+      paths:
+        - crates/scanner/**
+    - component_id: probe_chapters
+      name: prober & chapters
+      paths:
+        - crates/prober/**
+        - crates/chapters/**
+    - component_id: splitter
+      name: splitter (ffmpeg)
+      paths:
+        - crates/splitter/**
+    - component_id: feed
+      name: feed (RSS + self-check)
+      paths:
+        - crates/feed/**
+    - component_id: http
+      name: http (Axum)
+      paths:
+        - crates/http/**
+    - component_id: ui
+      name: ui (maud)
+      paths:
+        - crates/ui/**
+    - component_id: index
+      name: index (SQLite)
+      paths:
+        - crates/index/**
+    - component_id: config
+      name: config
+      paths:
+        - crates/config/**
+    - component_id: server_cli
+      name: server & cli
+      paths:
+        - src/**
+        - crates/cli/**

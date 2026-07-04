@@ -43,3 +43,29 @@ jobs:
         run: cargo audit
       - name: Deny
         run: cargo deny check
+
+  coverage:
+    name: coverage (>= 88% lines)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      # Enforce the line floor (the real gate; baseline ~91%) and emit lcov.
+      # cargo-llvm-cov writes lcov.info before the threshold check, so the upload
+      # below still runs on a floor failure — surfacing a drop when it matters.
+      - name: Coverage (lcov + line floor)
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info --fail-under-lines 88
+      # Codecov is informational (PR comment + trends + per-crate breakdown, see
+      # codecov.yml); tokenless for public repos, never fails CI on upload hiccups.
+      - name: Upload to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          fail_ci_if_error: false

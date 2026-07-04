@@ -1,0 +1,47 @@
+{
+  "strictness": 1,
+  "fileChangeLimit": 100,
+  "triggerOnUpdates": true,
+  "statusCheck": true,
+  "statusCommentsEnabled": true,
+  "excludeAuthors": [
+    "dependabot[bot]",
+    "renovate[bot]",
+    "pre-commit-ci[bot]",
+    "github-actions[bot]",
+    "coderabbitai[bot]"
+  ],
+  "summarySection": { "included": true, "collapsible": true, "defaultOpen": true },
+  "confidenceScoreSection": { "included": true, "collapsible": true, "defaultOpen": true },
+  "issuesTableSection": { "included": true, "collapsible": true, "defaultOpen": false },
+  "sequenceDiagramSection": { "included": true, "collapsible": true, "defaultOpen": false },
+  "instructions": "Podspine turns audiobook files into per-chapter podcast RSS feeds (Rust workspace, shells out to ffmpeg/ffprobe). Guard the invariants that keep feeds correct and the server safe; don't nitpick formatting or lint that cargo fmt / clippy -D warnings already enforce, and don't restate what tests already cover.",
+  "ignorePatterns": "target/**\ndist/**\nCargo.lock\nLICENSE\n**/*.min.*",
+  "rules": [
+    {
+      "id": "feed-ordering",
+      "rule": "Feed items must have strictly sequential pubDates (oldest = chapter 1), plus itunes:episode and itunes:duration, and an enclosure length read from the real output file (fs::metadata().len()) — NEVER prorated from a bitrate. The self-check must reject a feed that violates these. Flag any regression to feed ordering, the itunes tags, the real-size enclosure length, or guid stability (blake3(book.id:idx:source_mtime)).",
+      "scope": ["crates/feed/**", "crates/scanner/**"]
+    },
+    {
+      "id": "ffmpeg-argv",
+      "rule": "ffmpeg/ffprobe are invoked out-of-process with an ARGUMENT VECTOR, never a shell string — chapter titles, filenames, and tags are untrusted. Flag any construction of an ffmpeg/ffprobe command as a shell string, or interpolation of embedded metadata into a command line.",
+      "scope": ["crates/splitter/**", "crates/prober/**"]
+    },
+    {
+      "id": "path-safety",
+      "rule": "Book/episode ids are opaque index keys: validate slugs against the [a-z0-9-] allow-list, resolve to a file path server-side, and canonicalize the resolved path and assert it stays under the data dir (404 on reject, not 403). Flag any path built from request input via format!/join without the allow-list + canonicalize-prefix guard.",
+      "scope": ["crates/http/**"]
+    },
+    {
+      "id": "drm-free",
+      "rule": "Podspine ships NO DRM circumvention. DRM inputs (.aax/.aaxc/.aa/.odm) are skipped with a logged notice. Flag any code that attempts to decrypt or work around DRM.",
+      "scope": ["crates/scanner/**", "crates/splitter/**", "crates/prober/**"]
+    },
+    {
+      "id": "ffmpeg-gated-tests",
+      "rule": "Many tests synthesize fixtures with ffmpeg and return early with a skip notice when ffmpeg or a specific encoder (aac/libmp3lame/flac/libopus) is unavailable. Do NOT flag that gated skip-return as dead code, an early return bug, or a silently-passing test.",
+      "scope": ["crates/**", "**/tests/**"]
+    }
+  ]
+}
