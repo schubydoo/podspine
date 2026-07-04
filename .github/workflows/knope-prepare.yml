@@ -47,31 +47,43 @@ jobs:
           exit 1
       # Full history + tags so knope can find the last release tag; persist the App
       # token so knope's `git push` of the release branch runs as the App identity.
+      # Full history + tags so knope can find the last release tag; persist the App
+      # token so knope's `git push` of the release branch runs as the App identity.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token }}
           persist-credentials: true
+      # Changesets-only: knope releases iff a `.changeset/*.md` fragment is pending.
+      # Detecting one here lets the knope step run WITHOUT error-swallowing (a real
+      # failure fails the job), while an ordinary push with no fragment — or the
+      # release-PR merge that consumes them — is a clean no-op.
+      - name: Detect pending changesets
+        id: changesets
+        run: |
+          set -euo pipefail
+          count=0
+          if [ -d .changeset ]; then
+            count=$(find .changeset -maxdepth 1 -name '*.md' ! -iname 'README.md' | wc -l)
+          fi
+          echo "has=$([ "$count" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "pending changeset fragments: $count"
       - uses: dtolnay/rust-toolchain@stable
+        if: ${{ steps.changesets.outputs.has == 'true' }}
       - name: Configure git identity (podspine-ci App)
+        if: ${{ steps.changesets.outputs.has == 'true' }}
         run: |
           # Use the App bot's real "<numeric-id>+podspine-ci[bot]@users.noreply.github.com"
           # once the App exists, so commits attribute to the bot account.
           git config user.name "podspine-ci[bot]"
           git config user.email "podspine-ci[bot]@users.noreply.github.com"
       - name: Install knope
+        if: ${{ steps.changesets.outputs.has == 'true' }}
         uses: knope-dev/action@v2
         with:
           version: 0.23.0
-      - name: Open or refresh the release PR (no-op if nothing to release)
+      - name: Open or refresh the release PR
+        if: ${{ steps.changesets.outputs.has == 'true' }}
+        run: knope prepare-release --verbose
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: |
-          set +e
-          out=$(knope prepare-release --verbose 2>&1); code=$?
-          echo "$out"
-          if [ "$code" -ne 0 ]; then
-            # A "nothing to release" exit on an ordinary push is expected — succeed.
-            echo "$out" | grep -qiE "nothing to release|no changes" && { echo "nothing to release"; exit 0; }
-            exit "$code"
-          fi

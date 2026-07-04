@@ -50,8 +50,12 @@ its availability, so run them with ffmpeg installed to actually exercise them.
 
 - Fill in the PR template and link the issue it addresses.
 - Include tests for new behavior or bug fixes where practical.
-- Update the docs (`README.md`, `docs/`) and `CHANGELOG.md` (`[Unreleased]`) when
-  your change is user-visible.
+- Update the docs (`README.md`, `docs/`) when your change is user-visible.
+- **Add a changeset** for any user-visible change: a `.changeset/*.md` fragment
+  (run `knope document-change`, or see [`.changeset/README.md`](.changeset/README.md)).
+  Releases and the `CHANGELOG.md` are generated from these fragments — don't
+  hand-edit the changelog. Internal-only PRs (CI, refactor, tests) can skip it
+  with the `no-changelog` label.
 
 ## A few project-specific rules worth knowing
 
