@@ -64,4 +64,11 @@ name = "podspine"
 path = "src/main.rs"
 
 [dependencies]
-# Wired in Sprint 2 (config -> scanner -> http). Empty during the POC scaffold.
+podspine-config = { path = "crates/config" }
+podspine-index = { path = "crates/index" }
+podspine-scanner = { path = "crates/scanner" }
+podspine-http = { path = "crates/http" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

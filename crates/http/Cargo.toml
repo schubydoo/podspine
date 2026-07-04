@@ -1,6 +1,6 @@
 [package]
 name = "podspine-http"
-description = "Axum router: feed, audio (Range), UI, and health routes with tower-http timeout/limit/concurrency layers."
+description = "Axum router: feed, audio (Range), and health routes with tower-http timeout/limit layers."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,3 +10,19 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+axum = { workspace = true }
+axum-range = { workspace = true }
+axum-extra = { workspace = true }
+tower-http = { workspace = true }
+tokio = { workspace = true }
+podspine-index = { path = "../index" }
+podspine-feed = { path = "../feed" }
+tracing = { workspace = true }
+
+[dev-dependencies]
+podspine-scanner = { path = "../scanner" }
+podspine-index = { path = "../index" }
+axum = { workspace = true }
+tokio = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
