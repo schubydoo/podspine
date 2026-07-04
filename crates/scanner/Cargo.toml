@@ -1,6 +1,6 @@
 [package]
 name = "podspine-scanner"
-description = "Watches/scans the library root, classifies inputs by format tier, skips DRM'd files, orchestrates chapters -> splitter -> index."
+description = "Orchestrates probe -> split -> index for one audiobook; chapter-less fallback, idempotent re-scan, DRM skip."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,3 +10,8 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+podspine-prober = { path = "../prober" }
+podspine-splitter = { path = "../splitter" }
+podspine-index = { path = "../index" }
+podspine-feed = { path = "../feed" }
+thiserror = { workspace = true }

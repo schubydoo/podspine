@@ -499,6 +499,13 @@ dependencies = [
 [[package]]
 name = "podspine-scanner"
 version = "0.1.0"
+dependencies = [
+ "podspine-feed",
+ "podspine-index",
+ "podspine-prober",
+ "podspine-splitter",
+ "thiserror",
+]
 
 [[package]]
 name = "podspine-splitter"

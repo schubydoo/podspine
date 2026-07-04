@@ -86,7 +86,10 @@ pub fn format_itunes_duration(secs: f64) -> String {
 /// pubDate epoch for episode `idx` of `n`, anchored so the last episode sits at
 /// `anchor` and earlier ones step backwards — i.e. every date is `<= anchor`
 /// (in the past) and strictly increasing with `idx` (chapter 1 oldest).
-fn pubdate_epoch(anchor: i64, idx: usize, n: usize) -> i64 {
+///
+/// Public so the scanner can persist the same value it would render, keeping the
+/// index and the feed in agreement.
+pub fn pubdate_epoch(anchor: i64, idx: usize, n: usize) -> i64 {
     let back = (n as i64 - 1 - idx as i64) * PUBDATE_STEP_SECS;
     anchor - back
 }
