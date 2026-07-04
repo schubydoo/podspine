@@ -63,19 +63,9 @@ cargo run -- --library ./sample-books
 
 ## Configuration
 
-The library path is the only required input; everything else has a default. Each
-option can be set by CLI flag, environment variable, or a TOML file (`--config`),
-in that precedence.
-
-| Flag | Env var | Default | Purpose |
-|---|---|---|---|
-| `--library` | `PODSPINE_LIBRARY` | — (required) | Folder of audiobooks to scan. |
-| `--data-dir` | `PODSPINE_DATA_DIR` | `./data` | SQLite index + split episode files. |
-| `--bind` | `PODSPINE_BIND` | `0.0.0.0:8080` | Address to listen on. |
-| `--base-url` | `PODSPINE_BASE_URL` | `http://localhost:<port>` | External URL used to build feed/audio links. |
-| `--default-cover-url` | `PODSPINE_DEFAULT_COVER_URL` | none | Feed-level fallback cover for books with no embedded art. |
-| `--force-embedded-chapters` | `PODSPINE_FORCE_EMBEDDED_CHAPTERS` | off | Ignore `.cue`/`.ffmeta` sidecars, use embedded chapters. |
-| `--config` | `PODSPINE_CONFIG` | none | Path to an optional TOML config file. |
+The library path is the only required input; everything else has a default and can
+be set via CLI flag, environment variable, or a TOML file (`--config`), in that
+precedence. See the **[full option reference](docs/DEPLOYMENT.md#configuration)**.
 
 Endpoints: `/` (browse UI), `/book/{slug}` (feed URL + QR), `/feed/{slug}.xml`
 (the podcast feed), `/audio/{slug}/{n}` (episode audio, HTTP Range), `/healthz`.
@@ -105,17 +95,19 @@ tools first, then drop the result in your library.
 Open the Podspine UI, click a book, and copy its feed URL (or scan the QR code).
 Then see the per-app steps and troubleshooting in **[docs/importing.md](docs/importing.md)**.
 
+## Documentation
+
+- **[Deploying](docs/DEPLOYMENT.md)** — Docker/compose, reverse proxy, systemd, backups, and the full config reference.
+- **[Adding to your podcast app](docs/importing.md)** — per-app import steps and troubleshooting.
+- **[Architecture](docs/ARCHITECTURE.md)** — how the pipeline and feeds work, and the invariants behind them.
+- **[Development](docs/DEVELOPMENT.md)** — local setup, crate layout, testing, and release builds.
+- **[Contributing](CONTRIBUTING.md)** · **[Security](SECURITY.md)** · **[Changelog](CHANGELOG.md)**
+
 ## Development
 
-Rust workspace, one crate per pipeline stage. Requires `ffmpeg`/`ffprobe` on
-`PATH`.
-
-```bash
-cargo build           # build
-cargo test --workspace
-cargo clippy --all-targets -- -D warnings
-cargo fmt
-```
+Rust workspace, one crate per pipeline stage; requires `ffmpeg`/`ffprobe` on `PATH`.
+See **[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)** for setup, the crate layout, and
+testing, and **[CONTRIBUTING.md](CONTRIBUTING.md)** for the workflow.
 
 ## License
 
