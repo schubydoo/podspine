@@ -1,0 +1,52 @@
+# ClusterFuzzLite — fuzz code changed by each PR (cargo-fuzz harnesses in fuzz/).
+# Informational / Phase-1: a short per-PR run on the address sanitizer; NOT a
+# required check, so a flaky finding never blocks a merge, but a reproducible
+# crash surfaces here (and as SARIF in the Security tab). Deeper runs live in the
+# scheduled cflite_batch.yml. No corpus secret here (fork-PR-safe).
+# Docs: https://google.github.io/clusterfuzzlite/
+name: ClusterFuzzLite PR fuzzing
+
+on:
+  pull_request:
+    branches: [main]
+    # Fuzz only when fuzz-relevant code changes, and only on open/reopen/ready
+    # (not every `synchronize` push). The nightly batch is the deep fuzzer.
+    types: [opened, reopened, ready_for_review]
+    paths:
+      - "src/**"
+      - "crates/**"
+      - "fuzz/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+permissions: {}
+
+jobs:
+  pr-fuzzing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    concurrency:
+      group: ${{ github.workflow }}-${{ matrix.sanitizer }}-${{ github.ref }}
+      cancel-in-progress: true
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address]
+    steps:
+      - name: Build fuzzers (${{ matrix.sanitizer }})
+        uses: google/clusterfuzzlite/actions/build_fuzzers@v1
+        with:
+          language: rust
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          sanitizer: ${{ matrix.sanitizer }}
+      - name: Run fuzzers (${{ matrix.sanitizer }})
+        uses: google/clusterfuzzlite/actions/run_fuzzers@v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: 180
+          mode: code-change
+          sanitizer: ${{ matrix.sanitizer }}
+          output-sarif: true

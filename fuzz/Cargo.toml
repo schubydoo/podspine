@@ -1,0 +1,40 @@
+# cargo-fuzz harnesses for Podspine's untrusted-input parsers. This is its OWN
+# workspace (the `[workspace]` table below detaches it from the root), so the
+# normal `cargo build/test/clippy --workspace` and coverage never touch it — only
+# ClusterFuzzLite / `cargo +nightly fuzz` build it.
+[package]
+name = "podspine-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+podspine-chapters = { path = "../crates/chapters" }
+podspine-prober = { path = "../crates/prober" }
+
+[[bin]]
+name = "parse_cue"
+path = "fuzz_targets/parse_cue.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_ffmeta"
+path = "fuzz_targets/parse_ffmeta.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_probe_json"
+path = "fuzz_targets/parse_probe_json.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

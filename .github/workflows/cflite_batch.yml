@@ -1,0 +1,53 @@
+# ClusterFuzzLite — scheduled BATCH fuzzing (the deep counterpart to cflite_pr).
+# Runs EVERY harness in fuzz/ on a schedule (`mode: batch`), so unchanged code is
+# re-fuzzed regularly and each target gets a longer run. A reproducible crash
+# surfaces here + as SARIF. NOT a required check — it signals, never gates.
+#
+# Corpus persistence (optional): clones a private storage-repo, fuzzes, and pushes
+# the grown corpus back so coverage compounds across runs. Needs a
+# `schubydoo/podspine-fuzz-corpus` repo + a `FUZZ_STORAGE_TOKEN` PAT (write) — see
+# the publish checklist. The PR job deliberately carries no such secret. If the
+# secret is unset the job still runs (fuzzing from seed), it just won't accumulate.
+# `fuzz-seconds` is PER target → wall-clock ≈ fuzz-seconds × harness count + build.
+# Docs: https://google.github.io/clusterfuzzlite/
+name: ClusterFuzzLite batch fuzzing
+
+on:
+  schedule:
+    - cron: "27 4 */2 * *" # odd calendar days, 04:27 UTC
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  batch-fuzzing:
+    name: batch fuzzing
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    permissions:
+      contents: read
+      security-events: write
+    concurrency:
+      group: ${{ github.workflow }}-${{ matrix.sanitizer }}
+      cancel-in-progress: true
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address]
+    steps:
+      - name: Build fuzzers (${{ matrix.sanitizer }})
+        uses: google/clusterfuzzlite/actions/build_fuzzers@v1
+        with:
+          language: rust
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          sanitizer: ${{ matrix.sanitizer }}
+      - name: Run fuzzers (${{ matrix.sanitizer }})
+        uses: google/clusterfuzzlite/actions/run_fuzzers@v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: 300
+          mode: batch
+          sanitizer: ${{ matrix.sanitizer }}
+          output-sarif: true
+          storage-repo: https://${{ secrets.FUZZ_STORAGE_TOKEN }}@github.com/schubydoo/podspine-fuzz-corpus.git
+          storage-repo-branch: main

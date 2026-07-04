@@ -1,0 +1,3 @@
+# ClusterFuzzLite project config. Rust fuzzing runs via cargo-fuzz (libFuzzer) on
+# the OSS-Fuzz base-builder-rust image. See fuzz/ for the harnesses.
+language: rust
