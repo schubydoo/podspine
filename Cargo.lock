@@ -1035,6 +1035,7 @@ dependencies = [
  "podspine-prober",
  "podspine-splitter",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]

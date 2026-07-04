@@ -15,3 +15,4 @@ podspine-splitter = { path = "../splitter" }
 podspine-index = { path = "../index" }
 podspine-feed = { path = "../feed" }
 thiserror = { workspace = true }
+tracing = { workspace = true }

@@ -1,15 +1,21 @@
-//! `scanner` — orchestrate `prober -> splitter -> index` for one audiobook.
+//! `scanner` — orchestrate `prober -> splitter -> index`.
 //!
-//! [`scan_book`] probes a file, splits its chapters into `<data>/books/<id>/`,
-//! and persists a book + episodes to the index. It:
+//! [`scan_book`] probes one audio file, splits its chapters into
+//! `<data>/books/<id>/`, and persists a book + episodes to the index. It:
 //! - falls back to a single episode for a chapter-less file,
 //! - is **idempotent**: an unchanged source that is already fully indexed is not
 //!   re-split (guids/pubDates are stable),
 //! - **skips DRM-protected input** (AAX/AAXC/`.aa`/`.odm`) with a typed error —
 //!   Podspine ships no circumvention (PRD W5).
 //!
-//! Multi-book library scanning and richer format tiers come later (Tasks 3.1/3.9).
+//! [`scan_library`] walks a library root of many audiobooks (Task 3.1): each
+//! top-level audio file and each per-book subfolder becomes one independent
+//! book. It distinguishes single-file books (`.m4b`/`.m4a`, or a lone `.mp3`)
+//! from multi-track MP3 folders (recognized here, ingested in Task 3.3), assigns
+//! collision-free slugs deterministically, and never lets one bad book abort the
+//! whole scan. Richer format tiers come later (Task 3.9).
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -49,9 +55,23 @@ pub enum ScanError {
     Index(#[from] IndexError),
 }
 
-/// Scan one audiobook `input` into `index`, writing split episodes under
-/// `<data_dir>/books/<id>/`. Returns the persisted [`BookRow`].
+/// Scan one audiobook `input` into `index` under a slug derived from its file
+/// name. Convenience wrapper over [`scan_book_as`] for single-book callers.
 pub fn scan_book(input: &Path, data_dir: &Path, index: &Index) -> Result<BookRow, ScanError> {
+    let id = slugify(&file_stem(input));
+    scan_book_as(input, &id, data_dir, index)
+}
+
+/// Scan one audiobook `input` into `index` under the explicit `id` (also used as
+/// the slug), writing split episodes under `<data_dir>/books/<id>/`. Returns the
+/// persisted [`BookRow`]. The library scanner uses this to assign collision-free
+/// slugs; single-book callers should use [`scan_book`].
+pub fn scan_book_as(
+    input: &Path,
+    id: &str,
+    data_dir: &Path,
+    index: &Index,
+) -> Result<BookRow, ScanError> {
     if !input.is_file() {
         return Err(ScanError::NotAFile(input.to_path_buf()));
     }
@@ -59,7 +79,7 @@ pub fn scan_book(input: &Path, data_dir: &Path, index: &Index) -> Result<BookRow
         return Err(ScanError::UnsupportedDrm(input.to_path_buf()));
     }
 
-    let id = slugify(&file_stem(input));
+    let id = id.to_string();
     let source_mtime = mtime_epoch(input)?;
     let book_out = data_dir.join("books").join(&id);
 
@@ -134,6 +154,170 @@ pub fn scan_book(input: &Path, data_dir: &Path, index: &Index) -> Result<BookRow
     }
 
     Ok(book)
+}
+
+/// Outcome of a library scan (counts only — a library of thousands of books is
+/// never held in memory; each is indexed and dropped in turn, NFR-P4).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ScanSummary {
+    /// Books successfully indexed.
+    pub indexed: usize,
+    /// Sources skipped: bad/DRM'd files, or MP3 folders pending Task 3.3.
+    pub skipped: usize,
+}
+
+/// A discovered book source within the library.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BookSource {
+    /// A single splittable audio file (`.m4b`/`.m4a`, or a lone `.mp3`).
+    File(PathBuf),
+    /// A folder of per-track MP3s — recognized in v1, ingested in Task 3.3.
+    Mp3Folder(PathBuf),
+}
+
+impl BookSource {
+    /// The base name a slug is derived from (file stem, or folder name).
+    fn base_name(&self) -> String {
+        match self {
+            BookSource::File(p) => file_stem(p),
+            // A folder name has no extension to strip; use it whole.
+            BookSource::Mp3Folder(d) => d
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "book".to_string()),
+        }
+    }
+}
+
+/// Audio extensions we recognize at the library level. DRM is rejected deeper,
+/// in [`scan_book_as`]; richer tiers (Ogg/Opus/FLAC) arrive in Task 3.9.
+const AUDIO_EXTENSIONS: &[&str] = &["m4b", "m4a", "mp3"];
+
+/// Scan a library root of many audiobooks into `index`, writing each book's
+/// episodes under `<data_dir>/books/<slug>/`. One independent book per top-level
+/// audio file or per-book subfolder. Slugs are collision-free and deterministic
+/// across re-scans; a single failing book is logged and skipped, never fatal.
+pub fn scan_library(library: &Path, data_dir: &Path, index: &Index) -> ScanSummary {
+    let sources = discover(library);
+
+    let mut seen = HashSet::new();
+    let mut summary = ScanSummary::default();
+    for source in sources {
+        // Reserve a slug for every candidate in deterministic order so a book's
+        // slug is stable across re-scans regardless of siblings' outcomes.
+        let slug = unique_slug(&slugify(&source.base_name()), &mut seen);
+        match source {
+            BookSource::File(path) => match scan_book_as(&path, &slug, data_dir, index) {
+                Ok(book) => {
+                    summary.indexed += 1;
+                    tracing::info!(slug = %book.slug, title = %book.title, "indexed book");
+                }
+                Err(err) => {
+                    summary.skipped += 1;
+                    tracing::warn!(error = %err, path = %path.display(), "skipped");
+                }
+            },
+            BookSource::Mp3Folder(dir) => {
+                summary.skipped += 1;
+                tracing::info!(
+                    path = %dir.display(),
+                    "recognized MP3-folder book; ingest lands in Task 3.3, skipping for now"
+                );
+            }
+        }
+    }
+    tracing::info!(
+        indexed = summary.indexed,
+        skipped = summary.skipped,
+        "library scan complete"
+    );
+    summary
+}
+
+/// Discover book sources one level under `library`, in a deterministic
+/// (path-sorted) order so slug disambiguation is stable across re-scans.
+fn discover(library: &Path) -> Vec<BookSource> {
+    let mut entries = match std::fs::read_dir(library) {
+        Ok(entries) => entries.flatten().map(|e| e.path()).collect::<Vec<_>>(),
+        Err(err) => {
+            tracing::error!(error = %err, library = %library.display(), "cannot read library");
+            return Vec::new();
+        }
+    };
+    entries.sort();
+
+    let mut sources = Vec::new();
+    for path in entries {
+        if path.is_file() && is_audio(&path) {
+            sources.push(BookSource::File(path));
+        } else if path.is_dir()
+            && let Some(src) = classify_dir(&path)
+        {
+            sources.push(src);
+        }
+    }
+    sources
+}
+
+/// Classify a per-book subfolder: prefer a splittable `.m4b`/`.m4a`; a lone
+/// `.mp3` is a single-file book; several `.mp3`s are a multi-track folder
+/// (Task 3.3). A folder with no audio yields nothing.
+fn classify_dir(dir: &Path) -> Option<BookSource> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut m4x = Vec::new();
+    let mut mp3 = Vec::new();
+    for path in entries.flatten().map(|e| e.path()) {
+        if !path.is_file() {
+            continue;
+        }
+        match ext_lower(&path).as_deref() {
+            Some("m4b") | Some("m4a") => m4x.push(path),
+            Some("mp3") => mp3.push(path),
+            _ => {}
+        }
+    }
+    m4x.sort();
+    mp3.sort();
+
+    if let Some(f) = m4x.into_iter().next() {
+        Some(BookSource::File(f))
+    } else if mp3.len() == 1 {
+        Some(BookSource::File(mp3.into_iter().next().unwrap()))
+    } else if !mp3.is_empty() {
+        Some(BookSource::Mp3Folder(dir.to_path_buf()))
+    } else {
+        None
+    }
+}
+
+/// Reserve `base` if free, else `base-2`, `base-3`, … Inserts the chosen slug
+/// into `seen` and returns it.
+fn unique_slug(base: &str, seen: &mut HashSet<String>) -> String {
+    if seen.insert(base.to_string()) {
+        return base.to_string();
+    }
+    let mut n = 2;
+    loop {
+        let candidate = format!("{base}-{n}");
+        if seen.insert(candidate.clone()) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// Whether a path has a recognized top-level audio extension.
+fn is_audio(p: &Path) -> bool {
+    ext_lower(p)
+        .map(|e| AUDIO_EXTENSIONS.contains(&e.as_str()))
+        .unwrap_or(false)
+}
+
+/// A path's extension, lowercased.
+fn ext_lower(p: &Path) -> Option<String> {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
 }
 
 /// Whether a path has a DRM extension we refuse to ingest.
@@ -234,6 +418,113 @@ mod tests {
         let status = cmd.arg(&input).status().expect("spawn ffmpeg");
         assert!(status.success(), "ffmpeg synth failed");
         input
+    }
+
+    fn touch(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"x").unwrap();
+    }
+
+    #[test]
+    fn unique_slug_disambiguates_collisions() {
+        let mut seen = HashSet::new();
+        assert_eq!(unique_slug("dune", &mut seen), "dune");
+        assert_eq!(unique_slug("dune", &mut seen), "dune-2");
+        assert_eq!(unique_slug("dune", &mut seen), "dune-3");
+        assert_eq!(unique_slug("other", &mut seen), "other");
+    }
+
+    #[test]
+    fn discover_finds_files_and_folders_sorted() {
+        let root = scratch("discover");
+        // Top-level single-file book, plus per-book folders of each kind.
+        touch(&root.join("Top Book.m4b"));
+        touch(&root.join("a-m4b-book/book.m4b"));
+        touch(&root.join("a-m4b-book/cover.jpg")); // ignored non-audio sibling
+        touch(&root.join("mp3-single/only.mp3")); // lone mp3 -> single-file book
+        touch(&root.join("mp3-multi/01.mp3"));
+        touch(&root.join("mp3-multi/02.mp3")); // several mp3s -> folder book
+        touch(&root.join("empty-folder/readme.txt")); // no audio -> ignored
+
+        let found = discover(&root);
+        // Path-sorted: "Top Book.m4b" < "a-m4b-book" < "mp3-multi" < "mp3-single".
+        assert_eq!(
+            found,
+            vec![
+                BookSource::File(root.join("Top Book.m4b")),
+                BookSource::File(root.join("a-m4b-book/book.m4b")),
+                BookSource::Mp3Folder(root.join("mp3-multi")),
+                BookSource::File(root.join("mp3-single/only.mp3")),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_scan_disambiguates_same_named_books() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not available");
+            return;
+        }
+        // Two books that slugify identically, in separate folders.
+        let root = scratch("dup-lib");
+        let b1 = synth(
+            &{
+                let d = root.join("Dune");
+                std::fs::create_dir_all(&d).unwrap();
+                d
+            },
+            false,
+        );
+        std::fs::rename(&b1, root.join("Dune/Dune.m4a")).unwrap();
+        let b2 = synth(
+            &{
+                let d = root.join("dune");
+                std::fs::create_dir_all(&d).unwrap();
+                d
+            },
+            false,
+        );
+        std::fs::rename(&b2, root.join("dune/Dune.m4a")).unwrap();
+
+        let data = root.join("data");
+        let index = Index::open_in_memory().unwrap();
+        let summary = scan_library(&root, &data, &index);
+
+        assert_eq!(summary.indexed, 2, "both books indexed");
+        assert_eq!(summary.skipped, 0);
+        let books = index.list_books().unwrap();
+        assert_eq!(books.len(), 2, "no clobber: two distinct rows");
+        let slugs: HashSet<_> = books.iter().map(|b| b.slug.clone()).collect();
+        assert!(
+            slugs.contains("dune") && slugs.contains("dune-2"),
+            "got {slugs:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_scan_skips_bad_books_without_aborting() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not available");
+            return;
+        }
+        let root = scratch("mixed-lib");
+        synth(&root, true); // chapters.m4a at the top level (the good book)
+        std::fs::write(root.join("broken.m4a"), b"not really audio").unwrap();
+        touch(&root.join("mp3-multi/01.mp3"));
+        touch(&root.join("mp3-multi/02.mp3"));
+
+        let data = root.join("data");
+        let index = Index::open_in_memory().unwrap();
+        let summary = scan_library(&root, &data, &index);
+
+        assert_eq!(summary.indexed, 1, "only the good book");
+        assert_eq!(summary.skipped, 2, "unprobeable file + MP3 folder skipped");
+        assert_eq!(index.list_books().unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
