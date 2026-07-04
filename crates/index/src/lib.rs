@@ -5,10 +5,41 @@
 //! the database. `rusqlite::Connection` is not `Sync`, so the server accesses an
 //! [`Index`] behind a mutex / `spawn_blocking` (Sprint 2.4); this layer is
 //! synchronous.
+//!
+//! Feed tokens (v1.5, per-book): a token is 128 bits of OS randomness rendered
+//! URL-safe. Only its BLAKE3 hash is ever persisted; the raw token is shown to
+//! the user once at mint time and is not recoverable. Validation hashes the
+//! presented token and looks it up by hash, so the raw secret is never compared
+//! directly (no timing side-channel) — see [`token`] and [`Index::token_book`].
 
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
+
+/// Feed-token primitives: generate a fresh token, and hash one for storage or
+/// lookup. Pure and side-effect-free; persistence lives on [`Index`].
+pub mod token {
+    use base64::Engine;
+
+    /// Token entropy in bytes (128 bits — NFR-S2).
+    const TOKEN_BYTES: usize = 16;
+
+    /// Generate a fresh, URL-safe feed token (128-bit, base64url, unpadded).
+    ///
+    /// Panics only if the OS RNG is unavailable, which on a running server means
+    /// the platform is broken and there's no sensible recovery.
+    pub fn generate() -> String {
+        let mut buf = [0u8; TOKEN_BYTES];
+        getrandom::getrandom(&mut buf).expect("OS RNG unavailable");
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
+    }
+
+    /// Hash a raw token for storage/lookup. Deterministic; the raw token is
+    /// never stored, so only this hash is compared.
+    pub fn hash(raw: &str) -> String {
+        blake3::hash(raw.as_bytes()).to_hex().to_string()
+    }
+}
 
 /// Schema, created on open. `IF NOT EXISTS` makes open idempotent; the
 /// `feed_token` table is defined now (used from Sprint 4) so migrations stay
@@ -83,6 +114,21 @@ pub struct EpisodeRow {
     pub duration_sec: f64,
     /// pubDate epoch seconds.
     pub pubdate_epoch: i64,
+}
+
+/// A stored feed token's metadata — never the raw token, which is shown once at
+/// mint time and not recoverable. Suitable for a revocation UI (show the hash
+/// prefix as an identifier).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TokenRow {
+    /// BLAKE3 hash of the raw token (the stored primary key).
+    pub token_hash: String,
+    /// Owning book id.
+    pub book_id: String,
+    /// Mint time (epoch seconds).
+    pub created_at: i64,
+    /// Revocation time (epoch seconds), or `None` if still active.
+    pub revoked_at: Option<i64>,
 }
 
 /// Errors from the index layer.
@@ -221,6 +267,56 @@ impl Index {
             )
             .optional()?)
     }
+
+    /// Mint a fresh per-book feed token. Returns the **raw** token (show it once —
+    /// it is not recoverable); only its BLAKE3 hash is stored. `now` is the
+    /// mint epoch (seconds).
+    pub fn mint_token(&self, book_id: &str, now: i64) -> Result<String, IndexError> {
+        let raw = token::generate();
+        self.conn.execute(
+            "INSERT INTO feed_token (token_hash, book_id, created_at, revoked_at)
+             VALUES (?1, ?2, ?3, NULL)",
+            params![token::hash(&raw), book_id, now],
+        )?;
+        Ok(raw)
+    }
+
+    /// Resolve a raw token to its still-active book id, or `None` if the token is
+    /// unknown or revoked. The lookup is by hash, so the raw secret is never
+    /// compared directly.
+    pub fn token_book(&self, raw: &str) -> Result<Option<String>, IndexError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT book_id FROM feed_token
+                 WHERE token_hash = ?1 AND revoked_at IS NULL",
+                [token::hash(raw)],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Revoke a token by its hash, effective immediately. Idempotent: returns
+    /// `true` if an active token was revoked, `false` if it was unknown or
+    /// already revoked. `now` is the revocation epoch (seconds).
+    pub fn revoke_token(&self, token_hash: &str, now: i64) -> Result<bool, IndexError> {
+        let n = self.conn.execute(
+            "UPDATE feed_token SET revoked_at = ?2
+             WHERE token_hash = ?1 AND revoked_at IS NULL",
+            params![token_hash, now],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// A book's tokens (active and revoked), newest first — for the revocation UI.
+    pub fn list_tokens(&self, book_id: &str) -> Result<Vec<TokenRow>, IndexError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT token_hash, book_id, created_at, revoked_at
+             FROM feed_token WHERE book_id = ?1 ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([book_id], token_from_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
 }
 
 fn book_from_row(row: &Row) -> rusqlite::Result<BookRow> {
@@ -246,6 +342,15 @@ fn episode_from_row(row: &Row) -> rusqlite::Result<EpisodeRow> {
         byte_length: row.get(5)?,
         duration_sec: row.get(6)?,
         pubdate_epoch: row.get(7)?,
+    })
+}
+
+fn token_from_row(row: &Row) -> rusqlite::Result<TokenRow> {
+    Ok(TokenRow {
+        token_hash: row.get(0)?,
+        book_id: row.get(1)?,
+        created_at: row.get(2)?,
+        revoked_at: row.get(3)?,
     })
 }
 
@@ -371,5 +476,99 @@ mod tests {
         let reopened = Index::open(&db).unwrap();
         assert_eq!(reopened.get_book("b1").unwrap().unwrap().title, "A Book");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- feed tokens (Task 4.1) ----
+
+    #[test]
+    fn generated_tokens_are_128_bit_url_safe_and_unique() {
+        use base64::Engine;
+        let t = token::generate();
+        // URL-safe base64, no padding, no `+`/`/`/`=`.
+        assert!(
+            t.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "not url-safe: {t}"
+        );
+        // Decodes to exactly 16 bytes (128 bits).
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&t)
+            .unwrap();
+        assert_eq!(bytes.len(), 16);
+        // Two mints don't collide (CSPRNG).
+        assert_ne!(token::generate(), token::generate());
+    }
+
+    #[test]
+    fn mint_returns_raw_but_persists_only_the_hash() {
+        let idx = Index::open_in_memory().unwrap();
+        idx.upsert_book(&book("b1", "a-book", "A Book")).unwrap();
+
+        let raw = idx.mint_token("b1", 1_700_000_000).unwrap();
+
+        // The raw token never lands in the table; only its hash does.
+        let stored: String = idx
+            .conn
+            .query_row("SELECT token_hash FROM feed_token", [], |r| r.get(0))
+            .unwrap();
+        assert_ne!(stored, raw, "raw token must not be stored");
+        assert_eq!(stored, token::hash(&raw));
+        // And it resolves back to the book.
+        assert_eq!(idx.token_book(&raw).unwrap().as_deref(), Some("b1"));
+    }
+
+    #[test]
+    fn unknown_token_resolves_to_none() {
+        let idx = Index::open_in_memory().unwrap();
+        idx.upsert_book(&book("b1", "a-book", "A Book")).unwrap();
+        assert_eq!(idx.token_book("nope-not-a-real-token").unwrap(), None);
+    }
+
+    #[test]
+    fn revoked_token_stops_resolving_but_is_still_listed() {
+        let idx = Index::open_in_memory().unwrap();
+        idx.upsert_book(&book("b1", "a-book", "A Book")).unwrap();
+        let raw = idx.mint_token("b1", 1_700_000_000).unwrap();
+        let hash = token::hash(&raw);
+
+        assert!(idx.revoke_token(&hash, 1_700_000_100).unwrap());
+        assert_eq!(idx.token_book(&raw).unwrap(), None, "revoked → no access");
+
+        // Still visible to the UI, now marked revoked.
+        let listed = idx.list_tokens("b1").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].token_hash, hash);
+        assert_eq!(listed[0].revoked_at, Some(1_700_000_100));
+
+        // Revoking again is a no-op.
+        assert!(!idx.revoke_token(&hash, 1_700_000_200).unwrap());
+    }
+
+    #[test]
+    fn multiple_tokens_per_book_all_resolve_and_list_newest_first() {
+        let idx = Index::open_in_memory().unwrap();
+        idx.upsert_book(&book("b1", "a-book", "A Book")).unwrap();
+        let t1 = idx.mint_token("b1", 1_700_000_000).unwrap();
+        let t2 = idx.mint_token("b1", 1_700_000_500).unwrap();
+
+        assert_eq!(idx.token_book(&t1).unwrap().as_deref(), Some("b1"));
+        assert_eq!(idx.token_book(&t2).unwrap().as_deref(), Some("b1"));
+
+        let listed = idx.list_tokens("b1").unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].created_at, 1_700_000_500, "newest first");
+        assert_eq!(listed[1].created_at, 1_700_000_000);
+    }
+
+    #[test]
+    fn tokens_cascade_on_book_delete() {
+        let idx = Index::open_in_memory().unwrap();
+        idx.upsert_book(&book("b1", "a-book", "A Book")).unwrap();
+        let raw = idx.mint_token("b1", 1_700_000_000).unwrap();
+        idx.conn
+            .execute("DELETE FROM book WHERE id = 'b1'", [])
+            .unwrap();
+        assert_eq!(idx.token_book(&raw).unwrap(), None);
+        assert!(idx.list_tokens("b1").unwrap().is_empty());
     }
 }
