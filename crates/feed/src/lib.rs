@@ -1,7 +1,8 @@
 //! `feed` — builds one podcast RSS 2.0 channel per book.
 //!
 //! The correctness rules here are the ones that killed Podspine's predecessors,
-//! so they are treated as first-class (a built-in self-check lands in Task 1.5):
+//! so they are treated as first-class, and the [`selfcheck`] module refuses to
+//! let a broken feed be served:
 //! - **Sequential `<pubDate>`, oldest = chapter 1.** Dates are anchored to the
 //!   source mtime and stepped so every episode lands in the past and pubDates are
 //!   strictly increasing with chapter order.
@@ -18,6 +19,8 @@ use rss::extension::itunes::{ITunesChannelExtension, ITunesItemExtension};
 use rss::{Channel, Enclosure, Guid, Item};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc2822;
+
+pub mod selfcheck;
 
 const PODCAST_NS: &str = "https://podcastindex.org/namespace/1.0";
 
@@ -162,6 +165,15 @@ pub fn build_channel(book: &FeedBook) -> Channel {
 /// Render a book's feed to an XML string.
 pub fn render(book: &FeedBook) -> String {
     build_channel(book).to_string()
+}
+
+/// Build, self-check, and render a book's feed — returning the XML only if the
+/// feed passes [`selfcheck::check`]. This is the entry point the server should
+/// use so a broken feed is never served.
+pub fn render_checked(book: &FeedBook) -> Result<String, Vec<selfcheck::SelfCheckError>> {
+    let channel = build_channel(book);
+    selfcheck::check(&channel)?;
+    Ok(channel.to_string())
 }
 
 #[cfg(test)]

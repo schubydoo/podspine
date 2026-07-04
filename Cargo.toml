@@ -21,7 +21,7 @@ tower-http = { version = "0.7", features = ["fs", "timeout", "limit", "trace"] }
 tokio = { version = "1.52", features = ["full"] }
 # feed
 rss = "2.1.0"
-time = { version = "0.3.47", features = ["formatting"] } # >=0.3.47: RUSTSEC-2026-0009
+time = { version = "0.3.47", features = ["formatting", "parsing"] } # >=0.3.47: RUSTSEC-2026-0009
 # probe / chapters (ffprobe is primary; mp4ameta is the pure-Rust fallback)
 mp4ameta = "0.13.0"
 # index / storage (bundled SQLite compiles into the static binary)
