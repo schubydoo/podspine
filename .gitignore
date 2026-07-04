@@ -18,3 +18,6 @@
 # Agent config (normally committed; kept local while planning skills run)
 /CLAUDE.md
 /.claude/
+
+# Release build output (per-arch binaries for the Docker image)
+/dist/

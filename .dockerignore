@@ -1,0 +1,4 @@
+# The image build context only needs the prebuilt binaries under dist/.
+# Ignore everything, then re-include dist/.
+*
+!dist
