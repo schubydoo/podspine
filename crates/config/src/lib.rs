@@ -127,8 +127,9 @@ pub enum ConfigError {
     ParseConfig {
         /// The path.
         path: PathBuf,
-        /// TOML error.
-        source: toml::de::Error,
+        /// TOML error (boxed — `toml::de::Error` is large, keeping
+        /// `ConfigError`/`Result` small; see clippy `result_large_err`).
+        source: Box<toml::de::Error>,
     },
 }
 
@@ -223,7 +224,7 @@ fn load_file(path: Option<&Path>) -> Result<FileConfig, ConfigError> {
     })?;
     toml::from_str(&text).map_err(|source| ConfigError::ParseConfig {
         path: path.to_path_buf(),
-        source,
+        source: Box::new(source),
     })
 }
 

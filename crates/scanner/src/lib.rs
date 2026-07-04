@@ -1032,7 +1032,10 @@ mod tests {
             eprintln!("skipping: ffmpeg not available");
             return;
         }
-        // Two books that slugify identically, in separate folders.
+        // Two books that slugify identically, in separate folders. The folder
+        // names must differ by more than case so they stay distinct on
+        // case-insensitive filesystems (Windows/macOS) — `Dune` and `Dune!`
+        // both slugify to "dune" but are two real directories everywhere.
         let root = scratch("dup-lib");
         let b1 = synth(
             &{
@@ -1045,13 +1048,13 @@ mod tests {
         std::fs::rename(&b1, root.join("Dune/Dune.m4a")).unwrap();
         let b2 = synth(
             &{
-                let d = root.join("dune");
+                let d = root.join("Dune!");
                 std::fs::create_dir_all(&d).unwrap();
                 d
             },
             false,
         );
-        std::fs::rename(&b2, root.join("dune/Dune.m4a")).unwrap();
+        std::fs::rename(&b2, root.join("Dune!/Dune.m4a")).unwrap();
 
         let data = root.join("data");
         let index = Index::open_in_memory().unwrap();
