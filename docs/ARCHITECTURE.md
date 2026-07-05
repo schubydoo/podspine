@@ -92,14 +92,21 @@ that the path-safety check enforces. `book` and `episode` rows carry the on-disk
 
 ## HTTP surface
 
-| Route | Purpose |
-|---|---|
-| `GET /` | Browsable book grid (UI). |
-| `GET /book/{slug}` | Per-book page: copy-feed-URL, QR code, per-app how-to. |
-| `GET /cover/{slug}` | Book cover image. |
-| `GET /feed/{slug}.xml` | The podcast feed (built from the index, passed through the self-check). |
-| `GET /audio/{slug}/{n}` | Episode audio with HTTP Range (206 / `Content-Range` / 416) via `axum-range`. |
-| `GET /healthz` | Liveness. |
+Routes split into two surfaces. The **browse UI** is keyed by the human `slug` and
+enumerates the library, so it's meant for the LAN / behind proxy-auth. The
+**capability surface** is keyed by a random, unguessable per-book `feed_id` and is
+safe to expose externally (a guessed id 404s); see
+[DEPLOYMENT.md](DEPLOYMENT.md#exposing-podspine-safely).
+
+| Route | Surface | Purpose |
+|---|---|---|
+| `GET /` | UI (slug) | Browsable book grid. |
+| `GET /book/{slug}` | UI (slug) | Per-book page: copy capability-feed-URL, QR code, per-app how-to, **Regenerate link**. |
+| `POST /book/{slug}/regenerate` | UI (slug) | Rotate the book's `feed_id` (leak recovery); same-origin/CSRF-guarded. |
+| `GET /feed/{feed_id}.xml` | capability | The podcast feed (built from the index, passed through the self-check); always `itunes:block` + `X-Robots-Tag: noindex`. |
+| `GET /audio/{feed_id}/{n}` | capability | Episode audio with HTTP Range (206 / `Content-Range` / 416) via `axum-range`. |
+| `GET /cover/{feed_id}` | capability | Book cover image. |
+| `GET /healthz` | — | Liveness. |
 
 ## Invariants
 

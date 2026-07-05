@@ -4,10 +4,11 @@ Running Podspine in a homelab. For a first run, the [README quick start](../READ
 is enough; this page covers the production details: persistence, exposing it safely,
 and running it as a service.
 
-> **Podspine has no authentication.** It's designed as trusted, host-local
-> infrastructure. Bind it to loopback, or put a reverse proxy with auth in front of
-> it before exposing it to a network — anyone who can reach the port can read your
-> feeds and audio. See [SECURITY.md](../SECURITY.md).
+> **Podspine has no built-in login.** It splits into two surfaces (see
+> [Exposing Podspine safely](#exposing-podspine-safely) below): the **feed/audio/cover**
+> routes are protected by an unguessable per-book **capability URL** and are safe to
+> expose to the internet, while the **browse UI** enumerates your whole library and
+> must stay on your LAN or behind proxy-auth. See [SECURITY.md](../SECURITY.md).
 
 ## Configuration
 
@@ -28,6 +29,22 @@ that precedence. The library path is the only required input.
 > URLs are built from it. If it's left at `localhost`, a podcatcher on another device
 > can't fetch anything. Set it to the LAN IP / hostname (and scheme + port, or the
 > public URL if behind a proxy) that clients actually reach.
+
+## Exposing Podspine safely
+
+Podspine has two kinds of routes, and they want different exposure:
+
+| Surface | Routes | Keyed by | Expose to the internet? |
+|---|---|---|---|
+| **Capability** | `GET /feed/{id}.xml`, `/audio/{id}/{n}`, `/cover/{id}`, `/healthz` | a random, unguessable per-book `feed_id` | **Yes** — a guessed id just 404s, and feeds carry `itunes:block` + `X-Robots-Tag: noindex` so they aren't listed or crawled |
+| **Browse UI** | `GET /`, `/book/{slug}`, `POST /book/{slug}/regenerate` | the human `slug` | **No** — `GET /` lists every book, handing out the "unguessable" URLs. Keep it on the LAN or behind proxy-auth |
+
+This is what lets you subscribe to a book and stream it **on the road without a VPN**:
+you copy the capability feed URL (or scan its QR) from the book page **on your LAN**,
+add it to your podcast app, and only the capability routes ever need to be reachable
+externally. If a link leaks, hit **Regenerate** on the book page — the old URL dies.
+
+The reverse-proxy configs below implement exactly this split.
 
 ## Docker
 
@@ -108,17 +125,33 @@ sudo systemctl daemon-reload && sudo systemctl enable --now podspine
 
 ## Reverse proxy
 
-Front Podspine with a proxy to add TLS and (recommended) auth. The one hard
-requirement: **pass through `Range` and `Accept-Ranges`** — podcast apps use HTTP
-Range to seek/scrub, and stripping it breaks playback. Also set `PODSPINE_BASE_URL`
-to the public URL so generated links match.
+Front Podspine with a proxy for TLS, and use it to enforce the [surface
+split](#exposing-podspine-safely): expose only the capability routes publicly, keep
+the browse UI private. Two hard requirements:
+
+1. **Pass through `Range` and `Accept-Ranges`** on `/audio/*` — podcast apps use HTTP
+   Range to seek/scrub; stripping it breaks playback.
+2. Set `PODSPINE_BASE_URL` to the **public** URL so generated feed/audio links match.
+
+The configs below publish `/feed`, `/audio`, `/cover`, `/healthz` and refuse the
+browse UI (`/`, `/book/*`) — you use the UI over the LAN. (Prefer one authenticated
+hostname instead? Drop the `@ui`/`location /` blocks and put `basicauth`/`auth_basic`
+on the whole server — just never require auth on `/feed`,`/audio`,`/cover`, since
+podcast apps can't log in.)
 
 **Caddy** (Range passes through automatically):
 
 ```caddy
 podspine.example.com {
-    reverse_proxy 127.0.0.1:8080
-    # basic auth (optional): basicauth { user <bcrypt-hash> }
+    # Public: the capability surface only (unguessable per-book URLs).
+    @capability path /feed/* /audio/* /cover/* /healthz
+    handle @capability {
+        reverse_proxy 127.0.0.1:8080
+    }
+    # Browse UI + regenerate enumerate the library — not reachable from the public host.
+    handle {
+        respond 404
+    }
 }
 ```
 
@@ -127,14 +160,19 @@ podspine.example.com {
 ```nginx
 server {
     server_name podspine.example.com;
-    location / {
+
+    # Public capability surface: feeds, cover, and audio (with Range).
+    location ~ ^/(feed|audio|cover)/ {
         proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host $host;
         proxy_set_header Range $http_range;               # forward seek requests
         proxy_set_header If-Range $http_if_range;
         proxy_buffering off;                              # stream large audio
-        # auth_basic "Podspine"; auth_basic_user_file /etc/nginx/.htpasswd;
     }
+    location = /healthz { proxy_pass http://127.0.0.1:8080; }
+
+    # Browse UI + management enumerate the library — not exposed here (use the LAN).
+    location / { return 404; }
 }
 ```
 
@@ -146,9 +184,11 @@ compose example above) or an uptime monitor.
 ## Data, backups, and updating
 
 - **Back up `<data_dir>`** — `podspine.db` plus `books/`. The DB is the source of
-  truth for slugs, episode order, and stable guids; losing it means feeds get new
-  guids on the next scan (subscribers may re-download). The `books/` tree can be
-  regenerated by re-scanning the library, but backing it up avoids the re-split.
+  truth for slugs, **capability `feed_id`s**, episode order, and stable guids. Losing
+  it is disruptive: a rescan mints **new capability URLs** (every existing feed link
+  breaks and must be re-shared) and new guids (subscribers may re-download). The
+  `books/` tree can be regenerated by re-scanning the library, but backing it up
+  avoids the re-split.
 - **Your source library** is never modified — Podspine only reads it.
 - **Updating:** pull the new image (or drop in the new binary) and restart. The
   library is re-scanned on startup; unchanged books are idempotent (no re-split), so

@@ -1,16 +1,18 @@
 # Adding a Podspine feed to your podcast app
 
-Every book has its own feed URL. In the Podspine web UI (`http://<host>:8080/`),
-open a book and use **Copy feed URL** (or scan the QR code with your phone). The
-URL looks like:
+Every book has its own feed URL — a private, unguessable **capability link**. In the
+Podspine web UI (`http://<host>:8080/`), open a book and use **Copy feed URL** (or
+scan the QR code with your phone). The URL looks like:
 
 ```
-http://<your-host>:8080/feed/<book-slug>.xml
+http://<your-host>:8080/feed/<feed_id>.xml
 ```
 
-Then add it as a podcast **by URL** in your app. Most apps hide this behind an
-"add by URL / RSS" option because it's not something you search the public
-directory for.
+where `<feed_id>` is a random per-book id (not the title). Treat it like a password —
+anyone with it can subscribe. If it leaks, use **Regenerate link** on the book page
+to replace it (the old URL stops working). Then add it as a podcast **by URL** in your
+app. Most apps hide this behind an "add by URL / RSS" option because these feeds are
+deliberately kept out of the public podcast directories.
 
 ## Per-app steps
 

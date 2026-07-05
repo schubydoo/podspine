@@ -67,8 +67,11 @@ The library path is the only required input; everything else has a default and c
 be set via CLI flag, environment variable, or a TOML file (`--config`), in that
 precedence. See the **[full option reference](docs/DEPLOYMENT.md#configuration)**.
 
-Endpoints: `/` (browse UI), `/book/{slug}` (feed URL + QR), `/feed/{slug}.xml`
-(the podcast feed), `/audio/{slug}/{n}` (episode audio, HTTP Range), `/healthz`.
+Each book's feed lives at an unguessable **capability URL** — `/feed/{feed_id}.xml`,
+with `/audio/{feed_id}/{n}` (episode audio, HTTP Range) and `/cover/{feed_id}`. The
+browse UI (`/`, `/book/{slug}`) enumerates your library, so keep it on the LAN or
+behind proxy-auth while the capability routes are safe to expose — see
+**[exposing Podspine safely](docs/DEPLOYMENT.md#exposing-podspine-safely)**.
 
 ## Supported formats
 

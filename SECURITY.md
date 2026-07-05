@@ -23,9 +23,13 @@ Podspine is **trusted, host-local infrastructure** for a homelab — it turns a
 folder of audiobooks into podcast feeds on the machine it runs on. It is not a
 multi-tenant service. Key considerations:
 
-- **No authentication by default.** Bind to loopback, or put a trusted reverse
-  proxy (with auth) in front of it before exposing it to a network. Anyone who
-  can reach the port can read your feeds and audio.
+- **No built-in login; two exposure surfaces.** Feed/audio/cover routes are
+  protected by an unguessable per-book **capability URL** (`feed_id`) and are safe
+  to expose to a network. The **browse UI** (`/`, `/book/*`) enumerates the whole
+  library and must stay on the LAN or behind a trusted reverse proxy with auth —
+  it hands out those capability URLs. The state-changing `POST /book/*/regenerate`
+  shares the UI boundary and is additionally same-origin/CSRF-guarded. See
+  [DEPLOYMENT.md](docs/DEPLOYMENT.md#exposing-podspine-safely).
 - **The library and data directory are trusted inputs.** Podspine reads the
   library you point it at and writes split episodes + a SQLite index into the
   data directory. Point it only at content you control.
