@@ -134,10 +134,14 @@ jobs:
             release/checksums.txt.sigstore.json
             release/podspine.intoto.jsonl
           )
+          # A tag with a hyphen (v1.0.0-rc.1, -beta …) is a pre-release: mark it so it
+          # doesn't become the repo's "Latest release". SemVer build/pre-release marker.
+          prerelease=""
+          case "$TAG" in *-*) prerelease="--prerelease" ;; esac
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "${assets[@]}" --clobber
           else
-            gh release create "$TAG" "${assets[@]}" --title "$TAG" --generate-notes
+            gh release create "$TAG" "${assets[@]}" --title "$TAG" --generate-notes $prerelease
           fi
 
   image:
@@ -181,7 +185,10 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
+            # Only move :latest for a stable release; a pre-release tag (v1.0.0-rc.1)
+            # must not claim :latest. type=semver already skips {{major}}.{{minor}} for
+            # pre-releases, but type=raw is unconditional, so guard it explicitly.
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
       - name: Build and push
         id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
