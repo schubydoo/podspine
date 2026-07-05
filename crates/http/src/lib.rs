@@ -1,21 +1,26 @@
 //! `http` — the Axum HTTP surface.
 //!
-//! Routes:
+//! Routes split into two surfaces (v1.5):
+//! - **Browse UI (keyed by human `slug`)** — meant for the LAN / behind
+//!   proxy-auth; it enumerates the library, so it must not be publicly exposed:
+//!   - `GET /` — the browsable book grid.
+//!   - `GET /book/{slug}` — a book's page: copy-feed-URL, QR, how-to panel.
+//! - **Public capability surface (keyed by unguessable `feed_id`)** — safe to
+//!   expose externally; a guessed id reveals nothing (404):
+//!   - `GET /feed/{feed_id}.xml` — the podcast feed (built from the index and
+//!     passed through the feed self-check before serving).
+//!   - `GET /audio/{feed_id}/{number}` — an episode file with HTTP Range support
+//!     (206 / `Content-Range` / 416) via `axum-range`.
+//!   - `GET /cover/{feed_id}` — the book's cover image.
 //! - `GET /healthz` — liveness.
-//! - `GET /` — the browsable book grid (UI).
-//! - `GET /book/{slug}` — a book's page: copy-feed-URL, QR, how-to panel (UI).
-//! - `GET /cover/{slug}` — the book's cover image (once extracted, Task 3.4).
-//! - `GET /feed/{slug}.xml` — the podcast feed, built from the index and passed
-//!   through the feed self-check before serving.
-//! - `GET /audio/{slug}/{number}` — an episode file with HTTP Range support
-//!   (206 / `Content-Range` / 416) via `axum-range`.
 //!
 //! Book/episode keys are resolved server-side through the index; the file path
 //! served comes from the database (written at scan time), never built from user
-//! input. Hardening (Task 3.5, TAD §7): every slug is validated against an
-//! allow-list charset ([`valid_slug`]) so `..`/separators/absolute markers 404
-//! before touching the DB or filesystem; as defense-in-depth the resolved audio
-//! path is still canonicalized and asserted to live under the data dir; a
+//! input. Hardening (Task 3.5, TAD §7): the human slug is validated against an
+//! allow-list charset ([`valid_slug`]) and the capability id against
+//! [`valid_feed_id`], so `..`/separators/absolute markers 404 before touching
+//! the DB or filesystem; as defense-in-depth the resolved audio path is still
+//! canonicalized and asserted to live under the data dir; a
 //! `ConcurrencyLimitLayer` bounds in-flight requests alongside the timeout and
 //! body-limit layers. Errors never leak filesystem paths or ffmpeg stderr (that
 //! detail is logged, collapsed to a bare status for the client). See TAD §4/§7.
@@ -60,6 +65,20 @@ fn valid_slug(slug: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+/// Whether a string is a syntactically valid capability `feed_id`: non-empty,
+/// bounded length, and the URL-safe base64 alphabet (`[A-Za-z0-9_-]`) that
+/// [`podspine_index::capability::generate`] produces. Same purpose as
+/// [`valid_slug`] — reject traversal/separator input before the DB/filesystem —
+/// but a wider charset because the id is random, not a lowercase slug. A bad id
+/// 404s (no oracle); a well-formed but unknown id also 404s.
+fn valid_feed_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 /// Shared server state.
 #[derive(Clone)]
 pub struct AppState {
@@ -100,9 +119,9 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/", get(index))
         .route("/book/{slug}", get(book))
-        .route("/cover/{slug}", get(cover))
-        .route("/feed/{slug}", get(feed))
-        .route("/audio/{slug}/{number}", get(audio))
+        .route("/cover/{feed_id}", get(cover))
+        .route("/feed/{feed_id}", get(feed))
+        .route("/audio/{feed_id}/{number}", get(audio))
         .layer(TraceLayer::new_for_http())
         // Bounds only response *production* (not the streamed body), so large
         // audio downloads aren't truncated.
@@ -129,20 +148,26 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
-/// `GET /feed/{slug}.xml` — the route captures `{slug}` including the `.xml`
-/// suffix, which we strip before lookup.
+/// `GET /feed/{feed_id}.xml` — the route captures `{feed_id}` including the
+/// `.xml` suffix, which we strip before lookup. The capability URL is never
+/// crawlable: an `X-Robots-Tag: noindex` keeps it out of web search engines
+/// (the `itunes:block` in the XML separately keeps it out of podcast directories
+/// when the book isn't `indexable`).
 async fn feed(
     State(state): State<AppState>,
-    Path(slug_xml): Path<String>,
+    Path(id_xml): Path<String>,
 ) -> Result<Response, AppError> {
-    let slug = slug_xml.strip_suffix(".xml").ok_or(AppError::NotFound)?;
-    if !valid_slug(slug) {
+    let feed_id = id_xml.strip_suffix(".xml").ok_or(AppError::NotFound)?;
+    if !valid_feed_id(feed_id) {
         return Err(AppError::NotFound);
     }
-    let xml = build_feed_xml(&state, slug)?;
+    let xml = build_feed_xml(&state, feed_id)?;
     Ok((
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/rss+xml; charset=utf-8")],
+        [
+            ("content-type", "application/rss+xml; charset=utf-8"),
+            ("x-robots-tag", "noindex, nofollow"),
+        ],
         xml,
     )
         .into_response())
@@ -158,6 +183,7 @@ async fn index(State(state): State<AppState>) -> Result<Html<String>, AppError> 
         .into_iter()
         .map(|b| BookCard {
             slug: b.slug,
+            feed_id: b.feed_id,
             title: b.title,
             author: b.author,
             has_cover: b.cover_path.is_some(),
@@ -188,8 +214,9 @@ async fn book(
     };
 
     let detail = BookDetail {
-        feed_url: format!("{}/feed/{}.xml", state.base_url, book.slug),
+        feed_url: format!("{}/feed/{}.xml", state.base_url, book.feed_id),
         slug: book.slug,
+        feed_id: book.feed_id,
         title: book.title,
         author: book.author,
         has_cover: book.cover_path.is_some(),
@@ -198,20 +225,21 @@ async fn book(
     Ok(Html(book_page(&detail).into_string()))
 }
 
-/// `GET /cover/{slug}` — the book's cover image. Covers are populated by cover
+/// `GET /cover/{feed_id}` — the book's cover image, keyed by capability id so it
+/// isn't a guessable catalog-probe surface. Covers are populated by cover
 /// extraction (Task 3.4); until then books have no cover and this 404s. The
 /// stored path is canonicalized and confirmed under the data dir before serving.
 async fn cover(
     State(state): State<AppState>,
-    Path(slug): Path<String>,
+    Path(feed_id): Path<String>,
 ) -> Result<Response, AppError> {
-    if !valid_slug(&slug) {
+    if !valid_feed_id(&feed_id) {
         return Err(AppError::NotFound);
     }
     let cover_path = {
         let index = state.index.lock().map_err(AppError::internal)?;
         index
-            .get_book_by_slug(&slug)
+            .get_book_by_feed_id(&feed_id)
             .map_err(AppError::internal)?
             .ok_or(AppError::NotFound)?
             .cover_path
@@ -222,7 +250,7 @@ async fn cover(
         .canonicalize()
         .map_err(|_| AppError::NotFound)?;
     if !canonical.starts_with(&state.data_dir) {
-        tracing::warn!(slug, "resolved cover path escaped the data dir");
+        tracing::warn!(feed_id, "resolved cover path escaped the data dir");
         return Err(AppError::NotFound);
     }
     let bytes = tokio::fs::read(&canonical)
@@ -236,25 +264,27 @@ async fn cover(
         .into_response())
 }
 
-/// `GET /audio/{slug}/{number}` — stream an episode with Range support.
+/// `GET /audio/{feed_id}/{number}` — stream an episode with Range support.
 async fn audio(
     State(state): State<AppState>,
-    Path((slug, number)): Path<(String, u32)>,
+    Path((feed_id, number)): Path<(String, u32)>,
     range: Option<TypedHeader<Range>>,
 ) -> Result<Ranged<KnownSize<File>>, AppError> {
-    let path = resolve_audio_path(&state, &slug, number)?;
+    let path = resolve_audio_path(&state, &feed_id, number)?;
     let file = File::open(&path).await.map_err(|_| AppError::NotFound)?;
     let body = KnownSize::file(file).await.map_err(AppError::internal)?;
     let range = range.map(|TypedHeader(range)| range);
     Ok(Ranged::new(range, body))
 }
 
-/// Build and self-check the feed XML for a slug.
-fn build_feed_xml(state: &AppState, slug: &str) -> Result<String, AppError> {
+/// Build and self-check the feed XML for a capability `feed_id`. All public URLs
+/// in the feed (self link, enclosures, cover) are built from `feed_id` so the
+/// whole book is reachable from the one capability, and nothing guessable.
+fn build_feed_xml(state: &AppState, feed_id: &str) -> Result<String, AppError> {
     let (book, episodes) = {
         let index = state.index.lock().map_err(AppError::internal)?;
         let book = index
-            .get_book_by_slug(slug)
+            .get_book_by_feed_id(feed_id)
             .map_err(AppError::internal)?
             .ok_or(AppError::NotFound)?;
         let episodes = index
@@ -264,12 +294,12 @@ fn build_feed_xml(state: &AppState, slug: &str) -> Result<String, AppError> {
     };
 
     let base = &state.base_url;
-    // Per-book cover served at /cover/{slug} when extracted; otherwise the
+    // Per-book cover served at /cover/{feed_id} when extracted; otherwise the
     // configured feed-level fallback (or no image at all). See Task 3.4.
     let cover_url = book
         .cover_path
         .as_ref()
-        .map(|_| format!("{base}/cover/{slug}"))
+        .map(|_| format!("{base}/cover/{feed_id}"))
         .or_else(|| state.default_cover_url.clone());
     let feed_book = FeedBook {
         id: book.id,
@@ -278,13 +308,15 @@ fn build_feed_xml(state: &AppState, slug: &str) -> Result<String, AppError> {
         description: None,
         cover_url,
         source_mtime: book.source_mtime,
-        self_url: format!("{base}/feed/{slug}.xml"),
+        self_url: format!("{base}/feed/{feed_id}.xml"),
+        // Not indexable → ask podcast directories not to list it (itunes:block).
+        blocked: !book.indexable,
         episodes: episodes
             .iter()
             .map(|e| FeedEpisode {
                 idx: e.idx as usize,
                 title: e.title.clone(),
-                audio_url: format!("{base}/audio/{slug}/{}", e.idx + 1),
+                audio_url: format!("{base}/audio/{feed_id}/{}", e.idx + 1),
                 byte_length: e.byte_length as u64,
                 duration_sec: e.duration_sec,
                 mime_type: mime_for(&e.file_path).to_string(),
@@ -293,14 +325,14 @@ fn build_feed_xml(state: &AppState, slug: &str) -> Result<String, AppError> {
     };
 
     render_checked(&feed_book).map_err(|errs| {
-        tracing::error!(?errs, slug, "feed failed self-check");
+        tracing::error!(?errs, feed_id, "feed failed self-check");
         AppError::Internal
     })
 }
 
-/// Resolve `(slug, episode number)` to a validated on-disk path.
-fn resolve_audio_path(state: &AppState, slug: &str, number: u32) -> Result<PathBuf, AppError> {
-    if !valid_slug(slug) {
+/// Resolve `(feed_id, episode number)` to a validated on-disk path.
+fn resolve_audio_path(state: &AppState, feed_id: &str, number: u32) -> Result<PathBuf, AppError> {
+    if !valid_feed_id(feed_id) {
         return Err(AppError::NotFound);
     }
     let idx = number.checked_sub(1).ok_or(AppError::NotFound)? as i64;
@@ -308,7 +340,7 @@ fn resolve_audio_path(state: &AppState, slug: &str, number: u32) -> Result<PathB
     let file_path = {
         let index = state.index.lock().map_err(AppError::internal)?;
         let book = index
-            .get_book_by_slug(slug)
+            .get_book_by_feed_id(feed_id)
             .map_err(AppError::internal)?
             .ok_or(AppError::NotFound)?;
         index
@@ -326,7 +358,7 @@ fn resolve_audio_path(state: &AppState, slug: &str, number: u32) -> Result<PathB
         .canonicalize()
         .map_err(|_| AppError::NotFound)?;
     if !canonical.starts_with(&state.data_dir) {
-        tracing::warn!(slug, number, "resolved audio path escaped the data dir");
+        tracing::warn!(feed_id, number, "resolved audio path escaped the data dir");
         return Err(AppError::NotFound);
     }
     Ok(canonical)
@@ -420,6 +452,28 @@ mod tests {
             "café",
         ] {
             assert!(!valid_slug(bad), "must reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn valid_feed_id_allow_list() {
+        // Accepts the URL-safe base64 alphabet capability::generate produces.
+        assert!(valid_feed_id("Xk9mQ2vP7nR4tB1cY6wZ8a"));
+        assert!(valid_feed_id("aA0-_zZ"));
+        // Rejects traversal / separators / dots / empty / over-long.
+        for bad in [
+            "",
+            "..",
+            "../etc/passwd",
+            "a/b",
+            "a\\b",
+            "a.b",
+            "a b",
+            "a%2e",
+            "café",
+            &"x".repeat(65),
+        ] {
+            assert!(!valid_feed_id(bad), "must reject {bad:?}");
         }
     }
 

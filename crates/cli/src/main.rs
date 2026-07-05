@@ -106,6 +106,7 @@ fn run(args: &Args) -> Result<()> {
         cover_url: None,
         source_mtime,
         self_url: format!("{base}/feed/{id}.xml"),
+        blocked: false,
         episodes: feed_episodes,
     };
 

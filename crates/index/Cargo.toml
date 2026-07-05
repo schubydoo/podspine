@@ -12,3 +12,6 @@ publish = false
 [dependencies]
 rusqlite = { workspace = true }
 thiserror = { workspace = true }
+# capability feed ids (v1.5): 128-bit random -> URL-safe base64 (stored raw)
+getrandom = { workspace = true }
+base64 = { workspace = true }

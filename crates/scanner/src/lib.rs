@@ -182,12 +182,14 @@ pub fn scan_book_as(
     let book = BookRow {
         id: id.clone(),
         slug: id.clone(),
+        feed_id: podspine_index::capability::generate(),
         title: file_stem(input),
         author: None,
         cover_path,
         source_path: input.to_string_lossy().into_owned(),
         source_mtime,
         status: "ready".to_string(),
+        indexable: false,
     };
     index.upsert_book(&book)?;
 
@@ -280,12 +282,14 @@ fn scan_mp3_folder(
     let book = BookRow {
         id: id.to_string(),
         slug: id.to_string(),
+        feed_id: podspine_index::capability::generate(),
         title: dir_name(dir),
         author: None,
         cover_path: None,
         source_path: dir.to_string_lossy().into_owned(),
         source_mtime,
         status: "ready".to_string(),
+        indexable: false,
     };
     index.upsert_book(&book)?;
 

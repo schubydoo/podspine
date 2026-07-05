@@ -62,6 +62,9 @@ pub struct FeedBook {
     pub source_mtime: i64,
     /// The feed's own URL (channel `<link>`).
     pub self_url: String,
+    /// Keep this feed out of podcast directories (`itunes:block`). Private
+    /// capability feeds set this so an unguessable URL isn't advertised anywhere.
+    pub blocked: bool,
     /// Episodes in chapter order (idx ascending).
     pub episodes: Vec<FeedEpisode>,
 }
@@ -153,6 +156,10 @@ pub fn build_channel(book: &FeedBook) -> Channel {
     ch_it.set_author(book.author.clone());
     ch_it.set_image(book.cover_url.clone());
     ch_it.set_summary(book.description.clone());
+    // Private capability feeds ask directories not to list them.
+    if book.blocked {
+        ch_it.set_block(Some("Yes".to_string()));
+    }
     channel.set_itunes_ext(Some(ch_it));
 
     // The rss crate emits xmlns:itunes automatically when itunes_ext is set; we
@@ -202,6 +209,7 @@ mod tests {
             cover_url: Some("http://host/cover.jpg".to_string()),
             source_mtime: mtime,
             self_url: "http://host/feed/book.xml".to_string(),
+            blocked: false,
             episodes,
         }
     }

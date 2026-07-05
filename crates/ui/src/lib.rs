@@ -15,27 +15,32 @@ use qrcode::render::svg;
 
 /// One book as shown in the grid on `GET /`.
 pub struct BookCard {
-    /// URL slug (also the `/book/{slug}` and `/cover/{slug}` key).
+    /// URL slug — the human `/book/{slug}` key (browse UI only).
     pub slug: String,
+    /// Capability id — the `/cover/{feed_id}` key (unguessable).
+    pub feed_id: String,
     /// Human title.
     pub title: String,
     /// Author, if known.
     pub author: Option<String>,
-    /// Whether a cover image is available to serve at `/cover/{slug}`.
+    /// Whether a cover image is available to serve at `/cover/{feed_id}`.
     pub has_cover: bool,
 }
 
 /// A single book's detail page (`GET /book/{slug}`).
 pub struct BookDetail {
-    /// URL slug.
+    /// URL slug — the human `/book/{slug}` key (also the base for future
+    /// regenerate/indexable POST actions).
     pub slug: String,
+    /// Capability id — the `/cover/{feed_id}` key (unguessable).
+    pub feed_id: String,
     /// Human title.
     pub title: String,
     /// Author, if known.
     pub author: Option<String>,
-    /// Whether a cover image is available to serve at `/cover/{slug}`.
+    /// Whether a cover image is available to serve at `/cover/{feed_id}`.
     pub has_cover: bool,
-    /// The exact, working feed URL (what "copy" yields and the QR encodes).
+    /// The exact, working capability feed URL (what "copy" yields, QR encodes).
     pub feed_url: String,
     /// Number of episodes (chapters) in the feed.
     pub episode_count: usize,
@@ -117,7 +122,9 @@ fn page(title: &str, body: Markup) -> Markup {
 }
 
 /// A cover `<img>` when available, else an accessible lettered placeholder.
-fn cover(slug: &str, title: &str, has_cover: bool, class: &str) -> Markup {
+/// `id` is the book's capability `feed_id` — covers are served at
+/// `/cover/{feed_id}`, never the guessable slug.
+fn cover(id: &str, title: &str, has_cover: bool, class: &str) -> Markup {
     let initial = title
         .chars()
         .next()
@@ -126,7 +133,7 @@ fn cover(slug: &str, title: &str, has_cover: bool, class: &str) -> Markup {
         .to_string();
     html! {
         @if has_cover {
-            img class=(class) src=(format!("/cover/{slug}")) alt=(format!("Cover of {title}")) loading="lazy";
+            img class=(class) src=(format!("/cover/{id}")) alt=(format!("Cover of {title}")) loading="lazy";
         } @else {
             div class=(format!("{class} placeholder")) role="img" aria-label=(format!("No cover art for {title}")) {
                 span aria-hidden="true" { (initial) }
@@ -148,7 +155,7 @@ pub fn index_page(books: &[BookCard]) -> Markup {
                         @for b in books {
                             li.card {
                                 a href=(format!("/book/{}", b.slug)) {
-                                    (cover(&b.slug, &b.title, b.has_cover, "cover"))
+                                    (cover(&b.feed_id, &b.title, b.has_cover, "cover"))
                                     span.title { (b.title) }
                                     @if let Some(a) = &b.author { span.author { (a) } }
                                 }
@@ -170,7 +177,7 @@ pub fn book_page(book: &BookDetail) -> Markup {
             main {
                 a.back href="/" { "← All books" }
                 div.detail {
-                    (cover(&book.slug, &book.title, book.has_cover, "cover"))
+                    (cover(&book.feed_id, &book.title, book.has_cover, "cover"))
                     div {
                         h1 { (book.title) }
                         @if let Some(a) = &book.author { p.author { (a) } }
@@ -235,6 +242,7 @@ mod tests {
     fn card(slug: &str, title: &str, has_cover: bool) -> BookCard {
         BookCard {
             slug: slug.into(),
+            feed_id: format!("cap-{slug}"),
             title: title.into(),
             author: Some("An Author".into()),
             has_cover,
@@ -251,7 +259,8 @@ mod tests {
         assert!(html.contains("href=\"/book/dune\""));
         assert!(html.contains("href=\"/book/solaris\""));
         // Cover present -> img with alt; absent -> labelled placeholder.
-        assert!(html.contains("src=\"/cover/dune\""));
+        // Covers are served by capability id, not the slug.
+        assert!(html.contains("src=\"/cover/cap-dune\""));
         assert!(html.contains("alt=\"Cover of Dune\""));
         assert!(html.contains("aria-label=\"No cover art for Solaris\""));
     }
@@ -267,16 +276,18 @@ mod tests {
     fn book_page_has_exact_feed_url_and_qr() {
         let book = BookDetail {
             slug: "dune".into(),
+            feed_id: "Xk9mQ2vP7nR4tB1cY6wZ8a".into(),
             title: "Dune".into(),
             author: Some("Frank Herbert".into()),
             has_cover: true,
-            feed_url: "http://host:8080/feed/dune.xml".into(),
+            feed_url: "http://host:8080/feed/Xk9mQ2vP7nR4tB1cY6wZ8a.xml".into(),
             episode_count: 12,
         };
         let html = book_page(&book).into_string();
-        // The copy input carries the exact working URL, and it appears in the panel.
-        assert!(html.contains("value=\"http://host:8080/feed/dune.xml\""));
-        assert!(html.contains("<code>http://host:8080/feed/dune.xml</code>"));
+        // The copy input carries the exact working (capability) URL, and it
+        // appears in the panel.
+        assert!(html.contains("value=\"http://host:8080/feed/Xk9mQ2vP7nR4tB1cY6wZ8a.xml\""));
+        assert!(html.contains("<code>http://host:8080/feed/Xk9mQ2vP7nR4tB1cY6wZ8a.xml</code>"));
         assert!(html.contains("12 episodes"));
         // QR rendered as inline SVG, labelled for AT.
         assert!(html.contains("<svg"));

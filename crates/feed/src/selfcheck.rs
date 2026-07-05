@@ -176,6 +176,7 @@ mod tests {
             cover_url: Some("http://host/cover.jpg".to_string()),
             source_mtime: 1_700_000_000,
             self_url: "http://host/feed/book.xml".to_string(),
+            blocked: false,
             episodes,
         }
     }

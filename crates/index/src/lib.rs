@@ -5,24 +5,52 @@
 //! the database. `rusqlite::Connection` is not `Sync`, so the server accesses an
 //! [`Index`] behind a mutex / `spawn_blocking` (Sprint 2.4); this layer is
 //! synchronous.
+//!
+//! Feed privacy (v1.5) is a **capability URL**: each book carries a random,
+//! unguessable `feed_id` (128 bits) that is the public key for its feed, audio,
+//! and cover — the human `slug` is only for the LAN browse UI. The `feed_id` is
+//! stable across re-scans (preserved on upsert) and rotated only on an explicit
+//! [`Index::regenerate_feed_id`] (leak recovery). `indexable` gates whether the
+//! feed advertises itself to podcast directories (`itunes:block`).
 
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
-/// Schema, created on open. `IF NOT EXISTS` makes open idempotent; the
-/// `feed_token` table is defined now (used from Sprint 4) so migrations stay
-/// forward-only.
+/// Capability-id generation: an unguessable, URL-safe feed id. Stored raw (it is
+/// the owner's own retrievable link, shown in the UI and QR — not a hashed
+/// per-subscriber secret).
+pub mod capability {
+    use base64::Engine;
+
+    /// Capability entropy in bytes (128 bits).
+    const ID_BYTES: usize = 16;
+
+    /// Generate a fresh, URL-safe capability id (128-bit, base64url, unpadded).
+    ///
+    /// Panics only if the OS RNG is unavailable (an unrecoverable platform fault).
+    pub fn generate() -> String {
+        let mut buf = [0u8; ID_BYTES];
+        getrandom::getrandom(&mut buf).expect("OS RNG unavailable");
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
+    }
+}
+
+/// Schema, created on open. `IF NOT EXISTS` makes open idempotent. Pre-release:
+/// changing this is a fresh-schema change (delete an old `data/podspine.db` and
+/// re-scan) — no migration path is maintained before v1.
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS book (
     id           TEXT PRIMARY KEY,
     slug         TEXT NOT NULL UNIQUE,
+    feed_id      TEXT NOT NULL UNIQUE,
     title        TEXT NOT NULL,
     author       TEXT,
     cover_path   TEXT,
     source_path  TEXT NOT NULL,
     source_mtime INTEGER NOT NULL,
-    status       TEXT NOT NULL
+    status       TEXT NOT NULL,
+    indexable    INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS episode (
     guid          TEXT PRIMARY KEY,
@@ -35,12 +63,6 @@ CREATE TABLE IF NOT EXISTS episode (
     pubdate_epoch INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS episode_book_idx ON episode(book_id, idx);
-CREATE TABLE IF NOT EXISTS feed_token (
-    token_hash TEXT PRIMARY KEY,
-    book_id    TEXT NOT NULL REFERENCES book(id) ON DELETE CASCADE,
-    created_at INTEGER NOT NULL,
-    revoked_at INTEGER
-);
 ";
 
 /// One audiobook.
@@ -48,8 +70,11 @@ CREATE TABLE IF NOT EXISTS feed_token (
 pub struct BookRow {
     /// Opaque stable id.
     pub id: String,
-    /// URL slug (unique).
+    /// URL slug (unique) — the human key for the LAN browse UI only.
     pub slug: String,
+    /// Capability id (unique, unguessable) — the public key for feed/audio/cover.
+    /// Stable across re-scans; rotated only by [`Index::regenerate_feed_id`].
+    pub feed_id: String,
     /// Title.
     pub title: String,
     /// Author, if known.
@@ -62,6 +87,9 @@ pub struct BookRow {
     pub source_mtime: i64,
     /// Processing status (e.g. `ready`).
     pub status: String,
+    /// Whether the feed advertises itself to podcast directories. Default
+    /// `false` → emit `itunes:block` (private capability feeds stay unlisted).
+    pub indexable: bool,
 }
 
 /// One episode (a split chapter). Numeric fields are stored as SQLite integers.
@@ -116,11 +144,16 @@ impl Index {
     }
 
     /// Insert or update a book by `id` (idempotent — no duplicate rows).
+    ///
+    /// On conflict, `feed_id` and `indexable` are **preserved**, not overwritten:
+    /// a re-scan supplies a fresh `feed_id` it doesn't know is already set, and
+    /// the capability must stay stable (and the user's `indexable` choice must
+    /// survive) across re-scans. Both change only via their dedicated setters.
     pub fn upsert_book(&self, b: &BookRow) -> Result<(), IndexError> {
         self.conn.execute(
             "INSERT INTO book
-               (id, slug, title, author, cover_path, source_path, source_mtime, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+               (id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status, indexable)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(id) DO UPDATE SET
                slug=excluded.slug, title=excluded.title, author=excluded.author,
                cover_path=excluded.cover_path, source_path=excluded.source_path,
@@ -128,12 +161,14 @@ impl Index {
             params![
                 b.id,
                 b.slug,
+                b.feed_id,
                 b.title,
                 b.author,
                 b.cover_path,
                 b.source_path,
                 b.source_mtime,
                 b.status,
+                b.indexable,
             ],
         )?;
         Ok(())
@@ -168,7 +203,7 @@ impl Index {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, slug, title, author, cover_path, source_path, source_mtime, status
+                "SELECT id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status, indexable
                  FROM book WHERE id = ?1",
                 [id],
                 book_from_row,
@@ -181,7 +216,7 @@ impl Index {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, slug, title, author, cover_path, source_path, source_mtime, status
+                "SELECT id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status, indexable
                  FROM book WHERE slug = ?1",
                 [slug],
                 book_from_row,
@@ -192,7 +227,7 @@ impl Index {
     /// All books, ordered by title.
     pub fn list_books(&self) -> Result<Vec<BookRow>, IndexError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, slug, title, author, cover_path, source_path, source_mtime, status
+            "SELECT id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status, indexable
              FROM book ORDER BY title",
         )?;
         let rows = stmt.query_map([], book_from_row)?;
@@ -207,6 +242,43 @@ impl Index {
         )?;
         let rows = stmt.query_map([book_id], episode_from_row)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Fetch a book by its capability `feed_id` (the public feed/audio/cover
+    /// lookup key). Unknown ids return `None` → 404, so a guessed id reveals
+    /// nothing.
+    pub fn get_book_by_feed_id(&self, feed_id: &str) -> Result<Option<BookRow>, IndexError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status, indexable
+                 FROM book WHERE feed_id = ?1",
+                [feed_id],
+                book_from_row,
+            )
+            .optional()?)
+    }
+
+    /// Rotate a book's capability id (leak recovery): the old feed/audio/cover
+    /// URLs stop resolving immediately. Returns the new `feed_id`. No-op returns
+    /// `Ok(None)` if the book id is unknown.
+    pub fn regenerate_feed_id(&self, book_id: &str) -> Result<Option<String>, IndexError> {
+        let new_id = capability::generate();
+        let n = self.conn.execute(
+            "UPDATE book SET feed_id = ?2 WHERE id = ?1",
+            params![book_id, new_id],
+        )?;
+        Ok((n > 0).then_some(new_id))
+    }
+
+    /// Set whether a book's feed advertises to podcast directories (`indexable`
+    /// = not `itunes:block`). Returns whether a row changed.
+    pub fn set_indexable(&self, book_id: &str, indexable: bool) -> Result<bool, IndexError> {
+        let n = self.conn.execute(
+            "UPDATE book SET indexable = ?2 WHERE id = ?1",
+            params![book_id, indexable],
+        )?;
+        Ok(n > 0)
     }
 
     /// Fetch an episode by guid.
@@ -227,12 +299,14 @@ fn book_from_row(row: &Row) -> rusqlite::Result<BookRow> {
     Ok(BookRow {
         id: row.get(0)?,
         slug: row.get(1)?,
-        title: row.get(2)?,
-        author: row.get(3)?,
-        cover_path: row.get(4)?,
-        source_path: row.get(5)?,
-        source_mtime: row.get(6)?,
-        status: row.get(7)?,
+        feed_id: row.get(2)?,
+        title: row.get(3)?,
+        author: row.get(4)?,
+        cover_path: row.get(5)?,
+        source_path: row.get(6)?,
+        source_mtime: row.get(7)?,
+        status: row.get(8)?,
+        indexable: row.get(9)?,
     })
 }
 
@@ -257,12 +331,14 @@ mod tests {
         BookRow {
             id: id.to_string(),
             slug: slug.to_string(),
+            feed_id: format!("cap-{id}"),
             title: title.to_string(),
             author: Some("Author".to_string()),
             cover_path: None,
             source_path: format!("/library/{id}.m4b"),
             source_mtime: 1_700_000_000,
             status: "ready".to_string(),
+            indexable: false,
         }
     }
 
@@ -371,5 +447,77 @@ mod tests {
         let reopened = Index::open(&db).unwrap();
         assert_eq!(reopened.get_book("b1").unwrap().unwrap().title, "A Book");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- capability feed ids (v1.5) ----
+
+    #[test]
+    fn generated_capability_ids_are_128_bit_url_safe_and_unique() {
+        use base64::Engine;
+        let id = capability::generate();
+        assert!(
+            id.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "not url-safe: {id}"
+        );
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&id)
+            .unwrap();
+        assert_eq!(bytes.len(), 16);
+        assert_ne!(capability::generate(), capability::generate());
+    }
+
+    #[test]
+    fn lookup_by_feed_id_resolves_the_book() {
+        let idx = Index::open_in_memory().unwrap();
+        idx.upsert_book(&book("b1", "a-book", "A Book")).unwrap();
+        // `book()` sets feed_id = "cap-b1".
+        assert_eq!(idx.get_book_by_feed_id("cap-b1").unwrap().unwrap().id, "b1");
+        assert_eq!(idx.get_book_by_feed_id("cap-nope").unwrap(), None);
+    }
+
+    #[test]
+    fn feed_id_and_indexable_survive_a_rescan() {
+        let idx = Index::open_in_memory().unwrap();
+        idx.upsert_book(&book("b1", "a-book", "A Book")).unwrap();
+        idx.set_indexable("b1", true).unwrap();
+
+        // A re-scan supplies a different feed_id and the default indexable=false;
+        // both must be preserved (only title/etc update).
+        let mut rescan = book("b1", "a-book", "A Book v2");
+        rescan.feed_id = "cap-DIFFERENT".to_string();
+        rescan.indexable = false;
+        idx.upsert_book(&rescan).unwrap();
+
+        let got = idx.get_book("b1").unwrap().unwrap();
+        assert_eq!(got.title, "A Book v2", "mutable fields update");
+        assert_eq!(got.feed_id, "cap-b1", "capability is stable across rescans");
+        assert!(got.indexable, "user's indexable choice is preserved");
+    }
+
+    #[test]
+    fn regenerate_rotates_the_capability_and_kills_the_old_id() {
+        let idx = Index::open_in_memory().unwrap();
+        idx.upsert_book(&book("b1", "a-book", "A Book")).unwrap();
+
+        let new_id = idx.regenerate_feed_id("b1").unwrap().unwrap();
+        assert_ne!(new_id, "cap-b1");
+        assert_eq!(idx.get_book_by_feed_id(&new_id).unwrap().unwrap().id, "b1");
+        assert_eq!(
+            idx.get_book_by_feed_id("cap-b1").unwrap(),
+            None,
+            "old capability URL 404s after regenerate"
+        );
+        // Unknown book → no-op.
+        assert_eq!(idx.regenerate_feed_id("ghost").unwrap(), None);
+    }
+
+    #[test]
+    fn feed_id_is_unique_across_books() {
+        let idx = Index::open_in_memory().unwrap();
+        idx.upsert_book(&book("b1", "book-1", "One")).unwrap();
+        let mut clash = book("b2", "book-2", "Two");
+        clash.feed_id = "cap-b1".to_string(); // collide on purpose
+        assert!(idx.upsert_book(&clash).is_err(), "feed_id must be unique");
     }
 }

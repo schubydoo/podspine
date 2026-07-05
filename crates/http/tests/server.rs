@@ -111,7 +111,7 @@ async fn serves_cover_when_present() {
     let index = Index::open_in_memory().unwrap();
     let input = synth_with_cover(&dir);
     let book = scan_book(&input, &data, &index).unwrap();
-    let slug = book.slug.clone();
+    let feed_id = book.feed_id.clone();
     assert!(
         book.cover_path.is_some(),
         "cover should have been extracted"
@@ -120,9 +120,10 @@ async fn serves_cover_when_present() {
     let state = AppState::new(index, "http://test".to_string(), &data, None);
     let app = router(state);
 
+    // Covers are served by capability id, not the slug.
     let resp = app
         .oneshot(
-            Request::get(format!("/cover/{slug}"))
+            Request::get(format!("/cover/{feed_id}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -153,7 +154,8 @@ async fn serves_feed_and_range_audio() {
     let index = Index::open_in_memory().unwrap();
     let input = synth_three_chapters(&dir);
     let book = scan_book(&input, &data, &index).unwrap();
-    let slug = book.slug.clone();
+    let slug = book.slug.clone(); // human key → UI routes
+    let feed_id = book.feed_id.clone(); // capability → feed/audio/cover
 
     // The synthetic book has no embedded cover, so configure a feed-level
     // fallback to exercise the Task 3.4 default-cover path.
@@ -174,11 +176,11 @@ async fn serves_feed_and_range_audio() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(body_bytes(resp).await, b"ok");
 
-    // feed
+    // feed (by capability id)
     let resp = app
         .clone()
         .oneshot(
-            Request::get(format!("/feed/{slug}.xml"))
+            Request::get(format!("/feed/{feed_id}.xml"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -189,16 +191,23 @@ async fn serves_feed_and_range_audio() {
         resp.headers().get(header::CONTENT_TYPE).unwrap(),
         "application/rss+xml; charset=utf-8"
     );
+    // Capability feeds are never crawlable.
+    assert_eq!(
+        resp.headers().get("x-robots-tag").unwrap(),
+        "noindex, nofollow"
+    );
     let xml = String::from_utf8(body_bytes(resp).await).unwrap();
     assert_eq!(xml.matches("<item>").count(), 3);
     assert!(xml.contains("<itunes:duration>"));
-    assert!(xml.contains(&format!("http://test/audio/{slug}/1")));
+    assert!(xml.contains(&format!("http://test/audio/{feed_id}/1")));
+    // Default (not indexable) -> asks directories not to list it.
+    assert!(xml.contains("<itunes:block>Yes</itunes:block>"));
     // No embedded cover -> feed-level fallback image is emitted.
     assert!(xml.contains("<itunes:image"));
     assert!(xml.contains("http://test/default-cover.png"));
 
-    // unknown slug + missing .xml -> 404
-    for uri in ["/feed/nope.xml".to_string(), format!("/feed/{slug}")] {
+    // unknown id + missing .xml -> 404
+    for uri in ["/feed/nope.xml".to_string(), format!("/feed/{feed_id}")] {
         let resp = app
             .clone()
             .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
@@ -211,7 +220,7 @@ async fn serves_feed_and_range_audio() {
     let resp = app
         .clone()
         .oneshot(
-            Request::get(format!("/audio/{slug}/1"))
+            Request::get(format!("/audio/{feed_id}/1"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -224,7 +233,7 @@ async fn serves_feed_and_range_audio() {
     let resp = app
         .clone()
         .oneshot(
-            Request::get(format!("/audio/{slug}/1"))
+            Request::get(format!("/audio/{feed_id}/1"))
                 .header(header::RANGE, "bytes=0-99")
                 .body(Body::empty())
                 .unwrap(),
@@ -239,7 +248,7 @@ async fn serves_feed_and_range_audio() {
     let resp = app
         .clone()
         .oneshot(
-            Request::get(format!("/audio/{slug}/999"))
+            Request::get(format!("/audio/{feed_id}/999"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -277,11 +286,12 @@ async fn serves_feed_and_range_audio() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let page = String::from_utf8(body_bytes(resp).await).unwrap();
-    assert!(page.contains(&format!("http://test/feed/{slug}.xml")));
+    // The book page (by slug) shows the capability feed URL (by feed_id).
+    assert!(page.contains(&format!("http://test/feed/{feed_id}.xml")));
     assert!(page.contains("<svg"));
 
     // Unknown book -> 404; cover with no extracted art (Task 3.4) -> 404.
-    for uri in ["/book/nope".to_string(), format!("/cover/{slug}")] {
+    for uri in ["/book/nope".to_string(), format!("/cover/{feed_id}")] {
         let resp = app
             .clone()
             .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
@@ -290,14 +300,16 @@ async fn serves_feed_and_range_audio() {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
     }
 
-    // Path-traversal / bad-charset slugs are rejected with 404 and no path leak
-    // in the body (NFR-S1). %2e%2e keeps `..` from being normalized by the router.
+    // Path-traversal / bad-charset ids are rejected with 404 and no path leak in
+    // the body (NFR-S1). `.` and `/` are outside both the slug and feed_id
+    // allow-lists, so these 404 before any DB/filesystem touch. %2e%2e keeps `..`
+    // from being normalized by the router.
     for uri in [
         "/feed/..%2f..%2fetc%2fpasswd.xml",
         "/audio/..%2f..%2fetc%2fpasswd/1",
         "/book/..%2fsecret",
         "/cover/..%2fsecret",
-        "/feed/Uppercase.xml",
+        "/feed/bad.dotted.xml",
     ] {
         let resp = app
             .clone()
