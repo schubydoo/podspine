@@ -1,8 +1,9 @@
 name: Release
 
-# On a `v*` tag: build static musl binaries (amd64 + arm64), generate SBOMs,
-# sign the checksums with keyless cosign, attach a SLSA build-provenance file,
-# publish a GitHub Release, and push a multi-arch image to GHCR (with provenance +
+# On a `v*` tag: build release binaries for Linux (static musl amd64+arm64, via
+# zig), macOS (Intel + Apple Silicon), and Windows (x86_64), generate SBOMs, sign
+# the checksums with keyless cosign, attach a SLSA build-provenance file, publish a
+# GitHub Release, and push a multi-arch (Linux) image to GHCR (with provenance +
 # SBOM, and a cosign signature). TAD §6.4.
 #
 # OpenSSF Scorecard: Signed-Releases — cosign `.sigstore.json` signatures plus a
@@ -29,15 +30,42 @@ concurrency:
 
 jobs:
   binaries:
-    name: Build static ${{ matrix.arch }} binary
-    runs-on: ubuntu-latest
+    name: Build ${{ matrix.name }} binary
+    runs-on: ${{ matrix.os }}
     strategy:
+      # Don't let one platform's failure cancel the others — we want to see every
+      # target's result on a release run.
+      fail-fast: false
       matrix:
         include:
+          # Linux: cross-compiled static musl from an x86_64 runner via zig.
           - target: x86_64-unknown-linux-musl
-            arch: amd64
+            os: ubuntu-latest
+            name: linux-amd64
+            build: zig
           - target: aarch64-unknown-linux-musl
-            arch: arm64
+            os: ubuntu-latest
+            name: linux-arm64
+            build: zig
+          # macOS + Windows: use the platform's native toolchain (cargo build), not
+          # zig — native is exactly what CI already exercises (green macos + windows
+          # test jobs), and rusqlite's bundled SQLite C compiles with clang / MSVC
+          # cl.exe. Both darwin arches build on one Apple-Silicon runner: the macOS
+          # SDK is universal, so x86_64-apple-darwin cross-compiles cleanly there
+          # (macos-13, the old Intel runner, has been retired by GitHub).
+          - target: aarch64-apple-darwin
+            os: macos-14
+            name: darwin-arm64
+            build: native
+          - target: x86_64-apple-darwin
+            os: macos-14
+            name: darwin-amd64
+            build: native
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            name: windows-amd64
+            build: native
+            ext: .exe
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
@@ -45,29 +73,37 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           targets: ${{ matrix.target }}
-      # cargo-zigbuild uses zig as the cross linker, so both musl targets build
-      # from an x86_64 runner (incl. rusqlite's bundled SQLite C). mlugg/setup-zig
-      # is the maintained successor to the abandoned goto-bus-stop/setup-zig.
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+      # zig is the cross linker for the musl targets only (incl. rusqlite's bundled
+      # SQLite C). mlugg/setup-zig is the maintained successor to the abandoned
+      # goto-bus-stop/setup-zig.
+      - if: matrix.build == 'zig'
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.13.0
           # No Actions cache in this signed-release build: it's tag-triggered (rare),
           # and caching in an artifact-publishing workflow is a cache-poisoning vector
-          # (zizmor cache-poisoning). Matches the old goto-bus-stop/setup-zig behavior.
+          # (zizmor cache-poisoning).
           use-cache: false
-      - name: Install cargo-zigbuild
+      - if: matrix.build == 'zig'
+        name: Install cargo-zigbuild
         run: cargo install cargo-zigbuild --locked
-      - name: Build
+      - if: matrix.build == 'zig'
+        name: Build (musl via zig)
         run: cargo zigbuild --release --target ${{ matrix.target }} --bin podspine
+      - if: matrix.build == 'native'
+        name: Build (native)
+        run: cargo build --release --target ${{ matrix.target }} --bin podspine
       - name: Stage binary
+        shell: bash
         run: |
-          mkdir -p "dist/${{ matrix.arch }}"
-          cp "target/${{ matrix.target }}/release/podspine" "dist/${{ matrix.arch }}/podspine"
+          mkdir -p "dist/${{ matrix.name }}"
+          cp "target/${{ matrix.target }}/release/podspine${{ matrix.ext }}" \
+             "dist/${{ matrix.name }}/podspine${{ matrix.ext }}"
       - name: Upload binary artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: dist-${{ matrix.arch }}
-          path: dist/${{ matrix.arch }}/podspine
+          name: dist-${{ matrix.name }}
+          path: dist/${{ matrix.name }}/podspine${{ matrix.ext }}
           retention-days: 1
 
   release:
@@ -94,15 +130,28 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release
-          cp "artifacts/dist-amd64/podspine" "release/podspine-${TAG}-linux-amd64"
-          cp "artifacts/dist-arm64/podspine" "release/podspine-${TAG}-linux-arm64"
+          # download-artifact laid each build down at artifacts/dist-<name>/podspine[.exe]
+          # (name = linux-amd64, darwin-arm64, windows-amd64, …). Rename each into a
+          # release asset, preserving a .exe suffix for Windows.
+          for d in artifacts/dist-*; do
+            name="${d#artifacts/dist-}"
+            if [ -f "$d/podspine.exe" ]; then
+              cp "$d/podspine.exe" "release/podspine-${TAG}-${name}.exe"
+            else
+              cp "$d/podspine" "release/podspine-${TAG}-${name}"
+            fi
+          done
           cd release
-          for f in podspine-*-linux-*; do
+          # One SBOM per binary (skip any SBOM already present so we never SBOM a SBOM).
+          for f in podspine-${TAG}-*; do
+            case "$f" in *.sbom.cdx.json) continue ;; esac
             syft "$f" -o "cyclonedx-json=${f}.sbom.cdx.json"
           done
-          # One checksums file over binaries + SBOMs; cosign signs it, so a
-          # verifier trusts every artifact transitively through its hash.
-          sha256sum podspine-*-linux-* *.sbom.cdx.json > checksums.txt
+          # One checksums file over binaries + SBOMs, each listed exactly once; cosign
+          # signs it, so a verifier trusts every artifact transitively through its hash.
+          # (A single podspine-${TAG}-* glob now covers binaries AND their SBOMs — the
+          # old two-glob form double-counted the SBOMs.)
+          sha256sum podspine-${TAG}-* > checksums.txt
           cosign sign-blob --bundle checksums.txt.sigstore.json checksums.txt --yes
       - name: SLSA build provenance
         id: provenance
@@ -129,7 +178,7 @@ jobs:
         run: |
           set -euo pipefail
           assets=(
-            release/podspine-*-linux-*
+            release/podspine-${TAG}-*
             release/checksums.txt
             release/checksums.txt.sigstore.json
             release/podspine.intoto.jsonl
@@ -162,10 +211,13 @@ jobs:
         with:
           path: artifacts
       - name: Lay out dist/ for the Dockerfile
+        # The image is Linux-only; it consumes just the two musl binaries (the
+        # Dockerfile selects dist/${TARGETARCH}/podspine). macOS/Windows artifacts
+        # are ignored here.
         run: |
           mkdir -p dist/amd64 dist/arm64
-          cp artifacts/dist-amd64/podspine dist/amd64/podspine
-          cp artifacts/dist-arm64/podspine dist/arm64/podspine
+          cp artifacts/dist-linux-amd64/podspine dist/amd64/podspine
+          cp artifacts/dist-linux-arm64/podspine dist/arm64/podspine
           chmod +x dist/amd64/podspine dist/arm64/podspine
       - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
