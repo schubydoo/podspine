@@ -34,7 +34,7 @@ getrandom = "0.4"
 base64 = "0.22"
 blake3 = "1.5"
 # scanning / watching
-notify = "6"
+notify = "8"
 walkdir = "2"
 # config / cli
 clap = { version = "4", features = ["derive", "env"] }
