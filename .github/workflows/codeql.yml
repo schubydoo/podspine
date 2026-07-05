@@ -1,16 +1,21 @@
 name: CodeQL
 
-# Static analysis (SAST) for Rust via CodeQL — runs on pushes to main, PRs, and
-# a weekly schedule; results land in the Security tab (Code scanning). Not wired
-# into the CI required-checks aggregator, so a new alert never blocks a merge on
-# its own (branch protection can add `code_scanning` separately if wanted).
+# Static analysis (SAST) for Rust via CodeQL — results land in the Security tab
+# (Code scanning). The `main` ruleset makes CodeQL a REQUIRED code-scanning tool,
+# so coverage must survive the "stuck PR" class: the `push` trigger binds a result
+# to each branch's STABLE head SHA (GitHub maps it onto open PRs and honours it
+# across base moves that recompute the merge ref), while `pull_request` adds the
+# merge-ref, PR-diff-aware analysis. Analysing every branch head — not just main —
+# is what keeps a PR off mergeStateStatus=BLOCKED after an unrelated merge moves
+# main. CodeQL uploads via the built-in GITHUB_TOKEN (App tokens are rejected by
+# upload-sarif, github/codeql-action#2719).
 #
 # NOTE: action refs are version tags for readability; a Renovate digest-pinning
 # rule (renovate.json) converts them to commit SHAs (Scorecard Pinned-Dependencies).
 
 on:
   push:
-    branches: [main]
+    branches: ["**"] # every branch head; feature-branch heads cure the required-CodeQL stuck-PR class
   pull_request:
     branches: [main]
   schedule:

@@ -160,3 +160,32 @@ jobs:
         with:
           sarif_file: results.sarif
           category: zizmor
+
+  security-required-checks-passed:
+    name: security required checks passed
+    # The single required status context for this file (the `main` ruleset requires
+    # "security required checks passed"). Skipped jobs count as passing, so the
+    # PR-skipped trivy-image job never wedges the required check on pull requests.
+    if: always()
+    needs:
+      - gitleaks
+      - trivy-image
+      - zizmor
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Check required jobs passed
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          failing=$(echo "$NEEDS_JSON" | jq -r '
+            to_entries[]
+            | select(.value.result != "success" and .value.result != "skipped")
+            | "\(.key): \(.value.result)"
+          ')
+          if [ -n "$failing" ]; then
+            echo "Failed or cancelled jobs:"
+            echo "$failing"
+            exit 1
+          fi
+          echo "All required jobs passed (or were intentionally skipped)."
