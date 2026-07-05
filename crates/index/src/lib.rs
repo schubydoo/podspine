@@ -135,6 +135,10 @@ impl Index {
 
     fn init(conn: Connection) -> Result<Self, IndexError> {
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // WAL lets the background library watcher (its own connection) write
+        // during a rescan without blocking the server's feed/audio reads. A
+        // no-op for `:memory:` databases. (Task 4.3.)
+        let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
         conn.execute_batch(SCHEMA)?;
         Ok(Self { conn })
     }
@@ -264,6 +268,14 @@ impl Index {
             params![book_id, new_id],
         )?;
         Ok((n > 0).then_some(new_id))
+    }
+
+    /// Delete a book by id; its episodes and feed capability cascade away.
+    /// Returns whether a row was removed. Used by the watcher's orphan prune
+    /// (Task 4.3) when a source disappears from the library.
+    pub fn delete_book(&self, id: &str) -> Result<bool, IndexError> {
+        let n = self.conn.execute("DELETE FROM book WHERE id = ?1", [id])?;
+        Ok(n > 0)
     }
 
     /// Fetch an episode by guid.
@@ -457,6 +469,18 @@ mod tests {
         // `book()` sets feed_id = "cap-b1".
         assert_eq!(idx.get_book_by_feed_id("cap-b1").unwrap().unwrap().id, "b1");
         assert_eq!(idx.get_book_by_feed_id("cap-nope").unwrap(), None);
+    }
+
+    #[test]
+    fn delete_book_removes_it_and_cascades() {
+        let idx = Index::open_in_memory().unwrap();
+        idx.upsert_book(&book("b1", "a-book", "A Book")).unwrap();
+        idx.upsert_episode(&episode("b1", 0)).unwrap();
+        assert!(idx.delete_book("b1").unwrap());
+        assert_eq!(idx.get_book("b1").unwrap(), None);
+        assert!(idx.episodes_for_book("b1").unwrap().is_empty());
+        // Deleting a missing book is a no-op.
+        assert!(!idx.delete_book("b1").unwrap());
     }
 
     #[test]

@@ -17,3 +17,5 @@ podspine-index = { path = "../index" }
 podspine-feed = { path = "../feed" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# library auto-watch (v1.5): filesystem notifications, with a manual debounce
+notify = { workspace = true }

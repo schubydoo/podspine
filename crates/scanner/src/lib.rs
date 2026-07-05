@@ -374,6 +374,8 @@ pub struct ScanSummary {
     pub indexed: usize,
     /// Sources skipped: bad/DRM'd files, or MP3 folders pending Task 3.3.
     pub skipped: usize,
+    /// Orphaned books pruned (set by [`reconcile`]; `scan_library` leaves it 0).
+    pub pruned: usize,
 }
 
 /// A discovered book source within the library.
@@ -453,6 +455,121 @@ pub fn scan_library(
         "library scan complete"
     );
     summary
+}
+
+/// Remove indexed books whose source file/folder no longer exists, along with
+/// their split output under `<data_dir>/books/<id>/`. Returns the count pruned.
+///
+/// **Empty-root guard:** if the library root is missing, unreadable, or empty,
+/// nothing is pruned. A transiently-unmounted library looks like "every source
+/// vanished"; without this guard an unmount would wipe the whole index. The cost
+/// is that genuinely deleting your *last* book leaves it indexed until another
+/// book is present — a safe trade.
+pub fn prune_orphans(library: &Path, data_dir: &Path, index: &Index) -> Result<usize, ScanError> {
+    let root_has_entries = std::fs::read_dir(library)
+        .map(|mut rd| rd.next().is_some())
+        .unwrap_or(false);
+    if !root_has_entries {
+        tracing::warn!(
+            library = %library.display(),
+            "library root empty or unreadable — skipping orphan prune (unmount guard)"
+        );
+        return Ok(0);
+    }
+
+    let mut pruned = 0;
+    for book in index.list_books()? {
+        if Path::new(&book.source_path).exists() {
+            continue;
+        }
+        let book_out = data_dir.join("books").join(&book.id);
+        if book_out.exists()
+            && let Err(err) = std::fs::remove_dir_all(&book_out)
+        {
+            tracing::warn!(error = %err, dir = %book_out.display(),
+                "could not remove split output for a pruned book");
+        }
+        index.delete_book(&book.id)?;
+        pruned += 1;
+        tracing::info!(slug = %book.slug, "pruned orphaned book (source gone)");
+    }
+    Ok(pruned)
+}
+
+/// Reconcile the index with the library: [`scan_library`] (add/update) then
+/// [`prune_orphans`] (remove sources that disappeared). This is what the
+/// auto-watch runs after each debounced batch of changes, and what the server
+/// runs at startup so a book deleted while it was down is cleaned up.
+pub fn reconcile(
+    library: &Path,
+    data_dir: &Path,
+    index: &Index,
+    force_embedded: bool,
+) -> ScanSummary {
+    let mut summary = scan_library(library, data_dir, index, force_embedded);
+    summary.pruned = prune_orphans(library, data_dir, index).unwrap_or_else(|err| {
+        tracing::warn!(error = %err, "orphan prune failed");
+        0
+    });
+    summary
+}
+
+/// Debounce window: a burst of filesystem events (e.g. one big file copy lands
+/// as many) is coalesced into a single reconcile once things go quiet.
+const WATCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Spawn a background thread that watches `library` and [`reconcile`]s the index
+/// whenever it changes (debounced). The thread opens its **own** index
+/// connection on `db_path` — with WAL enabled, its rescans (including a long
+/// split of a newly-added book) don't block the server's feed/audio reads.
+///
+/// Returns immediately; the watcher runs for the process lifetime. A setup
+/// failure (or the watch ending) is logged and simply disables auto-refresh —
+/// the server keeps serving what's already indexed. (Task 4.3 / PRD C2.)
+pub fn spawn_library_watcher(
+    library: PathBuf,
+    data_dir: PathBuf,
+    db_path: PathBuf,
+    force_embedded: bool,
+) {
+    std::thread::spawn(move || {
+        if let Err(err) = watch_loop(&library, &data_dir, &db_path, force_embedded) {
+            tracing::error!(error = %err, "library watcher stopped — auto-refresh disabled");
+        }
+    });
+}
+
+fn watch_loop(
+    library: &Path,
+    data_dir: &Path,
+    db_path: &Path,
+    force_embedded: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use notify::{RecursiveMode, Watcher};
+
+    let index = Index::open(db_path)?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut watcher = notify::recommended_watcher(move |res| {
+        let _ = tx.send(res);
+    })?;
+    watcher.watch(library, RecursiveMode::Recursive)?;
+    tracing::info!(library = %library.display(), "watching library for changes");
+
+    // Block for an event, then drain the burst until it's quiet for the debounce
+    // window, then reconcile once. `watcher` stays alive in scope, so `rx` never
+    // disconnects and the loop runs for the process lifetime.
+    while rx.recv().is_ok() {
+        while rx.recv_timeout(WATCH_DEBOUNCE).is_ok() {}
+        tracing::info!("library changed — reconciling");
+        let s = reconcile(library, data_dir, &index, force_embedded);
+        tracing::info!(
+            indexed = s.indexed,
+            skipped = s.skipped,
+            pruned = s.pruned,
+            "reconcile complete"
+        );
+    }
+    Ok(())
 }
 
 /// Discover book sources one level under `library`, in a deterministic
@@ -1180,5 +1297,96 @@ mod tests {
         assert!(Path::new(&eps[0].file_path).exists());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Two distinctly-named top-level books in `root`; `data` is kept OUTSIDE the
+    // library so emptying `root` genuinely empties it (for the guard test). `tag`
+    // keeps each test's scratch dirs distinct so parallel runs don't collide.
+    fn two_book_library(tag: &str) -> (PathBuf, PathBuf, Index) {
+        let root = scratch(&format!("{tag}-lib"));
+        let data = scratch(&format!("{tag}-data"));
+        let a = synth(&root, false);
+        std::fs::rename(&a, root.join("alpha.m4a")).unwrap();
+        let b = synth(&root, false);
+        std::fs::rename(&b, root.join("beta.m4a")).unwrap();
+        let index = Index::open_in_memory().unwrap();
+        (root, data, index)
+    }
+
+    #[test]
+    fn prune_orphans_removes_a_deleted_source_and_its_split_output() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not available");
+            return;
+        }
+        let (root, data, index) = two_book_library("prune-removes");
+        scan_library(&root, &data, &index, false);
+        assert_eq!(index.list_books().unwrap().len(), 2);
+        let beta_out = data.join("books").join("beta");
+        assert!(beta_out.exists(), "beta was split");
+
+        // Delete beta's source; alpha remains, so the root is non-empty.
+        std::fs::remove_file(root.join("beta.m4a")).unwrap();
+        let pruned = prune_orphans(&root, &data, &index).unwrap();
+
+        assert_eq!(pruned, 1);
+        let books = index.list_books().unwrap();
+        assert_eq!(books.len(), 1);
+        assert_eq!(books[0].slug, "alpha");
+        assert!(!beta_out.exists(), "beta's split output was removed");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn prune_orphans_empty_root_guard_preserves_the_index() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not available");
+            return;
+        }
+        let (root, data, index) = two_book_library("prune-guard");
+        scan_library(&root, &data, &index, false);
+        assert_eq!(index.list_books().unwrap().len(), 2);
+
+        // Simulate an unmount: every source vanishes and the root goes empty.
+        std::fs::remove_file(root.join("alpha.m4a")).unwrap();
+        std::fs::remove_file(root.join("beta.m4a")).unwrap();
+        let pruned = prune_orphans(&root, &data, &index).unwrap();
+
+        assert_eq!(pruned, 0, "empty/unreadable root must not prune anything");
+        assert_eq!(
+            index.list_books().unwrap().len(),
+            2,
+            "books preserved despite missing sources (unmount guard)"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn reconcile_indexes_new_books_and_prunes_deleted_ones() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not available");
+            return;
+        }
+        let (root, data, index) = two_book_library("reconcile");
+
+        // First pass indexes both, prunes none.
+        let s = reconcile(&root, &data, &index, false);
+        assert_eq!(index.list_books().unwrap().len(), 2);
+        assert_eq!(s.pruned, 0);
+
+        // Remove one source, reconcile again -> it is pruned.
+        std::fs::remove_file(root.join("beta.m4a")).unwrap();
+        let s = reconcile(&root, &data, &index, false);
+        assert_eq!(s.pruned, 1);
+        let books = index.list_books().unwrap();
+        assert_eq!(books.len(), 1);
+        assert_eq!(books[0].slug, "alpha");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data);
     }
 }

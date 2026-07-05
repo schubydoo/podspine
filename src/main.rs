@@ -1,15 +1,16 @@
-//! Podspine server entrypoint: `config -> scan -> http`.
+//! Podspine server entrypoint: `config -> scan -> watch -> http`.
 //!
 //! Resolves configuration (validating the library and preflighting ffmpeg),
-//! opens the index, scans the library of audiobooks into it, then serves feeds +
-//! Range audio. Multi-book scanning (top-level files and per-book folders) lives
-//! in [`podspine_scanner::scan_library`]; MP3-folder ingest arrives in Task 3.3.
+//! opens the index, reconciles the library of audiobooks into it (scan + prune),
+//! spawns a background watcher that auto-refreshes on library changes, then
+//! serves feeds + Range audio. Multi-book scanning and the watcher live in
+//! [`podspine_scanner`].
 
 use anyhow::{Context, Result};
 use podspine_config::Config;
 use podspine_http::{AppState, serve};
 use podspine_index::Index;
-use podspine_scanner::scan_library;
+use podspine_scanner::{reconcile, spawn_library_watcher};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -20,12 +21,24 @@ async fn main() -> Result<()> {
         .init();
 
     let config = Config::load().context("resolving configuration")?;
-    let index = Index::open(config.data_dir.join("podspine.db")).context("opening the index")?;
+    let db_path = config.data_dir.join("podspine.db");
+    let index = Index::open(&db_path).context("opening the index")?;
 
-    scan_library(
+    // Initial reconcile: index new/changed books and prune ones deleted while the
+    // server was down.
+    reconcile(
         &config.library,
         &config.data_dir,
         &index,
+        config.force_embedded_chapters,
+    );
+
+    // Auto-refresh: a background thread (its own WAL index connection) re-runs the
+    // reconcile whenever the library changes, so feeds appear without a restart.
+    spawn_library_watcher(
+        config.library.clone(),
+        config.data_dir.clone(),
+        db_path,
         config.force_embedded_chapters,
     );
 
