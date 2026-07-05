@@ -47,7 +47,7 @@ jobs:
           exit 1
       # Full history + tags so knope can find the last release tag; persist the App
       # token so knope's `git push` of the release branch runs as the App identity.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token }}
@@ -66,7 +66,7 @@ jobs:
           fi
           echo "has=$([ "$count" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
           echo "pending changeset fragments: $count"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         if: ${{ steps.changesets.outputs.has == 'true' }}
       - name: Configure git identity (podspine-ci App)
         if: ${{ steps.changesets.outputs.has == 'true' }}
@@ -77,7 +77,7 @@ jobs:
           git config user.email "podspine-ci[bot]@users.noreply.github.com"
       - name: Install knope
         if: ${{ steps.changesets.outputs.has == 'true' }}
-        uses: knope-dev/action@v2
+        uses: knope-dev/action@19617851f9f13ab2f27a05989c55efb18aca3675 # v2.1.2
         with:
           version: 0.23.0
       - name: Open or refresh the release PR
