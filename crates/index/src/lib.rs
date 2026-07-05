@@ -31,7 +31,7 @@ pub mod capability {
     /// Panics only if the OS RNG is unavailable (an unrecoverable platform fault).
     pub fn generate() -> String {
         let mut buf = [0u8; ID_BYTES];
-        getrandom::getrandom(&mut buf).expect("OS RNG unavailable");
+        getrandom::fill(&mut buf).expect("OS RNG unavailable");
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
     }
 }
