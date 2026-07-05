@@ -438,6 +438,7 @@ async fn serves_feed_and_range_audio() {
         "/audio/..%2f..%2fetc%2fpasswd/1",
         "/book/..%2fsecret",
         "/cover/..%2fsecret",
+        "/subscribe/bad.dotted",
         "/feed/bad.dotted.xml",
     ] {
         let resp = app
