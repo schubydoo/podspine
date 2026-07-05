@@ -7,9 +7,8 @@ name: Scorecard
 # signal lives in the Security tab (Code scanning → Scorecard) and at
 # scorecard.dev once publish_results is enabled.
 #
-# NOTE: action refs are version tags for readability; a Renovate digest-pinning
-# rule (renovate.json) converts them to commit SHAs to satisfy Scorecard's
-# Pinned-Dependencies check and keeps them updated.
+# NOTE: action refs are pinned to full commit SHAs (the repo's Actions policy
+# requires it; also satisfies Scorecard Pinned-Dependencies); Renovate keeps them current.
 
 on:
   branch_protection_rule:

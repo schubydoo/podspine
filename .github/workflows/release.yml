@@ -10,8 +10,8 @@ name: Release
 #
 # Cut a release: `git tag v1.0.0 && git push origin v1.0.0`.
 #
-# NOTE: action refs are version tags for readability; a Renovate digest-pinning
-# rule (renovate.json) converts them to commit SHAs (Scorecard Pinned-Dependencies).
+# NOTE: action refs are pinned to full commit SHAs (the repo's Actions policy
+# requires it; also satisfies Scorecard Pinned-Dependencies); Renovate keeps them current.
 
 on:
   push:
@@ -46,10 +46,15 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       # cargo-zigbuild uses zig as the cross linker, so both musl targets build
-      # from an x86_64 runner (incl. rusqlite's bundled SQLite C).
-      - uses: goto-bus-stop/setup-zig@abea47f85e598557f500fa1fd2ab7464fcb39406 # v2
+      # from an x86_64 runner (incl. rusqlite's bundled SQLite C). mlugg/setup-zig
+      # is the maintained successor to the abandoned goto-bus-stop/setup-zig.
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.13.0
+          # No Actions cache in this signed-release build: it's tag-triggered (rare),
+          # and caching in an artifact-publishing workflow is a cache-poisoning vector
+          # (zizmor cache-poisoning). Matches the old goto-bus-stop/setup-zig behavior.
+          use-cache: false
       - name: Install cargo-zigbuild
         run: cargo install cargo-zigbuild --locked
       - name: Build
