@@ -35,6 +35,16 @@ repos:
         language: fail
         files: '\.(m4b|m4a|mp3|flac|ogg|opus|aax|aaxc|aa)$'
 
+      # Guard: knope changeset fragments must have front matter + a SINGLE-line body,
+      # else the release fails ("missing front matter") or the changelog renders a
+      # `#### heading` mid-list instead of a bullet. Runs when a fragment changes.
+      - id: changeset-lint
+        name: changeset fragment lint (knope one-line body)
+        entry: sh scripts/lint_changesets.sh
+        language: system
+        files: '^\.changeset/.+\.md$'
+        pass_filenames: false
+
       # ---- commit stage: fast feedback on every commit ----
       - id: cargo-fmt
         name: cargo fmt --check
