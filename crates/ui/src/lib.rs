@@ -44,6 +44,9 @@ pub struct BookDetail {
     pub feed_url: String,
     /// Number of episodes (chapters) in the feed.
     pub episode_count: usize,
+    /// Whether this feed is listed in podcast directories (drives the toggle's
+    /// current-state label). Default books are unlisted.
+    pub indexable: bool,
 }
 
 /// Shared styles + a page shell. Inlined so the binary needs no static assets.
@@ -51,7 +54,7 @@ pub struct BookDetail {
 /// (~16:1), `#52525b` muted (~7:1), and white on the `#1d4ed8` accent (~5.3:1).
 const STYLE: &str = r#"
 :root { --bg:#ffffff; --surface:#f4f4f5; --border:#d4d4d8; --text:#18181b;
-        --muted:#52525b; --accent:#1d4ed8; --accent-text:#ffffff; }
+        --muted:#52525b; --accent:#1d4ed8; --accent-text:#ffffff; --danger:#b91c1c; }
 * { box-sizing:border-box; }
 body { margin:0; font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
        color:var(--text); background:var(--bg); }
@@ -86,6 +89,19 @@ button.copy { padding:.55rem .9rem; border:0; border-radius:6px; font:inherit;
         border:1px solid var(--border); border-radius:8px; }
 .howto h2 { margin-top:0; font-size:1.05rem; }
 .howto ul { margin:0; padding-left:1.25rem; }
+.private { margin-top:1.5rem; padding:1rem 1.25rem; background:var(--surface);
+        border:1px solid var(--border); border-radius:8px; }
+.private h2 { margin-top:0; font-size:1.05rem; }
+.private > p { margin:.25rem 0 1rem; color:var(--muted); }
+.privrow { display:flex; gap:.6rem; align-items:center; flex-wrap:wrap; margin:.4rem 0; }
+.privrow form { margin:0; }
+.privrow .note { color:var(--muted); font-size:.85rem; }
+button.regen { padding:.5rem .85rem; border:1px solid var(--danger); border-radius:6px;
+        font:inherit; font-weight:600; background:transparent; color:var(--danger); cursor:pointer; }
+button.regen:hover { background:var(--danger); color:#fff; }
+button.toggle { padding:.5rem .85rem; border:1px solid var(--border); border-radius:6px;
+        font:inherit; font-weight:600; background:var(--bg); color:var(--text); cursor:pointer; }
+button.toggle:hover { background:var(--surface); }
 .back { display:inline-block; margin-bottom:1rem; }
 "#;
 
@@ -196,6 +212,8 @@ pub fn book_page(book: &BookDetail) -> Markup {
                             }
                         }
 
+                        (private_panel(&book.slug, book.indexable))
+
                         (howto(&book.feed_url))
                     }
                 }
@@ -203,6 +221,43 @@ pub fn book_page(book: &BookDetail) -> Markup {
             script { (PreEscaped(COPY_JS)) }
         },
     )
+}
+
+/// The "private link" controls: regenerate the capability URL (leak recovery)
+/// and toggle directory listing. Plain `POST` forms — no JS required. `slug` is
+/// the (LAN-only) UI key the mutation routes act on; `feed_id` never appears in
+/// these action URLs.
+fn private_panel(slug: &str, indexable: bool) -> Markup {
+    html! {
+        section.private {
+            h2 { "🔒 Private link" }
+            p {
+                "Anyone with the URL above can subscribe — treat it like a password. "
+                "If it leaks, regenerate to replace it."
+            }
+            div.privrow {
+                form method="post" action=(format!("/book/{slug}/regenerate")) {
+                    button.regen type="submit" { "Regenerate link" }
+                }
+                span.note { "Replaces the URL above — the current link stops working immediately." }
+            }
+            div.privrow {
+                @if indexable {
+                    span { "Listed in podcast directories." }
+                    form method="post" action=(format!("/book/{slug}/indexable")) {
+                        input type="hidden" name="indexable" value="false";
+                        button.toggle type="submit" { "Make private" }
+                    }
+                } @else {
+                    span { "Hidden from podcast directories " code { "(itunes:block)" } "." }
+                    form method="post" action=(format!("/book/{slug}/indexable")) {
+                        input type="hidden" name="indexable" value="true";
+                        button.toggle type="submit" { "List in directories" }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// A short per-app "how to add this" panel. The full app-by-app import guide is
@@ -282,6 +337,7 @@ mod tests {
             has_cover: true,
             feed_url: "http://host:8080/feed/Xk9mQ2vP7nR4tB1cY6wZ8a.xml".into(),
             episode_count: 12,
+            indexable: false,
         };
         let html = book_page(&book).into_string();
         // The copy input carries the exact working (capability) URL, and it
@@ -292,6 +348,33 @@ mod tests {
         // QR rendered as inline SVG, labelled for AT.
         assert!(html.contains("<svg"));
         assert!(html.contains("aria-label=\"QR code linking to the podcast feed URL\""));
+        // Private-link controls post to slug-keyed routes (feed_id never in the
+        // action URL); a not-indexed book offers to list it.
+        assert!(html.contains("action=\"/book/dune/regenerate\""));
+        assert!(html.contains("action=\"/book/dune/indexable\""));
+        assert!(html.contains("List in directories"));
+    }
+
+    #[test]
+    fn book_page_toggle_reflects_indexable_state() {
+        let mut book = BookDetail {
+            slug: "dune".into(),
+            feed_id: "cap".into(),
+            title: "Dune".into(),
+            author: None,
+            has_cover: false,
+            feed_url: "http://h/feed/cap.xml".into(),
+            episode_count: 1,
+            indexable: true,
+        };
+        // Listed → offers to make it private again.
+        assert!(book_page(&book).into_string().contains("Make private"));
+        book.indexable = false;
+        assert!(
+            book_page(&book)
+                .into_string()
+                .contains("List in directories")
+        );
     }
 
     #[test]

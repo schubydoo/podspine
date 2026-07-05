@@ -31,13 +31,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::Router;
-use axum::extract::{Path, State};
-use axum::http::{StatusCode, header};
-use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
+use axum::extract::{Form, Path, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::routing::{get, post};
 use axum_extra::TypedHeader;
 use axum_extra::headers::Range;
 use axum_range::{KnownSize, Ranged};
+use serde::Deserialize;
 use tokio::fs::File;
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -77,6 +78,24 @@ fn valid_feed_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Same-origin guard for the state-changing `POST` routes (CSRF defense). This
+/// app uses **no cookies**, so `SameSite` is inapplicable; instead we check the
+/// browser-set fetch-metadata / `Origin` headers. Modern browsers always send
+/// `Sec-Fetch-Site`, so cross-site form posts are caught even in the proxy-auth
+/// deployment (where a forged request would otherwise ride the owner's proxy
+/// session). Non-browser clients (curl) send neither header and carry no ambient
+/// auth to abuse, so they're allowed. Fails closed on a mismatched `Origin`.
+fn same_origin(headers: &HeaderMap, base_url: &str) -> bool {
+    if let Some(sfs) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
+        return sfs == "same-origin" || sfs == "none";
+    }
+    match headers.get(header::ORIGIN).and_then(|o| o.to_str().ok()) {
+        // Compare against base_url's scheme://authority (ignore any path suffix).
+        Some(origin) => origin == base_url.split('/').take(3).collect::<Vec<_>>().join("/"),
+        None => true,
+    }
 }
 
 /// Shared server state.
@@ -119,6 +138,8 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/", get(index))
         .route("/book/{slug}", get(book))
+        .route("/book/{slug}/regenerate", post(regenerate))
+        .route("/book/{slug}/indexable", post(set_indexable))
         .route("/cover/{feed_id}", get(cover))
         .route("/feed/{feed_id}", get(feed))
         .route("/audio/{feed_id}/{number}", get(audio))
@@ -221,8 +242,69 @@ async fn book(
         author: book.author,
         has_cover: book.cover_path.is_some(),
         episode_count,
+        indexable: book.indexable,
     };
     Ok(Html(book_page(&detail).into_string()))
+}
+
+/// Form body for the indexable toggle.
+#[derive(Deserialize)]
+struct IndexableForm {
+    indexable: bool,
+}
+
+/// `POST /book/{slug}/regenerate` — rotate the book's capability `feed_id` (leak
+/// recovery). The old feed/audio/cover URLs 404 immediately. Redirects back to
+/// the book page (PRG) so a refresh doesn't re-submit.
+async fn regenerate(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+    headers: HeaderMap,
+) -> Result<Redirect, AppError> {
+    if !same_origin(&headers, &state.base_url) {
+        return Err(AppError::Forbidden);
+    }
+    if !valid_slug(&slug) {
+        return Err(AppError::NotFound);
+    }
+    {
+        let index = state.index.lock().map_err(AppError::internal)?;
+        let book = index
+            .get_book_by_slug(&slug)
+            .map_err(AppError::internal)?
+            .ok_or(AppError::NotFound)?;
+        index
+            .regenerate_feed_id(&book.id)
+            .map_err(AppError::internal)?;
+    }
+    Ok(Redirect::to(&format!("/book/{slug}")))
+}
+
+/// `POST /book/{slug}/indexable` — toggle whether the feed advertises to podcast
+/// directories (drops/adds `itunes:block`). Redirects back to the book page.
+async fn set_indexable(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+    headers: HeaderMap,
+    Form(form): Form<IndexableForm>,
+) -> Result<Redirect, AppError> {
+    if !same_origin(&headers, &state.base_url) {
+        return Err(AppError::Forbidden);
+    }
+    if !valid_slug(&slug) {
+        return Err(AppError::NotFound);
+    }
+    {
+        let index = state.index.lock().map_err(AppError::internal)?;
+        let book = index
+            .get_book_by_slug(&slug)
+            .map_err(AppError::internal)?
+            .ok_or(AppError::NotFound)?;
+        index
+            .set_indexable(&book.id, form.indexable)
+            .map_err(AppError::internal)?;
+    }
+    Ok(Redirect::to(&format!("/book/{slug}")))
 }
 
 /// `GET /cover/{feed_id}` — the book's cover image, keyed by capability id so it
@@ -397,6 +479,7 @@ fn image_mime(path: &str) -> &'static str {
 #[derive(Debug)]
 enum AppError {
     NotFound,
+    Forbidden,
     Internal,
 }
 
@@ -411,6 +494,7 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         match self {
             AppError::NotFound => StatusCode::NOT_FOUND.into_response(),
+            AppError::Forbidden => StatusCode::FORBIDDEN.into_response(),
             AppError::Internal => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         }
     }
@@ -475,6 +559,34 @@ mod tests {
         ] {
             assert!(!valid_feed_id(bad), "must reject {bad:?}");
         }
+    }
+
+    #[test]
+    fn same_origin_guard() {
+        let base = "http://host:8087";
+        let with = |k: &'static str, v: &str| {
+            let mut m = HeaderMap::new();
+            m.insert(k, v.parse().unwrap());
+            m
+        };
+        // Fetch metadata (all modern browsers): same-origin/none pass, cross-site fails.
+        assert!(same_origin(&with("sec-fetch-site", "same-origin"), base));
+        assert!(same_origin(&with("sec-fetch-site", "none"), base));
+        assert!(!same_origin(&with("sec-fetch-site", "cross-site"), base));
+        // Origin fallback: exact origin passes; a look-alike host fails (no prefix bug).
+        assert!(same_origin(&with("origin", "http://host:8087"), base));
+        assert!(!same_origin(
+            &with("origin", "http://host:8087.evil.com"),
+            base
+        ));
+        assert!(!same_origin(&with("origin", "http://evil.com"), base));
+        // A base_url with a path suffix still compares by scheme://authority.
+        assert!(same_origin(
+            &with("origin", "http://host:8087"),
+            "http://host:8087/sub"
+        ));
+        // Non-browser client (no headers) is allowed — no ambient auth to abuse.
+        assert!(same_origin(&HeaderMap::new(), base));
     }
 
     #[test]

@@ -140,6 +140,121 @@ async fn serves_cover_when_present() {
 }
 
 #[tokio::test]
+async fn regenerate_rotates_and_indexable_toggles() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+    let dir = std::env::temp_dir().join("podspine-http-manage");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let data = dir.join("data");
+
+    let index = Index::open_in_memory().unwrap();
+    let input = synth_three_chapters(&dir);
+    let book = scan_book(&input, &data, &index).unwrap();
+    let slug = book.slug.clone();
+    let old_feed_id = book.feed_id.clone();
+
+    let state = AppState::new(index, "http://test".to_string(), &data, None);
+    let app = router(state);
+
+    // Default feed is blocked from directories.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/feed/{old_feed_id}.xml"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let xml = String::from_utf8(body_bytes(resp).await).unwrap();
+    assert!(xml.contains("<itunes:block>Yes</itunes:block>"));
+
+    // CSRF guard: a cross-site POST (browser fetch-metadata) is refused (403).
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/book/{slug}/regenerate"))
+                .header("sec-fetch-site", "cross-site")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "CSRF rejected");
+
+    // Toggle indexable on -> the block drops. PRG redirect (303).
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/book/{slug}/indexable"))
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("indexable=true"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/feed/{old_feed_id}.xml"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let xml = String::from_utf8(body_bytes(resp).await).unwrap();
+    assert!(!xml.contains("itunes:block"), "listed feed drops the block");
+
+    // Regenerate -> the old capability URL 404s immediately.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/book/{slug}/regenerate"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/feed/{old_feed_id}.xml"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "old capability URL dies after regenerate"
+    );
+
+    // The book page (by slug) now advertises a different capability URL.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/book/{slug}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let page = String::from_utf8(body_bytes(resp).await).unwrap();
+    assert!(
+        !page.contains(&old_feed_id),
+        "book page shows the rotated feed_id, not the old one"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn serves_feed_and_range_audio() {
     if !ffmpeg_available() {
         eprintln!("skipping: ffmpeg not available");
