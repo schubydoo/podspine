@@ -597,17 +597,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "getrandom"
-version = "0.2.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
-dependencies = [
- "cfg-if",
- "libc",
- "wasi",
-]
-
-[[package]]
 name = "hashbrown"
 version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1055,9 +1044,6 @@ dependencies = [
 name = "podspine-index"
 version = "0.1.0"
 dependencies = [
- "base64",
- "blake3",
- "getrandom",
  "rusqlite",
  "thiserror",
 ]
