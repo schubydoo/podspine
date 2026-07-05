@@ -1,14 +1,6 @@
 # Changelog
 
-All notable changes to Podspine are documented here. The format is based on
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and Podspine aims to
-follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-
-## [Unreleased]
-
-_Nothing yet._
-
-## [1.0.0]
+## 1.0.0 (2026-07-05)
 
 First tagged release: a zero-config, self-hosted server that turns a folder of
 audiobooks into per-chapter podcast RSS feeds any podcast app can play.
@@ -46,6 +38,3 @@ audiobooks into per-chapter podcast RSS feeds any podcast app can play.
 - Error responses never leak filesystem paths or `ffmpeg` stderr.
 - **DRM-free input only.** DRM-protected files (`.aax`/`.aaxc`/`.aa`/`.odm`) are
   skipped with a logged notice; Podspine ships no DRM circumvention.
-
-[Unreleased]: https://github.com/schubydoo/podspine/compare/v1.0.0...HEAD
-[1.0.0]: https://github.com/schubydoo/podspine/releases/tag/v1.0.0

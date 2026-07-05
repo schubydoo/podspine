@@ -6,9 +6,9 @@ name: Prepare Release
 # `chore: prepare release X.Y.Z` PR. Merging that PR is the approval gate; the
 # merge triggers knope-release.yml.
 #
-# GATED OFF: every job is skipped until the `KNOPE_ENABLED` repo variable is
-# 'true'. Flip it on once the flow is proven. Needs the `podspine-ci` GitHub App
-# (PODSPINE_CI_APP_ID / PODSPINE_CI_APP_PRIVATE_KEY secrets).
+# Gated on the `KNOPE_ENABLED` repo variable (now 'true'). Needs the `podspine-ci`
+# GitHub App INSTALLED on the repo (PODSPINE_CI_APP_ID / PODSPINE_CI_APP_PRIVATE_KEY
+# secrets) — only for release-driving pushes; see the changeset-first ordering below.
 
 on:
   push:
@@ -29,33 +29,14 @@ jobs:
     permissions:
       contents: read
     steps:
-      # Short-lived podspine-ci App token. Its identity is what lets the release
-      # PR's eventual merge tag trigger release.yml (a GITHUB_TOKEN-pushed tag
-      # would not, by GitHub's recursion suppression).
-      - name: Mint podspine-ci App token
-        id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          app-id: ${{ secrets.PODSPINE_CI_APP_ID }}
-          private-key: ${{ secrets.PODSPINE_CI_APP_PRIVATE_KEY }}
-          permission-contents: write
-          permission-pull-requests: write
-      - name: Verify App token was minted
-        if: ${{ steps.app-token.outputs.token == '' }}
-        run: |
-          echo "::error::podspine-ci App token mint produced an empty token; check the PODSPINE_CI_APP_ID / PODSPINE_CI_APP_PRIVATE_KEY secrets and the App installation."
-          exit 1
-      # Full history + tags so knope can find the last release tag; persist the App
-      # token so knope's `git push` of the release branch runs as the App identity.
+      # Detect a pending changeset FIRST, with a credential-less checkout, so a
+      # routine push with no fragment is a clean no-op that never touches the
+      # podspine-ci App. Only a release-driving push mints the token below — this
+      # decouples ordinary merges (docs/CI/no-changelog) from the App entirely.
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           fetch-depth: 0
-          token: ${{ steps.app-token.outputs.token }}
-          persist-credentials: true
-      # Changesets-only: knope releases iff a `.changeset/*.md` fragment is pending.
-      # Detecting one here lets the knope step run WITHOUT error-swallowing (a real
-      # failure fails the job), while an ordinary push with no fragment — or the
-      # release-PR merge that consumes them — is a clean no-op.
+          persist-credentials: false
       - name: Detect pending changesets
         id: changesets
         run: |
@@ -66,6 +47,33 @@ jobs:
           fi
           echo "has=$([ "$count" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
           echo "pending changeset fragments: $count"
+      # Everything below runs ONLY when a fragment is pending. Short-lived
+      # podspine-ci App token: its identity is what lets the release PR's eventual
+      # merge tag trigger release.yml (a GITHUB_TOKEN-pushed tag would not, by
+      # GitHub's recursion suppression) and lets CI run on the release PR.
+      - name: Mint podspine-ci App token
+        id: app-token
+        if: ${{ steps.changesets.outputs.has == 'true' }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.PODSPINE_CI_APP_ID }}
+          private-key: ${{ secrets.PODSPINE_CI_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Verify App token was minted
+        if: ${{ steps.changesets.outputs.has == 'true' && steps.app-token.outputs.token == '' }}
+        run: |
+          echo "::error::podspine-ci App token mint produced an empty token; check the PODSPINE_CI_APP_ID / PODSPINE_CI_APP_PRIVATE_KEY secrets and the App installation."
+          exit 1
+      # Re-checkout with the App token persisted so knope's `git push` of the
+      # release branch + the PR it opens run as the App identity. Full history +
+      # tags so knope can find the last release tag.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        if: ${{ steps.changesets.outputs.has == 'true' }}
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: true
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         if: ${{ steps.changesets.outputs.has == 'true' }}
       - name: Configure git identity (podspine-ci App)

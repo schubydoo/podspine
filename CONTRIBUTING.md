@@ -51,11 +51,29 @@ its availability, so run them with ffmpeg installed to actually exercise them.
 - Fill in the PR template and link the issue it addresses.
 - Include tests for new behavior or bug fixes where practical.
 - Update the docs (`README.md`, `docs/`) when your change is user-visible.
-- **Add a changeset** for any user-visible change: a `.changeset/*.md` fragment
-  (run `knope document-change`, or see [`.changeset/README.md`](.changeset/README.md)).
-  Releases and the `CHANGELOG.md` are generated from these fragments — don't
-  hand-edit the changelog. Internal-only PRs (CI, refactor, tests) can skip it
-  with the `no-changelog` label.
+- **Add a changeset** for any user-visible change — create `.changeset/<slug>.md`
+  (or run `knope document-change`) with YAML front matter and a **single-line** body:
+
+  ```markdown
+  ---
+  default: minor
+  ---
+
+  Ingest Opus files with embedded chapters
+  ```
+
+  - `default:` is one of `major` (breaking), `minor` (feature → Features), `patch`
+    (fix → Fixes), `security`, or `perf`.
+  - The body must be **exactly one line** — knope renders any second line/paragraph
+    as a `#### heading` mid-list instead of a bullet, which corrupts the release
+    notes. Fold all detail into that one sentence. (`scripts/lint_changesets.sh`,
+    run by pre-commit, enforces this.)
+  - **Never put a `README.md` or other doc in `.changeset/`** — knope parses every
+    `.md` there and a non-fragment fails the release with "missing front matter".
+
+  Releases and `CHANGELOG.md` are generated from these fragments — don't hand-edit
+  the changelog. Internal-only PRs (CI, refactor, tests) skip it with the
+  `no-changelog` label.
 
 ## A few project-specific rules worth knowing
 
