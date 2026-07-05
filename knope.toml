@@ -3,7 +3,7 @@
 # Model: every user-facing change ships a `.changeset/*.md` fragment; those
 # fragments — not commit messages — drive BOTH the version bump and the changelog
 # (full section control, no commit/fragment duplication). `knope document-change`
-# scaffolds one; see .changeset/README.md and CONTRIBUTING.md. Conventional-commit
+# scaffolds one; see the changeset section in CONTRIBUTING.md. Conventional-commit
 # titles are still enforced (pr-title.yml) for a clean history, but are ignored
 # for release purposes.
 #
