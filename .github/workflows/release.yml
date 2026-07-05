@@ -116,14 +116,29 @@ jobs:
           set -euo pipefail
           [ -s "$BUNDLE" ] || { echo "no provenance bundle produced" >&2; exit 1; }
           cp "$BUNDLE" release/podspine.intoto.jsonl
+      # Publish via the runner's built-in gh CLI instead of a third-party action
+      # (zizmor superfluous-actions). Create-or-update: knope-release may have
+      # already created the Release (with CHANGELOG notes) before this tag-triggered
+      # run, so attach assets to it; otherwise (manual/Knope-off tag) create it.
+      # GH_REPO lets gh resolve the repo without a checkout in this job.
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
-        with:
-          files: |
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          assets=(
             release/podspine-*-linux-*
             release/checksums.txt
             release/checksums.txt.sigstore.json
             release/podspine.intoto.jsonl
+          )
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${assets[@]}" --clobber
+          else
+            gh release create "$TAG" "${assets[@]}" --title "$TAG" --generate-notes
+          fi
 
   image:
     name: Multi-arch image → GHCR (provenance + signed)
