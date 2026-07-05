@@ -42,6 +42,13 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      # Cache the workspace build like ci.yml does — build-mode: manual compiles the
+      # whole workspace under the tracer, and an uncached cold build would otherwise
+      # risk eating the timeout before analysis. Safe here (SAST, not artifact-
+      # publishing), unlike the deliberately-uncached release.yml.
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: codeql
       - name: Initialize CodeQL
         uses: github/codeql-action/init@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4
         with:
