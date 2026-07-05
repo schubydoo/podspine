@@ -319,6 +319,13 @@ async fn serves_feed_and_range_audio() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.headers().get(header::ACCEPT_RANGES).unwrap(), "bytes");
+    // Regression: audio responses MUST carry a Content-Type. axum-range's Ranged
+    // sets none, and a missing type makes Apple Podcasts / iOS refuse playback
+    // ("can't be played on this device"). The synthetic .m4a AAC -> audio/mp4.
+    assert_eq!(
+        resp.headers().get(header::CONTENT_TYPE).unwrap(),
+        "audio/mp4"
+    );
 
     // Range request -> 206 + Content-Range, exactly 100 bytes
     let resp = app
@@ -333,6 +340,11 @@ async fn serves_feed_and_range_audio() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
     assert!(resp.headers().get(header::CONTENT_RANGE).is_some());
+    // ...and the 206 keeps Content-Type too (applied on top of Ranged).
+    assert_eq!(
+        resp.headers().get(header::CONTENT_TYPE).unwrap(),
+        "audio/mp4"
+    );
     assert_eq!(body_bytes(resp).await.len(), 100);
 
     // unknown episode number -> 404

@@ -35,5 +35,6 @@ An optional second paragraph becomes the entry's details in the changelog.
 
 Internal-only PRs (CI, refactors, tests, docs that aren't user-facing) don't need
 a fragment — add the **`no-changelog`** label to silence the advisory
-`changeset-check`. The release automation is currently gated off (`KNOPE_ENABLED`);
-fragments still accumulate here and are consumed on the first enabled release.
+`changeset-check`. The release automation is **enabled** (`KNOPE_ENABLED=true`):
+merging a PR with a fragment opens a "prepare release" PR (version bump +
+generated `CHANGELOG.md`), and merging *that* tags the release.
