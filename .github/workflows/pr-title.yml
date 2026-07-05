@@ -26,9 +26,25 @@ jobs:
     permissions:
       pull-requests: read
     steps:
+      # Mint a short-lived podspine-ci App installation token (≥5,000 REST req/hr,
+      # vs the 1,000/hr github-actions[bot] pool that fails spuriously under
+      # multi-PR bursts). Same-repo PRs only — fork PRs can't read the App secrets,
+      # so the step is skipped there and the action falls back to GITHUB_TOKEN.
+      # Soft-fail: until the App secrets exist the mint yields an empty token and
+      # this required check still runs under GITHUB_TOKEN instead of erroring.
+      - name: Mint podspine-ci App token
+        id: app-token
+        if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.PODSPINE_CI_APP_ID }}
+          private-key: ${{ secrets.PODSPINE_CI_APP_PRIVATE_KEY }}
+          permission-pull-requests: read
       - uses: amannn/action-semantic-pull-request@v6
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # App token on same-repo PRs; GITHUB_TOKEN fallback on forks / pre-App.
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
         with:
           types: |
             feat

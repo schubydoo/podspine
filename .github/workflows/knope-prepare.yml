@@ -34,7 +34,7 @@ jobs:
       # would not, by GitHub's recursion suppression).
       - name: Mint podspine-ci App token
         id: app-token
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ secrets.PODSPINE_CI_APP_ID }}
           private-key: ${{ secrets.PODSPINE_CI_APP_PRIVATE_KEY }}
@@ -45,8 +45,6 @@ jobs:
         run: |
           echo "::error::podspine-ci App token mint produced an empty token; check the PODSPINE_CI_APP_ID / PODSPINE_CI_APP_PRIVATE_KEY secrets and the App installation."
           exit 1
-      # Full history + tags so knope can find the last release tag; persist the App
-      # token so knope's `git push` of the release branch runs as the App identity.
       # Full history + tags so knope can find the last release tag; persist the App
       # token so knope's `git push` of the release branch runs as the App identity.
       - uses: actions/checkout@v4
