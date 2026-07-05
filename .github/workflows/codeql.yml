@@ -45,8 +45,13 @@ jobs:
         uses: github/codeql-action/init@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4
         with:
           languages: rust
-          # Rust extraction is source-based; if analysis ever comes back
-          # incomplete, switch to `build-mode: manual` + a `cargo build` step.
+          # Rust ONLY supports `build-mode: none` (CodeQL 2.25.x). `manual`/`autobuild`
+          # fail at `database init` with "Rust does not support the manual build mode",
+          # so there's no cargo-build-under-tracer option. Extraction is therefore
+          # source-only: some files report "extracted with errors" (unresolved
+          # dependency/macro types) — a known limitation of the experimental Rust
+          # extractor, NOT fixable via build mode. Deeper Rust coverage comes from
+          # clippy (-D warnings), cargo audit/deny, and security.yml.
           build-mode: none
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4
