@@ -125,6 +125,15 @@ button.regen { padding:.5rem .85rem; border:1px solid var(--danger); border-radi
         font:inherit; font-weight:600; background:transparent; color:var(--danger); cursor:pointer; }
 button.regen:hover { background:var(--danger); color:#fff; }
 .back { display:inline-block; margin-bottom:1rem; }
+/* Detail/subscribe titles: the browser-default h1 (~2em) dominates on a phone and
+   a long slug-title can overflow — cap the size and allow wrapping. */
+.detail h1, .subscribe h1 { font-size:1.6rem; line-height:1.25; overflow-wrap:anywhere; margin:.25rem 0 .5rem; }
+@media (max-width:480px){
+  main { padding:1.25rem 1rem; }
+  .detail h1, .subscribe h1 { font-size:1.35rem; }
+  .grid { gap:1rem; grid-template-columns:repeat(auto-fill,minmax(130px,1fr)); }
+  .qrgrid { grid-template-columns:repeat(auto-fill,minmax(120px,1fr)); }
+}
 "#;
 
 /// Tiny clipboard helper. The feed input works without JS (selectable); this
