@@ -25,12 +25,12 @@ time = { version = "0.3.47", features = ["formatting", "parsing"] } # >=0.3.47: 
 # probe / chapters (ffprobe is primary; mp4ameta is the pure-Rust fallback)
 mp4ameta = "0.13.0"
 # index / storage (bundled SQLite compiles into the static binary)
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 # ui
-maud = "0.26"
+maud = "0.27"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 # tokens (v1.5)
-getrandom = "0.2"
+getrandom = "0.4"
 base64 = "0.22"
 blake3 = "1.5"
 # scanning / watching
@@ -38,7 +38,7 @@ notify = "6"
 walkdir = "2"
 # config / cli
 clap = { version = "4", features = ["derive", "env"] }
-toml = "0.8"
+toml = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # observability
