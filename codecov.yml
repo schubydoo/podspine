@@ -68,44 +68,51 @@ comment:
 
 # Per-crate coverage breakdown in the dashboard + PR comment. No `statuses` are
 # defined, so components add VISIBILITY only — no extra per-component PR checks.
-# Keep paths in sync as crates are added (one crate per pipeline stage).
+#
+# IMPORTANT: paths are EXPLICIT FILES, not `crates/<x>/**` globs. Codecov's
+# component matcher silently does NOT pick up a `**` glob here (the component
+# renders empty even at 100% coverage), whereas explicit file paths DO match.
+# (Same quirk clauster's codecov.yml hit with its `db/**` / `hooks/**` components.)
+# So when a crate gains a module, add its `.rs` file here — a glob will look fine
+# and quietly track nothing.
 component_management:
   individual_components:
     - component_id: scanner
       name: scanner (library + orchestration)
       paths:
-        - crates/scanner/**
+        - crates/scanner/src/lib.rs
     - component_id: probe_chapters
       name: prober & chapters
       paths:
-        - crates/prober/**
-        - crates/chapters/**
+        - crates/prober/src/lib.rs
+        - crates/chapters/src/lib.rs
     - component_id: splitter
       name: splitter (ffmpeg)
       paths:
-        - crates/splitter/**
+        - crates/splitter/src/lib.rs
     - component_id: feed
       name: feed (RSS + self-check)
       paths:
-        - crates/feed/**
+        - crates/feed/src/lib.rs
+        - crates/feed/src/selfcheck.rs
     - component_id: http
       name: http (Axum)
       paths:
-        - crates/http/**
+        - crates/http/src/lib.rs
     - component_id: ui
       name: ui (maud)
       paths:
-        - crates/ui/**
+        - crates/ui/src/lib.rs
     - component_id: index
       name: index (SQLite)
       paths:
-        - crates/index/**
+        - crates/index/src/lib.rs
     - component_id: config
       name: config
       paths:
-        - crates/config/**
+        - crates/config/src/lib.rs
     - component_id: server_cli
       name: server & cli
       paths:
-        - src/**
-        - crates/cli/**
+        - src/main.rs
+        - crates/cli/src/main.rs
