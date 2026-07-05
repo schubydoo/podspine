@@ -310,16 +310,24 @@ async fn cover(
 }
 
 /// `GET /audio/{feed_id}/{number}` — stream an episode with Range support.
+///
+/// The `Content-Type` is set explicitly: `axum-range`'s `Ranged` emits
+/// Content-Range/Accept-Ranges/Content-Length but NO Content-Type, and a missing
+/// type makes strict clients (Apple Podcasts / iOS AVPlayer) refuse to play with
+/// "can't be played on this device" — even though the enclosure carries `type=`.
 async fn audio(
     State(state): State<AppState>,
     Path((feed_id, number)): Path<(String, u32)>,
     range: Option<TypedHeader<Range>>,
-) -> Result<Ranged<KnownSize<File>>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     let path = resolve_audio_path(&state, &feed_id, number)?;
+    let mime = mime_for(&path.to_string_lossy());
     let file = File::open(&path).await.map_err(|_| AppError::NotFound)?;
     let body = KnownSize::file(file).await.map_err(AppError::internal)?;
     let range = range.map(|TypedHeader(range)| range);
-    Ok(Ranged::new(range, body))
+    // Header parts apply on top of Ranged's response, so the 206/Content-Range
+    // and the 200 full-body case both keep their status and gain Content-Type.
+    Ok(([(header::CONTENT_TYPE, mime)], Ranged::new(range, body)))
 }
 
 /// Build and self-check the feed XML for a capability `feed_id`. All public URLs
