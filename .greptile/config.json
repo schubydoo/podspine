@@ -9,6 +9,7 @@
     "renovate[bot]",
     "pre-commit-ci[bot]",
     "github-actions[bot]",
+    "podspine-ci[bot]",
     "coderabbitai[bot]"
   ],
   "summarySection": { "included": true, "collapsible": true, "defaultOpen": true },
