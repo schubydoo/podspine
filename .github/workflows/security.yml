@@ -6,9 +6,8 @@ name: Security
 # code-scanning Security tab. Rust SAST lives in codeql.yml and Rust supply-chain
 # (cargo audit/deny) in ci.yml — this file deliberately does not duplicate them.
 #
-# NOTE: first-party/well-known action refs are version tags for readability (a
-# Renovate rule SHA-pins them for Scorecard Pinned-Dependencies). The App-token and
-# third-party scanner actions are SHA-pinned up front.
+# NOTE: all action refs are pinned to full commit SHAs (the repo's Actions policy
+# requires it; also satisfies Scorecard Pinned-Dependencies); Renovate keeps them current.
 
 on:
   push:
@@ -147,10 +146,9 @@ jobs:
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
       - name: Install zizmor
         run: uv tool install zizmor
-      # Advisory: `|| true` keeps the SARIF flowing to the Security tab without
-      # gating merges. Pre-Renovate every action is TAG-pinned, so zizmor's
-      # `unpinned-uses` audit flags them all by design — that's expected noise until
-      # Renovate SHA-pins the refs. Once pinned, drop `|| true` to make it enforcing.
+      # Advisory: `|| true` keeps the SARIF flowing to the Security tab without gating
+      # merges while we confirm zizmor runs clean on these workflows. Drop `|| true` to
+      # make it enforcing once a run shows no findings we don't intend to accept.
       - name: Run zizmor
         run: zizmor --format sarif . > results.sarif || true
         env:
