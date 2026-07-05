@@ -123,6 +123,28 @@ WantedBy=multi-user.target
 sudo systemctl daemon-reload && sudo systemctl enable --now podspine
 ```
 
+## macOS & Windows binaries
+
+The releases page also carries macOS (Intel + Apple Silicon) and Windows (x64)
+binaries. Podspine is a self-hosted server — these are for convenience (dev
+boxes, quick trials); production belongs on the [Docker](#docker) image or the
+Linux binary above, behind a reverse proxy.
+
+They are **not code-signed or notarized** (that needs paid Apple/Microsoft
+certificates), so the OS warns on first launch. Verify the download the same way
+as Linux — cosign-signed `checksums.txt` + SLSA provenance (see
+[SECURITY.md](../SECURITY.md#release-artifacts)) — rather than relying on OS
+signing, then clear the warning:
+
+- **macOS (Gatekeeper):** a browser download is quarantined. Remove it with
+  `xattr -d com.apple.quarantine ./podspine-<version>-darwin-arm64` (then
+  `chmod +x`), or first-launch via right-click -> Open. Downloading with
+  `gh release download` avoids the quarantine flag entirely.
+- **Windows (SmartScreen):** click **More info -> Run anyway**, or unblock first
+  with `Unblock-File .\podspine-<version>-windows-amd64.exe`.
+
+Build provenance for any asset: `gh attestation verify ./<file> --owner schubydoo`.
+
 ## Reverse proxy
 
 Front Podspine with a proxy for TLS, and use it to enforce the [surface
