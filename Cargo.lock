@@ -1045,7 +1045,6 @@ dependencies = [
  "podspine-index",
  "podspine-scanner",
  "podspine-ui",
- "serde",
  "tokio",
  "tower",
  "tower-http",

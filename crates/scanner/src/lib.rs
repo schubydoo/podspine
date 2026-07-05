@@ -189,7 +189,6 @@ pub fn scan_book_as(
         source_path: input.to_string_lossy().into_owned(),
         source_mtime,
         status: "ready".to_string(),
-        indexable: false,
     };
     index.upsert_book(&book)?;
 
@@ -289,7 +288,6 @@ fn scan_mp3_folder(
         source_path: dir.to_string_lossy().into_owned(),
         source_mtime,
         status: "ready".to_string(),
-        indexable: false,
     };
     index.upsert_book(&book)?;
 

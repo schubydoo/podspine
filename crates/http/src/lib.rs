@@ -31,14 +31,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::Router;
-use axum::extract::{Form, Path, State};
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum_extra::TypedHeader;
 use axum_extra::headers::Range;
 use axum_range::{KnownSize, Ranged};
-use serde::Deserialize;
 use tokio::fs::File;
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -139,7 +138,6 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(index))
         .route("/book/{slug}", get(book))
         .route("/book/{slug}/regenerate", post(regenerate))
-        .route("/book/{slug}/indexable", post(set_indexable))
         .route("/cover/{feed_id}", get(cover))
         .route("/feed/{feed_id}", get(feed))
         .route("/audio/{feed_id}/{number}", get(audio))
@@ -172,8 +170,7 @@ async fn healthz() -> &'static str {
 /// `GET /feed/{feed_id}.xml` — the route captures `{feed_id}` including the
 /// `.xml` suffix, which we strip before lookup. The capability URL is never
 /// crawlable: an `X-Robots-Tag: noindex` keeps it out of web search engines
-/// (the `itunes:block` in the XML separately keeps it out of podcast directories
-/// when the book isn't `indexable`).
+/// (the `itunes:block` in the XML separately keeps it out of podcast directories).
 async fn feed(
     State(state): State<AppState>,
     Path(id_xml): Path<String>,
@@ -242,15 +239,8 @@ async fn book(
         author: book.author,
         has_cover: book.cover_path.is_some(),
         episode_count,
-        indexable: book.indexable,
     };
     Ok(Html(book_page(&detail).into_string()))
-}
-
-/// Form body for the indexable toggle.
-#[derive(Deserialize)]
-struct IndexableForm {
-    indexable: bool,
 }
 
 /// `POST /book/{slug}/regenerate` — rotate the book's capability `feed_id` (leak
@@ -275,33 +265,6 @@ async fn regenerate(
             .ok_or(AppError::NotFound)?;
         index
             .regenerate_feed_id(&book.id)
-            .map_err(AppError::internal)?;
-    }
-    Ok(Redirect::to(&format!("/book/{slug}")))
-}
-
-/// `POST /book/{slug}/indexable` — toggle whether the feed advertises to podcast
-/// directories (drops/adds `itunes:block`). Redirects back to the book page.
-async fn set_indexable(
-    State(state): State<AppState>,
-    Path(slug): Path<String>,
-    headers: HeaderMap,
-    Form(form): Form<IndexableForm>,
-) -> Result<Redirect, AppError> {
-    if !same_origin(&headers, &state.base_url) {
-        return Err(AppError::Forbidden);
-    }
-    if !valid_slug(&slug) {
-        return Err(AppError::NotFound);
-    }
-    {
-        let index = state.index.lock().map_err(AppError::internal)?;
-        let book = index
-            .get_book_by_slug(&slug)
-            .map_err(AppError::internal)?
-            .ok_or(AppError::NotFound)?;
-        index
-            .set_indexable(&book.id, form.indexable)
             .map_err(AppError::internal)?;
     }
     Ok(Redirect::to(&format!("/book/{slug}")))
@@ -391,8 +354,6 @@ fn build_feed_xml(state: &AppState, feed_id: &str) -> Result<String, AppError> {
         cover_url,
         source_mtime: book.source_mtime,
         self_url: format!("{base}/feed/{feed_id}.xml"),
-        // Not indexable → ask podcast directories not to list it (itunes:block).
-        blocked: !book.indexable,
         episodes: episodes
             .iter()
             .map(|e| FeedEpisode {

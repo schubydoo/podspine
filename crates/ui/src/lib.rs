@@ -29,8 +29,8 @@ pub struct BookCard {
 
 /// A single book's detail page (`GET /book/{slug}`).
 pub struct BookDetail {
-    /// URL slug — the human `/book/{slug}` key (also the base for future
-    /// regenerate/indexable POST actions).
+    /// URL slug — the human `/book/{slug}` key (also the base for the
+    /// regenerate POST action).
     pub slug: String,
     /// Capability id — the `/cover/{feed_id}` key (unguessable).
     pub feed_id: String,
@@ -44,9 +44,6 @@ pub struct BookDetail {
     pub feed_url: String,
     /// Number of episodes (chapters) in the feed.
     pub episode_count: usize,
-    /// Whether this feed is listed in podcast directories (drives the toggle's
-    /// current-state label). Default books are unlisted.
-    pub indexable: bool,
 }
 
 /// Shared styles + a page shell. Inlined so the binary needs no static assets.
@@ -99,9 +96,6 @@ button.copy { padding:.55rem .9rem; border:0; border-radius:6px; font:inherit;
 button.regen { padding:.5rem .85rem; border:1px solid var(--danger); border-radius:6px;
         font:inherit; font-weight:600; background:transparent; color:var(--danger); cursor:pointer; }
 button.regen:hover { background:var(--danger); color:#fff; }
-button.toggle { padding:.5rem .85rem; border:1px solid var(--border); border-radius:6px;
-        font:inherit; font-weight:600; background:var(--bg); color:var(--text); cursor:pointer; }
-button.toggle:hover { background:var(--surface); }
 .back { display:inline-block; margin-bottom:1rem; }
 "#;
 
@@ -212,7 +206,7 @@ pub fn book_page(book: &BookDetail) -> Markup {
                             }
                         }
 
-                        (private_panel(&book.slug, book.indexable))
+                        (private_panel(&book.slug))
 
                         (howto(&book.feed_url))
                     }
@@ -223,38 +217,24 @@ pub fn book_page(book: &BookDetail) -> Markup {
     )
 }
 
-/// The "private link" controls: regenerate the capability URL (leak recovery)
-/// and toggle directory listing. Plain `POST` forms — no JS required. `slug` is
-/// the (LAN-only) UI key the mutation routes act on; `feed_id` never appears in
-/// these action URLs.
-fn private_panel(slug: &str, indexable: bool) -> Markup {
+/// The "private link" controls: regenerate the capability URL (leak recovery).
+/// A plain `POST` form — no JS required. `slug` is the (LAN-only) UI key the
+/// route acts on; `feed_id` never appears in the action URL. Feeds are always
+/// kept out of podcast directories, so there's nothing to toggle.
+fn private_panel(slug: &str) -> Markup {
     html! {
         section.private {
             h2 { "🔒 Private link" }
             p {
                 "Anyone with the URL above can subscribe — treat it like a password. "
-                "If it leaks, regenerate to replace it."
+                "If it leaks, regenerate to replace it. This feed is kept out of "
+                "podcast directories."
             }
             div.privrow {
                 form method="post" action=(format!("/book/{slug}/regenerate")) {
                     button.regen type="submit" { "Regenerate link" }
                 }
                 span.note { "Replaces the URL above — the current link stops working immediately." }
-            }
-            div.privrow {
-                @if indexable {
-                    span { "Listed in podcast directories." }
-                    form method="post" action=(format!("/book/{slug}/indexable")) {
-                        input type="hidden" name="indexable" value="false";
-                        button.toggle type="submit" { "Make private" }
-                    }
-                } @else {
-                    span { "Hidden from podcast directories " code { "(itunes:block)" } "." }
-                    form method="post" action=(format!("/book/{slug}/indexable")) {
-                        input type="hidden" name="indexable" value="true";
-                        button.toggle type="submit" { "List in directories" }
-                    }
-                }
             }
         }
     }
@@ -337,7 +317,6 @@ mod tests {
             has_cover: true,
             feed_url: "http://host:8080/feed/Xk9mQ2vP7nR4tB1cY6wZ8a.xml".into(),
             episode_count: 12,
-            indexable: false,
         };
         let html = book_page(&book).into_string();
         // The copy input carries the exact working (capability) URL, and it
@@ -348,33 +327,10 @@ mod tests {
         // QR rendered as inline SVG, labelled for AT.
         assert!(html.contains("<svg"));
         assert!(html.contains("aria-label=\"QR code linking to the podcast feed URL\""));
-        // Private-link controls post to slug-keyed routes (feed_id never in the
-        // action URL); a not-indexed book offers to list it.
+        // The regenerate control posts to the slug-keyed route (feed_id never in
+        // the action URL).
         assert!(html.contains("action=\"/book/dune/regenerate\""));
-        assert!(html.contains("action=\"/book/dune/indexable\""));
-        assert!(html.contains("List in directories"));
-    }
-
-    #[test]
-    fn book_page_toggle_reflects_indexable_state() {
-        let mut book = BookDetail {
-            slug: "dune".into(),
-            feed_id: "cap".into(),
-            title: "Dune".into(),
-            author: None,
-            has_cover: false,
-            feed_url: "http://h/feed/cap.xml".into(),
-            episode_count: 1,
-            indexable: true,
-        };
-        // Listed → offers to make it private again.
-        assert!(book_page(&book).into_string().contains("Make private"));
-        book.indexable = false;
-        assert!(
-            book_page(&book)
-                .into_string()
-                .contains("List in directories")
-        );
+        assert!(html.contains("Regenerate link"));
     }
 
     #[test]
