@@ -51,6 +51,10 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.13.0
+          # No Actions cache in this signed-release build: it's tag-triggered (rare),
+          # and caching in an artifact-publishing workflow is a cache-poisoning vector
+          # (zizmor cache-poisoning). Matches the old goto-bus-stop/setup-zig behavior.
+          use-cache: false
       - name: Install cargo-zigbuild
         run: cargo install cargo-zigbuild --locked
       - name: Build
