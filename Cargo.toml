@@ -72,5 +72,4 @@ podspine-scanner = { path = "crates/scanner" }
 podspine-http = { path = "crates/http" }
 tokio = { workspace = true }
 anyhow = { workspace = true }
-tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

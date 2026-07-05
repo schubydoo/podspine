@@ -1101,7 +1101,6 @@ dependencies = [
  "podspine-index",
  "podspine-scanner",
  "tokio",
- "tracing",
  "tracing-subscriber",
 ]
 
@@ -1110,7 +1109,6 @@ name = "podspine-chapters"
 version = "0.1.0"
 dependencies = [
  "podspine-prober",
- "tracing",
 ]
 
 [[package]]

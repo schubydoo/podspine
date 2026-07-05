@@ -11,4 +11,3 @@ publish = false
 
 [dependencies]
 podspine-prober = { path = "../prober" }
-tracing = { workspace = true }
