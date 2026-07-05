@@ -10,8 +10,8 @@ name: CodeQL
 # main. CodeQL uploads via the built-in GITHUB_TOKEN (App tokens are rejected by
 # upload-sarif, github/codeql-action#2719).
 #
-# NOTE: action refs are version tags for readability; a Renovate digest-pinning
-# rule (renovate.json) converts them to commit SHAs (Scorecard Pinned-Dependencies).
+# NOTE: action refs are pinned to full commit SHAs (the repo's Actions policy
+# requires it; also satisfies Scorecard Pinned-Dependencies); Renovate keeps them current.
 
 on:
   push:
@@ -38,17 +38,17 @@ jobs:
       actions: read
       contents: read
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@411c4c9a36b3fca4d674f06b6396b2c6d23522c6 # v3
+        uses: github/codeql-action/init@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4
         with:
           languages: rust
           # Rust extraction is source-based; if analysis ever comes back
           # incomplete, switch to `build-mode: manual` + a `cargo build` step.
           build-mode: none
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@411c4c9a36b3fca4d674f06b6396b2c6d23522c6 # v3
+        uses: github/codeql-action/analyze@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4
         with:
           category: "/language:rust"

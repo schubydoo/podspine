@@ -11,7 +11,7 @@ _Nothing yet._
 ## [1.0.0]
 
 First tagged release: a zero-config, self-hosted server that turns a folder of
-audiobooks into per-chapter podcast RSS feeds any podcatcher can play.
+audiobooks into per-chapter podcast RSS feeds any podcast app can play.
 
 ### Added
 - **Per-chapter podcast feeds** with correct ordering: sequential `pubDate`s

@@ -26,7 +26,7 @@ that precedence. The library path is the only required input.
 | `--config` | `PODSPINE_CONFIG` | none | Path to a TOML config file. |
 
 > **`PODSPINE_BASE_URL` is the one that bites people.** Feed and enclosure (audio)
-> URLs are built from it. If it's left at `localhost`, a podcatcher on another device
+> URLs are built from it. If it's left at `localhost`, a podcast app on another device
 > can't fetch anything. Set it to the LAN IP / hostname (and scheme + port, or the
 > public URL if behind a proxy) that clients actually reach.
 

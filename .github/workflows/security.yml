@@ -6,9 +6,8 @@ name: Security
 # code-scanning Security tab. Rust SAST lives in codeql.yml and Rust supply-chain
 # (cargo audit/deny) in ci.yml — this file deliberately does not duplicate them.
 #
-# NOTE: first-party/well-known action refs are version tags for readability (a
-# Renovate rule SHA-pins them for Scorecard Pinned-Dependencies). The App-token and
-# third-party scanner actions are SHA-pinned up front.
+# NOTE: all action refs are pinned to full commit SHAs (the repo's Actions policy
+# requires it; also satisfies Scorecard Pinned-Dependencies); Renovate keeps them current.
 
 on:
   push:
@@ -32,7 +31,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           fetch-depth: 0 # full history so the scan covers every commit
           persist-credentials: false
@@ -69,7 +68,7 @@ jobs:
       security-events: write # upload the SARIF to code scanning
       contents: read
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
       # The runtime-only Dockerfile COPYs a prebuilt dist/<arch>/podspine, so build
@@ -89,9 +88,9 @@ jobs:
           mkdir -p dist/amd64
           cp target/x86_64-unknown-linux-musl/release/podspine dist/amd64/podspine
           chmod +x dist/amd64/podspine
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
       - name: Build image (load locally, no push)
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           load: true
@@ -113,7 +112,7 @@ jobs:
           exit-code: "0"
       - name: Upload SARIF
         if: always()
-        uses: github/codeql-action/upload-sarif@411c4c9a36b3fca4d674f06b6396b2c6d23522c6 # v3
+        uses: github/codeql-action/upload-sarif@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4
         with:
           sarif_file: trivy-image.sarif
           category: trivy-image
@@ -127,7 +126,7 @@ jobs:
       contents: read
       actions: read
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
       # podspine-ci App token so zizmor's advisory API lookups don't 403 against the
@@ -147,16 +146,15 @@ jobs:
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
       - name: Install zizmor
         run: uv tool install zizmor
-      # Advisory: `|| true` keeps the SARIF flowing to the Security tab without
-      # gating merges. Pre-Renovate every action is TAG-pinned, so zizmor's
-      # `unpinned-uses` audit flags them all by design — that's expected noise until
-      # Renovate SHA-pins the refs. Once pinned, drop `|| true` to make it enforcing.
+      # Advisory: `|| true` keeps the SARIF flowing to the Security tab without gating
+      # merges while we confirm zizmor runs clean on these workflows. Drop `|| true` to
+      # make it enforcing once a run shows no findings we don't intend to accept.
       - name: Run zizmor
         run: zizmor --format sarif . > results.sarif || true
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
       - name: Upload SARIF
-        uses: github/codeql-action/upload-sarif@411c4c9a36b3fca4d674f06b6396b2c6d23522c6 # v3
+        uses: github/codeql-action/upload-sarif@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4
         with:
           sarif_file: results.sarif
           category: zizmor

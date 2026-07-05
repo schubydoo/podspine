@@ -1,6 +1,6 @@
 # Podspine
 
-**Turn your audiobook files into per-chapter podcast feeds any podcatcher can play.**
+**Turn your audiobook files into per-chapter podcast feeds any podcast app can play.**
 
 Podspine is a small self-hosted server. Point it at a folder of audiobooks and it
 gives each book its own podcast RSS feed — one episode per chapter, in the right
@@ -36,7 +36,7 @@ docker run \
 
 Then open <http://localhost:8080> to browse your books and copy feed URLs.
 
-> **Set `PODSPINE_BASE_URL`** to the address podcatchers will actually reach
+> **Set `PODSPINE_BASE_URL`** to the address podcast apps will actually reach
 > (your LAN IP or public hostname). It defaults to `http://localhost:8080`, which
 > only works from the same machine — feed and audio URLs are built from it.
 
