@@ -8,7 +8,7 @@
 # Base is Alpine: the binary is static musl, so no glibc is needed, and Alpine's
 # ffmpeg keeps the image ~1/3 the size of debian-slim (TAD sanctions this "if size
 # matters" — it does; the ≤180MB target rules out debian's full ffmpeg).
-FROM alpine:3.24
+FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
 
 # ffmpeg is the one runtime dependency; ca-certificates for outbound TLS if needed.
 RUN apk add --no-cache ffmpeg ca-certificates
