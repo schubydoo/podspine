@@ -10,8 +10,8 @@ name: CodeQL
 # main. CodeQL uploads via the built-in GITHUB_TOKEN (App tokens are rejected by
 # upload-sarif, github/codeql-action#2719).
 #
-# NOTE: action refs are version tags for readability; a Renovate digest-pinning
-# rule (renovate.json) converts them to commit SHAs (Scorecard Pinned-Dependencies).
+# NOTE: action refs are pinned to full commit SHAs (the repo's Actions policy
+# requires it; also satisfies Scorecard Pinned-Dependencies); Renovate keeps them current.
 
 on:
   push:
