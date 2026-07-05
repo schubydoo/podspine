@@ -13,9 +13,10 @@
       "groupName": "github-actions"
     },
     {
-      "description": "Batch non-major Cargo updates.",
+      "description": "Batch non-major Cargo updates for STABLE (>=1.0) crates only. A 0.x minor bump is a breaking change under Cargo semver, so 0.x updates are left ungrouped as individual PRs that get reviewed with any required code change.",
       "matchManagers": ["cargo"],
       "matchUpdateTypes": ["minor", "patch"],
+      "matchCurrentVersion": "!/^0\\./",
       "groupName": "cargo (minor & patch)"
     }
   ]

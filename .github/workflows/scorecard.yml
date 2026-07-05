@@ -7,9 +7,8 @@ name: Scorecard
 # signal lives in the Security tab (Code scanning → Scorecard) and at
 # scorecard.dev once publish_results is enabled.
 #
-# NOTE: action refs are version tags for readability; a Renovate digest-pinning
-# rule (renovate.json) converts them to commit SHAs to satisfy Scorecard's
-# Pinned-Dependencies check and keeps them updated.
+# NOTE: action refs are pinned to full commit SHAs (the repo's Actions policy
+# requires it; also satisfies Scorecard Pinned-Dependencies); Renovate keeps them current.
 
 on:
   branch_protection_rule:
@@ -36,7 +35,7 @@ jobs:
       contents: read
       actions: read
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
       # podspine-ci App token as Scorecard's repo_token: the Branch-Protection check
@@ -63,7 +62,7 @@ jobs:
           publish_results: true
           repo_token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
       - name: Upload SARIF
-        uses: github/codeql-action/upload-sarif@411c4c9a36b3fca4d674f06b6396b2c6d23522c6 # v3
+        uses: github/codeql-action/upload-sarif@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4
         with:
           sarif_file: results.sarif
           category: scorecard

@@ -47,7 +47,7 @@ jobs:
           exit 1
       # Full history + tags so knope can find the last release tag; persist the App
       # token so knope's `git push` of the release branch runs as the App identity.
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token }}

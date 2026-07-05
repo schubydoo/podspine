@@ -10,8 +10,8 @@ name: Release
 #
 # Cut a release: `git tag v1.0.0 && git push origin v1.0.0`.
 #
-# NOTE: action refs are version tags for readability; a Renovate digest-pinning
-# rule (renovate.json) converts them to commit SHAs (Scorecard Pinned-Dependencies).
+# NOTE: action refs are pinned to full commit SHAs (the repo's Actions policy
+# requires it; also satisfies Scorecard Pinned-Dependencies); Renovate keeps them current.
 
 on:
   push:
@@ -39,17 +39,22 @@ jobs:
           - target: aarch64-unknown-linux-musl
             arch: arm64
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           targets: ${{ matrix.target }}
       # cargo-zigbuild uses zig as the cross linker, so both musl targets build
-      # from an x86_64 runner (incl. rusqlite's bundled SQLite C).
-      - uses: goto-bus-stop/setup-zig@abea47f85e598557f500fa1fd2ab7464fcb39406 # v2
+      # from an x86_64 runner (incl. rusqlite's bundled SQLite C). mlugg/setup-zig
+      # is the maintained successor to the abandoned goto-bus-stop/setup-zig.
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.13.0
+          # No Actions cache in this signed-release build: it's tag-triggered (rare),
+          # and caching in an artifact-publishing workflow is a cache-poisoning vector
+          # (zizmor cache-poisoning). Matches the old goto-bus-stop/setup-zig behavior.
+          use-cache: false
       - name: Install cargo-zigbuild
         run: cargo install cargo-zigbuild --locked
       - name: Build
@@ -59,7 +64,7 @@ jobs:
           mkdir -p "dist/${{ matrix.arch }}"
           cp "target/${{ matrix.target }}/release/podspine" "dist/${{ matrix.arch }}/podspine"
       - name: Upload binary artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: dist-${{ matrix.arch }}
           path: dist/${{ matrix.arch }}/podspine
@@ -75,11 +80,11 @@ jobs:
       attestations: write # actions/attest-build-provenance
     steps:
       - name: Fetch built binaries
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: artifacts
       - name: Install cosign
-        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Install syft (SBOMs)
         uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0
       - name: Assemble, SBOM, checksum, and sign
@@ -101,7 +106,7 @@ jobs:
           cosign sign-blob --bundle checksums.txt.sigstore.json checksums.txt --yes
       - name: SLSA build provenance
         id: provenance
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
         with:
           subject-checksums: release/checksums.txt
       - name: Attach provenance as a release asset
@@ -111,14 +116,29 @@ jobs:
           set -euo pipefail
           [ -s "$BUNDLE" ] || { echo "no provenance bundle produced" >&2; exit 1; }
           cp "$BUNDLE" release/podspine.intoto.jsonl
+      # Publish via the runner's built-in gh CLI instead of a third-party action
+      # (zizmor superfluous-actions). Create-or-update: knope-release may have
+      # already created the Release (with CHANGELOG notes) before this tag-triggered
+      # run, so attach assets to it; otherwise (manual/Knope-off tag) create it.
+      # GH_REPO lets gh resolve the repo without a checkout in this job.
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
-        with:
-          files: |
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          assets=(
             release/podspine-*-linux-*
             release/checksums.txt
             release/checksums.txt.sigstore.json
             release/podspine.intoto.jsonl
+          )
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${assets[@]}" --clobber
+          else
+            gh release create "$TAG" "${assets[@]}" --title "$TAG" --generate-notes
+          fi
 
   image:
     name: Multi-arch image → GHCR (provenance + signed)
@@ -130,11 +150,11 @@ jobs:
       id-token: write # cosign keyless
       attestations: write
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
       - name: Fetch prebuilt binaries
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: artifacts
       - name: Lay out dist/ for the Dockerfile
@@ -143,19 +163,19 @@ jobs:
           cp artifacts/dist-amd64/podspine dist/amd64/podspine
           cp artifacts/dist-arm64/podspine dist/arm64/podspine
           chmod +x dist/amd64/podspine dist/arm64/podspine
-      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
       - name: Install cosign
-        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Log in to GHCR
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Image tags
         id: meta
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
@@ -164,7 +184,7 @@ jobs:
             type=raw,value=latest
       - name: Build and push
         id: build
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
