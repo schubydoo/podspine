@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.1 (2026-07-05)
+
+### Fixes
+
+- Set the audio `Content-Type` on `/audio` responses so Apple Podcasts and other iOS clients can play episodes (axum-range sets none, which made playback fail with "this episode can't be played on this device"). ([#20](https://github.com/schubydoo/podspine/pull/20))
+
 ## 1.0.0 (2026-07-05)
 
 First tagged release: a zero-config, self-hosted server that turns a folder of
