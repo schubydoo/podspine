@@ -32,7 +32,7 @@ jobs:
   analyze:
     name: analyze (rust)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
       security-events: write # upload results to code scanning
       actions: read
@@ -41,13 +41,18 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - name: Initialize CodeQL
         uses: github/codeql-action/init@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4
         with:
           languages: rust
-          # Rust extraction is source-based; if analysis ever comes back
-          # incomplete, switch to `build-mode: manual` + a `cargo build` step.
-          build-mode: none
+          # `build-mode: none` did source-only extraction that couldn't resolve
+          # dependency types — 19/20 files came back "extracted with errors", so the
+          # SAST was effectively empty. `manual` traces a real cargo build so CodeQL
+          # sees the whole workspace with deps resolved.
+          build-mode: manual
+      - name: Build under the CodeQL tracer
+        run: cargo build --workspace --all-targets --locked
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4
         with:
