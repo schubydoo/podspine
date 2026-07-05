@@ -1,0 +1,11 @@
+# Per-Dockerfile ignore for the ClusterFuzzLite build. It OVERRIDES the repo-root
+# .dockerignore (which keeps only dist/ for the lean runtime image) — without this,
+# the root ignore excludes the source, so `COPY .clusterfuzzlite/build.sh` fails
+# "not found" and no fuzzers build. Here we keep the whole Rust workspace and
+# exclude only what cargo-fuzz doesn't need. rust-toolchain.toml is excluded on
+# purpose: its `channel = "stable"` would override base-builder-rust's nightly and
+# break `cargo fuzz build`.
+.git
+target
+dist
+rust-toolchain.toml
