@@ -4,10 +4,20 @@
 [advisories]
 version = 2
 yanked = "deny"
+# proc-macro-error (RUSTSEC-2024-0370) is unmaintained but reaches us only as a
+# BUILD-TIME proc-macro dep via maud_macros -> maud -> podspine-ui; maud 0.26
+# (latest) still uses it and there is no safe upgrade. It is not a runtime
+# dependency, and the advisory is "unmaintained", not a vulnerability. Revisit
+# if/when maud drops proc-macro-error.
+ignore = ["RUSTSEC-2024-0370"]
 
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Internal workspace crates are path deps with no version requirement — a
+# "wildcard" to cargo-deny, but expected and correct. Only EXTERNAL wildcard
+# deps are the smell this rule is meant to catch.
+allow-wildcard-paths = true
 
 [licenses]
 version = 2
