@@ -63,6 +63,12 @@ Run with logs to see scan/serve behavior:
 RUST_LOG=debug cargo run -- --library ./sample-books
 ```
 
+## Benchmarks
+
+`scripts/bench.sh` measures the v2 performance targets (ingest, feed p95, audio
+TTFB, idle RSS) against a synthesized book on your hardware. See
+[docs/benchmarks.md](benchmarks.md) for methodology, knobs, and a reference run.
+
 ## Release build (static musl)
 
 Release binaries are static musl builds so they run without a glibc dependency (and
