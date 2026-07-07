@@ -1,0 +1,58 @@
+# INSTALL THIS INTO the schubydoo/scoop-podspine repo at
+# .github/workflows/sync-manifest.yml  (it does NOT run from the main podspine repo).
+#
+# The canonical Scoop manifest lives in the main repo (schubydoo/podspine) at
+# packaging/scoop/podspine.json, regenerated on every release by packaging-bump.yml.
+# This bucket mirrors it to bucket/podspine.json so `scoop bucket add podspine
+# https://github.com/schubydoo/scoop-podspine; scoop install podspine` works. Auth-free.
+name: Sync manifest from podspine
+
+on:
+  schedule:
+    - cron: "19 6 * * *" # daily ~06:19 UTC (fallback if the dispatch is missed)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-manifest
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: Fetch + sync the canonical manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SRC: https://raw.githubusercontent.com/schubydoo/podspine/main/packaging/scoop/podspine.json
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp)"
+          if ! curl -fsSL "$SRC" -o "$tmp"; then
+            echo "::notice::could not fetch $SRC (not on main yet?) — skipping this run"
+            exit 0
+          fi
+          # Fail closed unless it parses as JSON with a version (never commit garbage).
+          if ! python3 -c "import json,sys; d=json.load(open('$tmp')); sys.exit(0 if d.get('version') else 1)"; then
+            echo "::error::fetched content is not a valid podspine Scoop manifest"
+            exit 1
+          fi
+          mkdir -p bucket
+          if cmp -s "$tmp" bucket/podspine.json; then
+            echo "Manifest already up to date — nothing to do."
+            exit 0
+          fi
+          cp "$tmp" bucket/podspine.json
+          ver="$(python3 -c "import json;print(json.load(open('bucket/podspine.json'))['version'])")"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bucket/podspine.json
+          git commit -m "chore: sync podspine manifest ${ver} from main"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main
+          echo "Synced manifest ${ver}."

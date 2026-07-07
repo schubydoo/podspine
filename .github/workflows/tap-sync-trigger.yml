@@ -1,0 +1,60 @@
+name: tap-sync-trigger
+
+# When a packaging-bump PR merges (the Homebrew formula + Scoop manifest sources on
+# `main` have just changed), trigger the tap's and bucket's syncs IMMEDIATELY instead
+# of waiting for their daily cron. Best-effort: a dispatch failure just leaves the cron
+# as the safety net, so this never blocks or fails the release path.
+#
+# WHY this trigger point (not `release: published`): at publish time the bumped manifests
+# are NOT yet on `main` — packaging-bump opens a PR; it doesn't push main. So we fire on
+# the packaging-bump PR MERGE, detected by the head-branch prefix.
+#
+# SECURITY: same-repo, merged `packaging-bump/*` PR only (a fork can't reach this even by
+# naming its head that; `pull_request`, not _target). Mints a tap/bucket-scoped
+# podspine-ci App token with `actions:write` ONLY (never contents:write) — the minimal
+# cross-repo surface `workflow run` needs. Workflow-level permissions stay read-only.
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  trigger-sync:
+    name: dispatch the tap + bucket syncs
+    timeout-minutes: 5
+    if: >-
+      github.event.pull_request.merged == true
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && startsWith(github.head_ref, 'packaging-bump/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint a tap/bucket-scoped podspine-ci App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.PODSPINE_CI_APP_ID }}
+          private-key: ${{ secrets.PODSPINE_CI_APP_PRIVATE_KEY }}
+          owner: schubydoo
+          repositories: |
+            homebrew-podspine
+            scoop-podspine
+          permission-actions: write # only what `gh workflow run` (workflow_dispatch) needs
+      - name: Verify the token was minted
+        if: ${{ steps.app-token.outputs.token == '' }}
+        run: |
+          echo "::error::podspine-ci App token was empty; refusing to dispatch. Confirm the \
+          App is installed on schubydoo/homebrew-podspine and scoop-podspine with Actions: write."
+          exit 1
+      # Best-effort per repo: each downstream sync no-ops when the manifest is unchanged,
+      # and its daily cron stays the fallback, so a dispatch failure must not fail the job.
+      - name: Trigger the Homebrew tap + Scoop bucket syncs
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh workflow run sync-formula.yml --repo schubydoo/homebrew-podspine --ref main \
+            || echo "::warning::tap sync dispatch failed; the tap's daily cron will still sync."
+          gh workflow run sync-manifest.yml --repo schubydoo/scoop-podspine --ref main \
+            || echo "::warning::bucket sync dispatch failed; the bucket's daily cron will still sync."
