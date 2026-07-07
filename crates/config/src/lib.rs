@@ -21,6 +21,7 @@ const DEFAULT_DATA_DIR: &str = "./data";
 #[derive(Debug, Default, Parser)]
 #[command(
     name = "podspine",
+    version,
     about = "Serve audiobooks as per-chapter podcast feeds"
 )]
 pub struct Cli {

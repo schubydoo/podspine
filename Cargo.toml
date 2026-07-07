@@ -61,6 +61,31 @@ repository.workspace = true
 authors.workspace = true
 publish = false
 
+# cargo-binstall: fetch the prebuilt release binary instead of compiling.
+#   cargo binstall --git https://github.com/schubydoo/podspine podspine
+# (`--git` because the workspace is publish=false — nothing is on crates.io.)
+# Our assets are raw binaries named podspine-v{version}-{os}-{arch} with
+# os=linux|darwin|windows and arch=amd64|arm64, which don't match binstall's
+# default {target-arch}/{target-os}, so each supported target is mapped here.
+# The Linux binaries are static musl, so they also serve the -gnu targets.
+[package.metadata.binstall]
+pkg-fmt = "bin"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-musl]
+pkg-url = "{ repo }/releases/download/v{ version }/podspine-v{ version }-linux-amd64"
+[package.metadata.binstall.overrides.aarch64-unknown-linux-musl]
+pkg-url = "{ repo }/releases/download/v{ version }/podspine-v{ version }-linux-arm64"
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/podspine-v{ version }-linux-amd64"
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/podspine-v{ version }-linux-arm64"
+[package.metadata.binstall.overrides.x86_64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/podspine-v{ version }-darwin-amd64"
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/podspine-v{ version }-darwin-arm64"
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/podspine-v{ version }-windows-amd64.exe"
+
 [[bin]]
 name = "podspine"
 path = "src/main.rs"
