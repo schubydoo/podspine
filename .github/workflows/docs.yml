@@ -49,10 +49,13 @@ jobs:
   deploy:
     name: deploy (mike)
     needs: build
-    # Never on PRs (fork tokens are read-only anyway); same-repo only.
+    # Never on PRs (fork tokens are read-only anyway); same-repo only; and only
+    # for main or a release tag — otherwise a manual workflow_dispatch from a
+    # feature branch would fall through and overwrite `latest` with branch docs.
     if: >-
       github.event_name != 'pull_request'
       && github.repository == 'schubydoo/podspine'
+      && (github.ref == 'refs/heads/main' || github.ref_type == 'tag')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -84,7 +87,14 @@ jobs:
             version="${REF_NAME#v}"
             mike deploy --push "${version%.*}"
           else
-            # main -> rolling `latest`, and make the site root redirect to it.
+            # main -> rolling `latest`. Note whether gh-pages exists BEFORE the
+            # deploy creates it, so we can set the root redirect exactly once.
+            first_deploy=true
+            git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1 && first_deploy=false
             mike deploy --push --update-aliases latest
-            mike set-default --push latest
+            # Point the site root at `latest` — only needed on the first deploy;
+            # skipping it afterwards avoids a redundant redirect commit each push.
+            if [ "$first_deploy" = true ]; then
+              mike set-default --push latest
+            fi
           fi
