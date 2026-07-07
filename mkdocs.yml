@@ -57,6 +57,10 @@ markdown_extensions:
   - pymdownx.snippets
   - pymdownx.highlight:
       anchor_linenums: true
+  # `:material-*:` / `:fontawesome-*:` icon shortcodes -> inline SVGs.
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
   - pymdownx.superfences:
       custom_fences:
         # Render ```mermaid fenced blocks client-side (Material bundles mermaid.js).
