@@ -103,6 +103,17 @@ jobs:
         run: |
           set -euo pipefail
           tmp="$(mktemp -d)"
+          # release.yml publishes the release before its 5-platform matrix finishes
+          # uploading assets, so `release: published` can fire before checksums.txt
+          # exists. Wait for it (up to ~5 min) instead of racing to a hard failure.
+          for i in $(seq 1 20); do
+            if [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+                    --json assets --jq '[.assets[].name]|index("checksums.txt")')" != "null" ]; then
+              break
+            fi
+            echo "checksums.txt not on $TAG yet (attempt $i/20) — waiting 15s..."
+            sleep 15
+          done
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern checksums.txt --dir "$tmp"
           python3 scripts/bump_packaging.py "$VERSION" "$GITHUB_REPOSITORY" "$tmp/checksums.txt"
           if git diff --quiet; then
