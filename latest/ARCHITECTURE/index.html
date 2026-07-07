@@ -765,15 +765,11 @@ small browse UI over HTTP. A background watcher keeps the index reconciled with 
 library while it runs, so added, replaced, or removed books are picked up without a
 restart.</p>
 <pre class="mermaid"><code>flowchart LR
-  cfg[config&lt;br/&gt;CLI/env/TOML + ffmpeg preflight] --&gt; scan[scanner&lt;br/&gt;walk library, classify books]
-  scan --&gt; probe[prober&lt;br/&gt;ffprobe]
-  probe --&gt; chap[chapters&lt;br/&gt;.cue / .ffmeta / embedded]
-  chap --&gt; split[splitter&lt;br/&gt;ffmpeg stream-copy]
-  split --&gt; idx[(index&lt;br/&gt;SQLite)]
-  idx --&gt; feed[feed&lt;br/&gt;RSS 2.0 + itunes/podcast]
-  idx --&gt; http[http&lt;br/&gt;Axum]
-  feed --&gt; http
-  http --&gt; ui[ui&lt;br/&gt;maud pages]</code></pre>
+  config --&gt; scanner --&gt; prober --&gt; chapters --&gt; splitter --&gt; index[(index)]
+  index --&gt; feed --&gt; http --&gt; ui
+  index --&gt; http</code></pre>
+<p>The crates are described below; the pipeline runs left to right, with the SQLite
+<code>index</code> feeding both the <code>feed</code> builder and the <code>http</code> server.</p>
 <h2 id="crates">Crates<a class="headerlink" href="#crates" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
