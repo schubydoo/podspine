@@ -46,7 +46,7 @@ use tower_http::trace::TraceLayer;
 
 use podspine_feed::{FeedBook, FeedEpisode, render_checked};
 use podspine_index::Index;
-use podspine_ui::{BookCard, BookDetail, book_page, index_page};
+use podspine_ui::{BookCard, BookDetail, book_page, index_page, subscribe_page};
 
 /// Max concurrent in-flight requests before backpressure (DoS guard). Generous
 /// for a homelab tool; only bounds a pathological flood.
@@ -138,6 +138,7 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(index))
         .route("/book/{slug}", get(book))
         .route("/book/{slug}/regenerate", post(regenerate))
+        .route("/subscribe/{feed_id}", get(subscribe))
         .route("/cover/{feed_id}", get(cover))
         .route("/feed/{feed_id}", get(feed))
         .route("/audio/{feed_id}/{number}", get(audio))
@@ -233,6 +234,7 @@ async fn book(
 
     let detail = BookDetail {
         feed_url: format!("{}/feed/{}.xml", state.base_url, book.feed_id),
+        subscribe_url: format!("{}/subscribe/{}", state.base_url, book.feed_id),
         slug: book.slug,
         feed_id: book.feed_id,
         title: book.title,
@@ -241,6 +243,41 @@ async fn book(
         episode_count,
     };
     Ok(Html(book_page(&detail).into_string()))
+}
+
+/// `GET /subscribe/{feed_id}` — the "add to a podcast app" helper page (per-app
+/// deep links + QRs). Keyed by capability id: this is what the book-page QR points
+/// at, so an iOS Camera scan lands on real "Open in…" app links, not raw feed XML.
+async fn subscribe(
+    State(state): State<AppState>,
+    Path(feed_id): Path<String>,
+) -> Result<Html<String>, AppError> {
+    if !valid_feed_id(&feed_id) {
+        return Err(AppError::NotFound);
+    }
+    let (book, episode_count) = {
+        let index = state.index.lock().map_err(AppError::internal)?;
+        let book = index
+            .get_book_by_feed_id(&feed_id)
+            .map_err(AppError::internal)?
+            .ok_or(AppError::NotFound)?;
+        let count = index
+            .episodes_for_book(&book.id)
+            .map_err(AppError::internal)?
+            .len();
+        (book, count)
+    };
+    let detail = BookDetail {
+        feed_url: format!("{}/feed/{}.xml", state.base_url, book.feed_id),
+        subscribe_url: format!("{}/subscribe/{}", state.base_url, book.feed_id),
+        slug: book.slug,
+        feed_id: book.feed_id,
+        title: book.title,
+        author: book.author,
+        has_cover: book.cover_path.is_some(),
+        episode_count,
+    };
+    Ok(Html(subscribe_page(&detail).into_string()))
 }
 
 /// `POST /book/{slug}/regenerate` — rotate the book's capability `feed_id` (leak

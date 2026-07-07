@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.0 (2026-07-05)
+
+### Features
+
+- Add an "Add to a podcast app" subscribe page: the book-page QR now opens `/subscribe/{feed_id}` with one-tap "Open in…" deep links for Apple Podcasts, Overcast, Pocket Casts, Castro, AntennaPod, and Podcast Addict (per-app QRs behind an expander) instead of raw feed XML the iOS Camera couldn't open. ([#22](https://github.com/schubydoo/podspine/pull/22))
+
 ## 1.0.1 (2026-07-05)
 
 ### Fixes

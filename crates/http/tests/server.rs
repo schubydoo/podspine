@@ -392,6 +392,32 @@ async fn serves_feed_and_range_audio() {
     // The book page (by slug) shows the capability feed URL (by feed_id).
     assert!(page.contains(&format!("http://test/feed/{feed_id}.xml")));
     assert!(page.contains("<svg"));
+    // ...and links to the /subscribe helper page (what the QR points at).
+    assert!(page.contains(&format!("/subscribe/{feed_id}")));
+
+    // Subscribe helper page (by capability id): per-app deep links + raw feed URL.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/subscribe/{feed_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let sub = String::from_utf8(body_bytes(resp).await).unwrap();
+    // Apple Podcasts deep link = podcast:// + feed URL without the scheme.
+    assert!(sub.contains(&format!("podcast://test/feed/{feed_id}.xml")));
+    // Manual-paste fallback still carries the exact feed URL.
+    assert!(sub.contains(&format!("http://test/feed/{feed_id}.xml")));
+    // A bad capability id 404s.
+    let resp = app
+        .clone()
+        .oneshot(Request::get("/subscribe/nope").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
     // Unknown book -> 404; cover with no extracted art (Task 3.4) -> 404.
     for uri in ["/book/nope".to_string(), format!("/cover/{feed_id}")] {
@@ -412,6 +438,7 @@ async fn serves_feed_and_range_audio() {
         "/audio/..%2f..%2fetc%2fpasswd/1",
         "/book/..%2fsecret",
         "/cover/..%2fsecret",
+        "/subscribe/bad.dotted",
         "/feed/bad.dotted.xml",
     ] {
         let resp = app
