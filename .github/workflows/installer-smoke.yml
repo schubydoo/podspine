@@ -3,7 +3,8 @@ name: Installer smoke
 # Smoke-test every install method on real runners (the cross-OS / package-manager
 # coverage the dev host can't provide): the one-line installers install.sh (Linux +
 # macOS) and install.ps1 (Windows), their uninstall counterparts, the Homebrew
-# formula (macOS), and the Nix flake (Linux). The script/brew jobs install the
+# formula (macOS), the Nix flake (Linux), and `cargo install` (Linux + macOS). The
+# script/brew jobs install the
 # published RELEASE binary and verify it runs via `--help` (the `--version` flag
 # ships in this PR, so the current release doesn't have it yet); the Nix job builds
 # THIS PR's source and so checks `--version`. Non-required signal job.
@@ -129,3 +130,25 @@ jobs:
           nix build .#podspine -L
           ./result/bin/podspine --version
           ./result/bin/podspine --version | grep -q '^podspine'
+
+  cargo:
+    name: cargo install (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      # `cargo install --path` from THIS PR's checkout exercises the cargo route
+      # (and the source carries the new --version). The Rust toolchain is preinstalled
+      # on GitHub runners. The [package.metadata.binstall] block is separately
+      # validated end-to-end by `cargo binstall --git` once it lands on main.
+      - name: cargo install + verify
+        run: |
+          set -euo pipefail
+          cargo install --path . --locked --root "${RUNNER_TEMP}/cargo-podspine"
+          "${RUNNER_TEMP}/cargo-podspine/bin/podspine" --version | grep -q '^podspine'
