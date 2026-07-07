@@ -104,6 +104,8 @@ For per-app steps and troubleshooting, see **[docs/importing.md](docs/importing.
 
 ## Documentation
 
+📖 **Full docs: <https://schubydoo.github.io/podspine/>** (searchable, versioned). The sources also render on GitHub:
+
 - **[Deploying](docs/DEPLOYMENT.md)** — Docker/compose, reverse proxy, systemd, backups, and the full config reference.
 - **[Adding to your podcast app](docs/importing.md)** — per-app import steps and troubleshooting.
 - **[Architecture](docs/ARCHITECTURE.md)** — how the pipeline and feeds work, and the invariants behind them.

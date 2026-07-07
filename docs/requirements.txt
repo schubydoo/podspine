@@ -1,0 +1,5 @@
+# Documentation site toolchain (Material for MkDocs + versioning).
+# Pinned for reproducible builds; Renovate keeps them current.
+mkdocs-material==9.7.6
+mkdocs-include-markdown-plugin==7.3.0
+mike==2.2.0

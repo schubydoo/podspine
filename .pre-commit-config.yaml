@@ -18,6 +18,9 @@ repos:
       - id: end-of-file-fixer
         exclude: '^LICENSE$'
       - id: check-yaml
+        # mkdocs.yml uses the `!!python/name:` tag (Material Mermaid fence); the
+        # safe loader can't resolve it. Everything else stays safe-loaded.
+        exclude: '^mkdocs\.yml$'
       - id: check-toml
       - id: check-merge-conflict
       - id: detect-private-key

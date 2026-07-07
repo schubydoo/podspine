@@ -97,6 +97,6 @@ playback order is correct.
 
 ## See also
 
-- [README](../README.md) — what Podspine is and the quick start.
+- [Home](index.md) — what Podspine is and the quick start.
 - [DEPLOYMENT.md](DEPLOYMENT.md) — running it, reverse proxy, and the full config reference.
-- [SECURITY.md](../SECURITY.md) — why feed URLs are capability links, and how to expose them safely.
+- [SECURITY.md](https://github.com/schubydoo/podspine/blob/main/SECURITY.md) — why feed URLs are capability links, and how to expose them safely.

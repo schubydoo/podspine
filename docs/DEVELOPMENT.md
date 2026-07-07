@@ -1,7 +1,7 @@
 # Development
 
 Setting up, building, and testing Podspine locally. For the contribution workflow
-(branching, commits, PRs), see [CONTRIBUTING.md](../CONTRIBUTING.md); for how the
+(branching, commits, PRs), see [CONTRIBUTING.md](https://github.com/schubydoo/podspine/blob/main/CONTRIBUTING.md); for how the
 system fits together, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Prerequisites
