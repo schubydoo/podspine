@@ -81,7 +81,10 @@ in
         # Hardening.
         NoNewPrivileges = true;
         ProtectSystem = "strict";
-        ProtectHome = true;
+        # "read-only" (not true): a homelab library commonly lives under /home, and
+        # `ProtectHome = true` would hide it entirely, so the service couldn't read
+        # it and would restart-loop. read-only keeps /home unwritable but readable.
+        ProtectHome = "read-only";
         PrivateTmp = true;
         PrivateDevices = true;
       };

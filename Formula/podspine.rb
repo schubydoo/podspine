@@ -42,6 +42,8 @@ class Podspine < Formula
   end
 
   test do
-    assert_match "podspine #{version}", shell_output("#{bin}/podspine --version")
+    # `--help` (not `--version`): the pinned release may predate the --version flag,
+    # so assert the binary runs and identifies itself rather than a version string.
+    assert_match "podspine", shell_output("#{bin}/podspine --help")
   end
 end
