@@ -12,13 +12,13 @@
         <meta name="author" content="schubydoo">
       
       
-        <link rel="canonical" href="https://schubydoo.github.io/podspine/latest/benchmarks/">
+        <link rel="canonical" href="https://schubydoo.github.io/podspine/latest/installation/">
       
       
-        <link rel="prev" href="../DEVELOPMENT/">
+        <link rel="prev" href="..">
       
       
-        <link rel="next" href="../changelog/">
+        <link rel="next" href="../DEPLOYMENT/">
       
       
         
@@ -29,7 +29,7 @@
     
     
       
-        <title>Benchmarks - Podspine</title>
+        <title>Installing - Podspine</title>
       
     
     
@@ -80,7 +80,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#benchmarks" class="md-skip">
+        <a href="#installing-podspine" class="md-skip">
           Skip to content
         </a>
       
@@ -120,7 +120,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              Benchmarks
+              Installing
             
           </span>
         </div>
@@ -292,10 +292,37 @@
       
   
   
+    
   
   
-    <li class="md-nav__item">
-      <a href="../installation/" class="md-nav__link">
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Installing
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
         
   
   
@@ -311,6 +338,125 @@
   
 
       </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#docker" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Docker
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#linux-macos-script" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Linux / macOS (script)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#windows-powershell" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Windows (PowerShell)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#homebrew" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Homebrew
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#scoop-windows" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Scoop (Windows)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#nix" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Nix
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#cargo" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Cargo
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#verifying-a-download" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Verifying a download
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#installing-ffmpeg" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Installing ffmpeg
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
     </li>
   
 
@@ -427,37 +573,10 @@
       
   
   
-    
   
   
-  
-    <li class="md-nav__item md-nav__item--active">
-      
-      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
-      
-      
-        
-      
-      
-        <label class="md-nav__link md-nav__link--active" for="__toc">
-          
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Benchmarks
-  
-
-    
-  </span>
-  
-  
-
-          <span class="md-nav__icon md-icon"></span>
-        </label>
-      
-      <a href="./" class="md-nav__link md-nav__link--active">
+    <li class="md-nav__item">
+      <a href="../benchmarks/" class="md-nav__link">
         
   
   
@@ -473,87 +592,6 @@
   
 
       </a>
-      
-        
-
-<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
-  
-  
-  
-    
-  
-  
-    <label class="md-nav__title" for="__toc">
-      <span class="md-nav__icon md-icon"></span>
-      Table of contents
-    </label>
-    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
-      
-        <li class="md-nav__item">
-  <a href="#targets" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Targets
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#running-the-harness" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Running the harness
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#how-each-number-is-measured" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        How each number is measured
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#reference-run" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Reference run
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Reference run">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#reading-the-reference-run" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Reading the reference run
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-    </ul>
-  
-</nav>
-      
     </li>
   
 
@@ -666,10 +704,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#targets" class="md-nav__link">
+  <a href="#docker" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Targets
+        Docker
       
     </span>
   </a>
@@ -677,10 +715,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#running-the-harness" class="md-nav__link">
+  <a href="#linux-macos-script" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Running the harness
+        Linux / macOS (script)
       
     </span>
   </a>
@@ -688,10 +726,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#how-each-number-is-measured" class="md-nav__link">
+  <a href="#windows-powershell" class="md-nav__link">
     <span class="md-ellipsis">
       
-        How each number is measured
+        Windows (PowerShell)
       
     </span>
   </a>
@@ -699,30 +737,68 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#reference-run" class="md-nav__link">
+  <a href="#homebrew" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Reference run
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Reference run">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#reading-the-reference-run" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Reading the reference run
+        Homebrew
       
     </span>
   </a>
   
 </li>
-        
-      </ul>
-    </nav>
+      
+        <li class="md-nav__item">
+  <a href="#scoop-windows" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Scoop (Windows)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#nix" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Nix
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#cargo" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Cargo
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#verifying-a-download" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Verifying a download
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#installing-ffmpeg" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Installing ffmpeg
+      
+    </span>
+  </a>
   
 </li>
       
@@ -746,181 +822,200 @@
   
 
 
-<h1 id="benchmarks">Benchmarks<a class="headerlink" href="#benchmarks" title="Permanent link">&para;</a></h1>
-<p>How Podspine measures itself against the v2 performance targets, and how to
-reproduce the numbers on your own hardware.</p>
-<p>This is the measurement half of the Sprint 5 performance-validation work — it
-checks Podspine against the four performance targets in the <a href="#targets">table below</a>
-(ingest time, feed render p95, audio time-to-first-byte, and idle memory).
-The point is not to publish a leaderboard — it is to answer one question before
-any v2 efficiency work (on-the-fly splitting, transcoding) is built: <strong>are the
-NFR targets already met, or is there a real bottleneck to fix?</strong> Run the harness
-on the box you actually deploy to and let the numbers decide.</p>
-<h2 id="targets">Targets<a class="headerlink" href="#targets" title="Permanent link">&para;</a></h2>
+<h1 id="installing-podspine">Installing Podspine<a class="headerlink" href="#installing-podspine" title="Permanent link">&para;</a></h1>
+<p>Podspine ships a single static binary (plus a Docker image). It needs <strong><code>ffmpeg</code>
+and <code>ffprobe</code> on your <code>PATH</code></strong> at runtime — every method below assumes they're
+installed (the scripts and the Homebrew formula help with this).</p>
+<p>Pick whichever fits your setup:</p>
 <table>
 <thead>
 <tr>
-<th>NFR</th>
-<th>Metric</th>
-<th>Target</th>
+<th>Method</th>
+<th>Best for</th>
+<th>Command</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td>P1</td>
-<td>Ingest / pre-split</td>
-<td>≤ 2 min per 10h book</td>
+<td><a href="#docker">Docker</a></td>
+<td>Servers / homelab (recommended)</td>
+<td><code>docker run … ghcr.io/schubydoo/podspine</code></td>
 </tr>
 <tr>
-<td>P2</td>
-<td>Feed render latency (p95)</td>
-<td>&lt; 200 ms</td>
+<td><a href="#linux--macos-script">Install script</a></td>
+<td>Linux / macOS, no package manager</td>
+<td><code>curl … \| bash</code></td>
 </tr>
 <tr>
-<td>P3</td>
-<td>Audio time-to-first-byte (LAN)</td>
-<td>&lt; 300 ms</td>
+<td><a href="#windows-powershell">PowerShell</a></td>
+<td>Windows</td>
+<td><code>irm … \| iex</code></td>
 </tr>
 <tr>
-<td>P4</td>
-<td>Idle resident memory (RSS)</td>
-<td>&lt; 50 MB</td>
+<td><a href="#homebrew">Homebrew</a></td>
+<td>macOS / Linux</td>
+<td><code>brew install schubydoo/podspine/podspine</code></td>
+</tr>
+<tr>
+<td><a href="#scoop-windows">Scoop</a></td>
+<td>Windows</td>
+<td><code>scoop install podspine</code></td>
+</tr>
+<tr>
+<td><a href="#nix">Nix</a></td>
+<td>NixOS / Nix users</td>
+<td><code>nix profile install github:schubydoo/podspine</code></td>
+</tr>
+<tr>
+<td><a href="#cargo">Cargo</a></td>
+<td>Rust users / from source</td>
+<td><code>cargo binstall --git … podspine</code></td>
 </tr>
 </tbody>
 </table>
-<h2 id="running-the-harness">Running the harness<a class="headerlink" href="#running-the-harness" title="Permanent link">&para;</a></h2>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>scripts/bench.sh
+<h2 id="docker">Docker<a class="headerlink" href="#docker" title="Permanent link">&para;</a></h2>
+<p>The primary path for running Podspine as a server — see the
+<a href="../DEPLOYMENT/">Deploying</a> guide for volumes, compose, and reverse-proxy setup.
+<code>ffmpeg</code> is bundled in the image.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>docker<span class="w"> </span>run<span class="w"> </span>-v<span class="w"> </span>/path/to/audiobooks:/library:ro<span class="w"> </span>-v<span class="w"> </span>podspine-data:/data<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w">  </span>-p<span class="w"> </span><span class="m">8080</span>:8080<span class="w"> </span>-e<span class="w"> </span><span class="nv">PODSPINE_BASE_URL</span><span class="o">=</span>http://&lt;your-lan-ip&gt;:8080<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="w">  </span>ghcr.io/schubydoo/podspine:latest
 </code></pre></div>
-<p>It needs only <code>bash</code>, <code>ffmpeg</code>, <code>ffprobe</code>, <code>curl</code>, <code>awk</code>, and <code>sort</code> — no extra
-crates, and it touches nothing the server ships. It builds the release binary
-(if absent), synthesizes a chapterised sine-tone <code>.m4a</code>, boots <code>podspine</code> against
-a throwaway library and data dir on <code>127.0.0.1</code>, drives it with <code>curl</code>, prints a
-report, and tears everything down.</p>
-<p>Knobs (all optional env vars):</p>
+<h2 id="linux-macos-script">Linux / macOS (script)<a class="headerlink" href="#linux-macos-script" title="Permanent link">&para;</a></h2>
+<p>Downloads the signed binary for your OS/arch, verifies its SHA-256 against the
+release <code>checksums.txt</code>, and installs to <code>~/.local/bin</code>:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>curl<span class="w"> </span>-fsSL<span class="w"> </span>https://raw.githubusercontent.com/schubydoo/podspine/main/install.sh<span class="w"> </span><span class="p">|</span><span class="w"> </span>bash
+</code></pre></div>
+<p>Overrides (environment variables):</p>
 <table>
 <thead>
 <tr>
 <th>Var</th>
 <th>Default</th>
-<th>Meaning</th>
+<th>Purpose</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td><code>DURATION_SEC</code></td>
-<td><code>600</code></td>
-<td>Synthetic book length in seconds</td>
+<td><code>PODSPINE_VERSION</code></td>
+<td>latest release</td>
+<td>Pin a version, e.g. <code>1.1.0</code></td>
 </tr>
 <tr>
-<td><code>CHAPTERS</code></td>
-<td><code>12</code></td>
-<td>Number of chapters to split into</td>
-</tr>
-<tr>
-<td><code>N_FEED</code></td>
-<td><code>200</code></td>
-<td>Feed requests sampled for the p95</td>
-</tr>
-<tr>
-<td><code>N_AUDIO</code></td>
-<td><code>30</code></td>
-<td>Audio requests sampled for TTFB</td>
-</tr>
-<tr>
-<td><code>PORT</code></td>
-<td><code>18080</code></td>
-<td>Loopback port to bind</td>
-</tr>
-<tr>
-<td><code>KEEP</code></td>
-<td>unset</td>
-<td>Keep the temp work dir for inspection</td>
+<td><code>PODSPINE_INSTALL_DIR</code></td>
+<td><code>~/.local/bin</code></td>
+<td>Install location (uses <code>sudo</code> only if it isn't writable)</td>
 </tr>
 </tbody>
 </table>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="c1"># A heavier run closer to a real book:</span>
-<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="nv">DURATION_SEC</span><span class="o">=</span><span class="m">3600</span><span class="w"> </span><span class="nv">CHAPTERS</span><span class="o">=</span><span class="m">40</span><span class="w"> </span><span class="nv">N_FEED</span><span class="o">=</span><span class="m">500</span><span class="w"> </span>scripts/bench.sh
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="c1"># Pin a version and install system-wide:</span>
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>curl<span class="w"> </span>-fsSL<span class="w"> </span>https://raw.githubusercontent.com/schubydoo/podspine/main/install.sh<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="w">  </span><span class="p">|</span><span class="w"> </span><span class="nv">PODSPINE_VERSION</span><span class="o">=</span><span class="m">1</span>.1.0<span class="w"> </span><span class="nv">PODSPINE_INSTALL_DIR</span><span class="o">=</span>/usr/local/bin<span class="w"> </span>bash
 </code></pre></div>
-<h2 id="how-each-number-is-measured">How each number is measured<a class="headerlink" href="#how-each-number-is-measured" title="Permanent link">&para;</a></h2>
-<ul>
-<li><strong>Ingest (P1)</strong> — wall-clock from launching the process to the book appearing
-  on the home grid (scanned, split, and indexed). This <strong>includes fixed startup
-  overhead</strong> (process init + bind), so the extrapolation to a 10h book is
-  <em>conservative</em>: startup does not scale with book length, but the linear
-  extrapolation pretends it does. Treat the 10h figure as an upper bound.</li>
-<li><strong>Feed render p95 (P2)</strong> — <code>curl</code> <code>time_total</code> over <code>N_FEED</code> requests to
-  <code>/feed/{id}.xml</code>, after one warm-up (the feed passes the self-check and renders
-  fresh each time). Percentiles via nearest-rank.</li>
-<li><strong>Audio TTFB (P3)</strong> — <code>curl</code> <code>time_starttransfer</code> over <code>N_AUDIO</code> ranged
-  (<code>Range: bytes=0-65535</code>) requests to <code>/audio/{id}/1</code>. This is <strong>loopback</strong>, so
-  a real LAN client adds one network hop; budget accordingly against the 300 ms
-  target.</li>
-<li><strong>Idle RSS (P4)</strong> — <code>VmRSS</code> from <code>/proc/&lt;pid&gt;/status</code> after the run (Linux
-  only; reported as <code>n/a</code> elsewhere).</li>
-</ul>
-<h2 id="reference-run">Reference run<a class="headerlink" href="#reference-run" title="Permanent link">&para;</a></h2>
-<p>Illustrative only — captured in a Linux x86_64 CI-class sandbox, loopback, with a
-synthetic 300s / 8-chapter book. <strong>Your hardware will differ</strong>; re-run locally.</p>
+<p><strong>Uninstall</strong> (removes the binary only — never your library or data dir):</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>curl<span class="w"> </span>-fsSL<span class="w"> </span>https://raw.githubusercontent.com/schubydoo/podspine/main/uninstall.sh<span class="w"> </span><span class="p">|</span><span class="w"> </span>bash
+</code></pre></div>
+<h2 id="windows-powershell">Windows (PowerShell)<a class="headerlink" href="#windows-powershell" title="Permanent link">&para;</a></h2>
+<p>Installs <code>podspine.exe</code> under <code>%LOCALAPPDATA%\Programs\podspine</code> and adds it to
+your user <code>PATH</code>:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="nb">irm </span><span class="n">https</span><span class="p">://</span><span class="n">raw</span><span class="p">.</span><span class="n">githubusercontent</span><span class="p">.</span><span class="n">com</span><span class="p">/</span><span class="n">schubydoo</span><span class="p">/</span><span class="n">podspine</span><span class="p">/</span><span class="n">main</span><span class="p">/</span><span class="n">install</span><span class="p">.</span><span class="n">ps1</span> <span class="p">|</span> <span class="nb">iex</span>
+</code></pre></div>
+<p>Same overrides apply (<code>$env:PODSPINE_VERSION</code>, <code>$env:PODSPINE_INSTALL_DIR</code>).
+Uninstall:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="nb">irm </span><span class="n">https</span><span class="p">://</span><span class="n">raw</span><span class="p">.</span><span class="n">githubusercontent</span><span class="p">.</span><span class="n">com</span><span class="p">/</span><span class="n">schubydoo</span><span class="p">/</span><span class="n">podspine</span><span class="p">/</span><span class="n">main</span><span class="p">/</span><span class="n">uninstall</span><span class="p">.</span><span class="n">ps1</span> <span class="p">|</span> <span class="nb">iex</span>
+</code></pre></div>
+<p>The binary is Sigstore-signed but not Authenticode-signed, so SmartScreen may
+warn on first run — the installer clears the mark-of-the-web after verifying the
+checksum.</p>
+<h2 id="homebrew">Homebrew<a class="headerlink" href="#homebrew" title="Permanent link">&para;</a></h2>
+<p>macOS and Linux. The formula pulls the release binary and declares <code>ffmpeg</code> as a
+dependency:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>brew<span class="w"> </span>install<span class="w"> </span>schubydoo/podspine/podspine
+<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="c1"># or, to keep the tap around for upgrades:</span>
+<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>brew<span class="w"> </span>tap<span class="w"> </span>schubydoo/podspine
+<a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a>brew<span class="w"> </span>install<span class="w"> </span>podspine
+</code></pre></div>
+<p><code>brew upgrade podspine</code> tracks new releases.</p>
+<h2 id="scoop-windows">Scoop (Windows)<a class="headerlink" href="#scoop-windows" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="n">scoop</span> <span class="n">bucket</span> <span class="n">add</span> <span class="n">podspine</span> <span class="n">https</span><span class="p">://</span><span class="n">github</span><span class="p">.</span><span class="n">com</span><span class="p">/</span><span class="n">schubydoo</span><span class="p">/</span><span class="n">scoop-podspine</span>
+<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="n">scoop</span> <span class="n">install</span> <span class="n">podspine</span>
+</code></pre></div>
+<h2 id="nix">Nix<a class="headerlink" href="#nix" title="Permanent link">&para;</a></h2>
+<p>With flakes enabled:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="c1"># Run without installing:</span>
+<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>nix<span class="w"> </span>run<span class="w"> </span>github:schubydoo/podspine<span class="w"> </span>--<span class="w"> </span>--library<span class="w"> </span>./books
+<a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a>
+<a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a><span class="c1"># Install into your profile:</span>
+<a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a>nix<span class="w"> </span>profile<span class="w"> </span>install<span class="w"> </span>github:schubydoo/podspine
+</code></pre></div>
+<p>On NixOS, the flake also exposes a module — add Podspine as a service:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="p">{</span>
+<a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a>  inputs<span class="o">.</span>podspine<span class="o">.</span><span class="ss">url</span> <span class="o">=</span> <span class="s2">&quot;github:schubydoo/podspine&quot;</span><span class="p">;</span>
+<a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a>  <span class="c1"># in your configuration:</span>
+<a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a>  services<span class="o">.</span><span class="ss">podspine</span> <span class="o">=</span> <span class="p">{</span>
+<a id="__codelineno-9-5" name="__codelineno-9-5" href="#__codelineno-9-5"></a>    <span class="ss">enable</span> <span class="o">=</span> <span class="no">true</span><span class="p">;</span>
+<a id="__codelineno-9-6" name="__codelineno-9-6" href="#__codelineno-9-6"></a>    <span class="ss">library</span> <span class="o">=</span> <span class="s2">&quot;/srv/audiobooks&quot;</span><span class="p">;</span>
+<a id="__codelineno-9-7" name="__codelineno-9-7" href="#__codelineno-9-7"></a>    <span class="ss">baseUrl</span> <span class="o">=</span> <span class="s2">&quot;http://nas.lan:8080&quot;</span><span class="p">;</span>
+<a id="__codelineno-9-8" name="__codelineno-9-8" href="#__codelineno-9-8"></a>  <span class="p">};</span>
+<a id="__codelineno-9-9" name="__codelineno-9-9" href="#__codelineno-9-9"></a><span class="p">}</span>
+</code></pre></div>
+<h2 id="cargo">Cargo<a class="headerlink" href="#cargo" title="Permanent link">&para;</a></h2>
+<p>Podspine is not published to crates.io (the workspace is <code>publish = false</code>), so
+Cargo installs come from the Git repo.</p>
+<p>With <a href="https://github.com/cargo-bins/cargo-binstall"><code>cargo-binstall</code></a> — fetches the
+prebuilt release binary, no compiling:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a>cargo<span class="w"> </span>binstall<span class="w"> </span>--git<span class="w"> </span>https://github.com/schubydoo/podspine<span class="w"> </span>podspine
+</code></pre></div>
+<p>Or build from source (<code>cargo install</code>):</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a>cargo<span class="w"> </span>install<span class="w"> </span>--git<span class="w"> </span>https://github.com/schubydoo/podspine<span class="w"> </span>podspine
+</code></pre></div>
+<p>Or from a checkout:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a>git<span class="w"> </span>clone<span class="w"> </span>https://github.com/schubydoo/podspine<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nb">cd</span><span class="w"> </span>podspine
+<a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a>cargo<span class="w"> </span>build<span class="w"> </span>--release<span class="w">          </span><span class="c1"># target/release/podspine</span>
+</code></pre></div>
+<h2 id="verifying-a-download">Verifying a download<a class="headerlink" href="#verifying-a-download" title="Permanent link">&para;</a></h2>
+<p>Every release ships a cosign-signed <code>checksums.txt</code> and SLSA provenance. To
+verify a binary you downloaded manually:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a>cosign<span class="w"> </span>verify-blob<span class="w"> </span>--bundle<span class="w"> </span>checksums.txt.sigstore.json<span class="w"> </span>checksums.txt
+<a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a>sha256sum<span class="w"> </span>-c<span class="w"> </span>checksums.txt<span class="w">         </span><span class="c1"># (from the dir holding the downloaded files)</span>
+<a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a>gh<span class="w"> </span>attestation<span class="w"> </span>verify<span class="w"> </span>./podspine-vX.Y.Z-linux-amd64<span class="w"> </span>--owner<span class="w"> </span>schubydoo
+</code></pre></div>
+<p>The install scripts do the SHA-256 check for you; see
+<a href="https://github.com/schubydoo/podspine/blob/main/SECURITY.md#release-artifacts">SECURITY.md</a>
+for the full verification story.</p>
+<h2 id="installing-ffmpeg">Installing ffmpeg<a class="headerlink" href="#installing-ffmpeg" title="Permanent link">&para;</a></h2>
+<p>Podspine needs <code>ffmpeg</code> (which provides <code>ffprobe</code>) at runtime:</p>
 <table>
 <thead>
 <tr>
-<th>NFR</th>
-<th>Metric</th>
-<th>Measured</th>
-<th>Target</th>
-<th>Result</th>
+<th>Platform</th>
+<th>Command</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td>P1</td>
-<td>Ingest (this book, 300s)</td>
-<td>0.91 s</td>
-<td>—</td>
-<td>—</td>
+<td>Debian/Ubuntu</td>
+<td><code>apt install ffmpeg</code></td>
 </tr>
 <tr>
-<td>P1</td>
-<td>Ingest → 10h (extrap.)</td>
-<td>~109 s</td>
-<td>≤ 120 s</td>
-<td>PASS</td>
+<td>Fedora</td>
+<td><code>dnf install ffmpeg</code></td>
 </tr>
 <tr>
-<td>P2</td>
-<td>Feed p50/p95/p99</td>
-<td>2.0 / 2.2 / 2.4 ms</td>
-<td>p95 &lt; 200ms</td>
-<td>PASS</td>
+<td>Arch</td>
+<td><code>pacman -S ffmpeg</code></td>
 </tr>
 <tr>
-<td>P3</td>
-<td>Audio TTFB p50/p95/p99</td>
-<td>2.4 / 2.7 / 2.8 ms</td>
-<td>p95 &lt; 300ms</td>
-<td>PASS</td>
+<td>macOS</td>
+<td><code>brew install ffmpeg</code></td>
 </tr>
 <tr>
-<td>P4</td>
-<td>Idle RSS</td>
-<td>8.3 MB</td>
-<td>&lt; 50 MB</td>
-<td>PASS</td>
+<td>Windows</td>
+<td><code>winget install Gyan.FFmpeg</code> or <code>scoop install ffmpeg</code></td>
 </tr>
 </tbody>
 </table>
-<h3 id="reading-the-reference-run">Reading the reference run<a class="headerlink" href="#reading-the-reference-run" title="Permanent link">&para;</a></h3>
-<p>All four targets clear with wide margins — feed render and audio TTFB sit ~100×
-under budget, and idle memory is ~6× under. The only figure worth watching is
-<strong>P1</strong>: pre-split ingest is I/O-bound (<code>ffmpeg -c copy</code> per chapter), so on slow
-storage or a many-chapter book it will rise. Because the extrapolation folds in
-fixed startup cost it is pessimistic, but if a real 10h book on your disk lands
-near the 2-minute ceiling, that is the signal that on-the-fly byte-range
-splitting (serving chapters from computed offsets, no duplicate split files) is
-worth building — otherwise it is premature.</p>
-<p>The optional <code>/metrics</code> endpoint (Prometheus counters/histograms) is intentionally
-not part of this harness; it adds a runtime dependency and an opt-in config flag,
-which is a separate change.</p>
+<p>Docker, Homebrew, and Nix installs pull it in for you.</p>
 
 
 
