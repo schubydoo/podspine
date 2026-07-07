@@ -14,7 +14,7 @@
         pkgs = nixpkgs.legacyPackages.${system};
         podspine = pkgs.rustPlatform.buildRustPackage {
           pname = "podspine";
-          version = "1.1.0";
+          version = "1.2.0";
           src = self;
           cargoLock.lockFile = ./Cargo.lock;
 
