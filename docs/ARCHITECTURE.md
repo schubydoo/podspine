@@ -18,16 +18,13 @@ restart.
 
 ```mermaid
 flowchart LR
-  cfg[config<br/>CLI/env/TOML + ffmpeg preflight] --> scan[scanner<br/>walk library, classify books]
-  scan --> probe[prober<br/>ffprobe]
-  probe --> chap[chapters<br/>.cue / .ffmeta / embedded]
-  chap --> split[splitter<br/>ffmpeg stream-copy]
-  split --> idx[(index<br/>SQLite)]
-  idx --> feed[feed<br/>RSS 2.0 + itunes/podcast]
-  idx --> http[http<br/>Axum]
-  feed --> http
-  http --> ui[ui<br/>maud pages]
+  config --> scanner --> prober --> chapters --> splitter --> index[(index)]
+  index --> feed --> http --> ui
+  index --> http
 ```
+
+The crates are described below; the pipeline runs left to right, with the SQLite
+`index` feeding both the `feed` builder and the `http` server.
 
 ## Crates
 
