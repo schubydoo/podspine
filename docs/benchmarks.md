@@ -3,14 +3,15 @@
 How Podspine measures itself against the v2 performance targets, and how to
 reproduce the numbers on your own hardware.
 
-This is the measurement half of the Sprint 5 performance-validation work (against
-NFR-P1..P4 in the PRD).
+This is the measurement half of the Sprint 5 performance-validation work — it
+checks Podspine against the four performance targets in the [table below](#targets)
+(ingest time, feed render p95, audio time-to-first-byte, and idle memory).
 The point is not to publish a leaderboard — it is to answer one question before
 any v2 efficiency work (on-the-fly splitting, transcoding) is built: **are the
 NFR targets already met, or is there a real bottleneck to fix?** Run the harness
 on the box you actually deploy to and let the numbers decide.
 
-## Targets (PRD §5.1, NFR-P1..P4)
+## Targets
 
 | NFR    | Metric                          | Target                  |
 |--------|---------------------------------|-------------------------|
