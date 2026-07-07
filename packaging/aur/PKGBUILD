@@ -1,0 +1,20 @@
+# Maintainer: schubydoo <schubydoo@users.noreply.github.com>
+# Version + sha256sums are auto-bumped per release by packaging-bump.yml.
+pkgname=podspine-bin
+pkgver=1.1.0
+pkgrel=1
+pkgdesc="Self-hosted server that turns audiobooks into per-chapter podcast feeds"
+arch=('x86_64' 'aarch64')
+url="https://github.com/schubydoo/podspine"
+license=('AGPL-3.0-only')
+depends=('ffmpeg')
+provides=('podspine')
+conflicts=('podspine')
+source_x86_64=("podspine-$pkgver-x86_64::$url/releases/download/v$pkgver/podspine-v$pkgver-linux-amd64")
+source_aarch64=("podspine-$pkgver-aarch64::$url/releases/download/v$pkgver/podspine-v$pkgver-linux-arm64")
+sha256sums_x86_64=('fc1b8afa24c35010ac7cbfb49d62cfa659cfb9c69af0b65e110dbb3375a64f63')
+sha256sums_aarch64=('d129ae3c3355eb8a0c1dfc17156e1c0870d625a4ec8d94f1124cc76fabf16005')
+
+package() {
+    install -Dm755 "$srcdir/podspine-$pkgver-$CARCH" "$pkgdir/usr/bin/podspine"
+}

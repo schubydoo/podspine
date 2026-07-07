@@ -1,0 +1,131 @@
+name: Installer smoke
+
+# Smoke-test every install method on real runners (the cross-OS / package-manager
+# coverage the dev host can't provide): the one-line installers install.sh (Linux +
+# macOS) and install.ps1 (Windows), their uninstall counterparts, the Homebrew
+# formula (macOS), and the Nix flake (Linux). The script/brew jobs install the
+# published RELEASE binary and verify it runs via `--help` (the `--version` flag
+# ships in this PR, so the current release doesn't have it yet); the Nix job builds
+# THIS PR's source and so checks `--version`. Non-required signal job.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - install.sh
+      - install.ps1
+      - uninstall.sh
+      - uninstall.ps1
+      - Formula/podspine.rb
+      - packaging/**
+      - flake.nix
+      - flake.lock
+      - Cargo.toml
+      - .github/workflows/installer-smoke.yml
+
+# Read-only; the installers only fetch public release assets. No secrets.
+permissions:
+  contents: read
+
+concurrency:
+  group: installer-smoke-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sh:
+    name: install.sh (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # One runner per published binary arch: ubuntu-latest->linux-amd64,
+        # ubuntu-24.04-arm->linux-arm64, macos-latest->darwin-arm64,
+        # macos-15-intel->darwin-amd64.
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: install.sh + verify + uninstall.sh
+        run: |
+          set -euo pipefail
+          bash ./install.sh
+          export PATH="$HOME/.local/bin:$PATH"
+          command -v podspine
+          podspine --help | grep -qi podspine
+          bash ./uninstall.sh
+          test ! -e "$HOME/.local/bin/podspine"
+
+  ps1:
+    name: install.ps1 (windows)
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      # install.ps1 runs under a function + try/catch (no `exit`, for iex safety); it
+      # signals failure via $global:LASTEXITCODE, so verify the OUTCOME (binary present
+      # + runnable) rather than trusting the script's exit status.
+      - name: install.ps1 + verify + uninstall.ps1
+        shell: pwsh
+        run: |
+          ./install.ps1
+          $dest = Join-Path $env:LOCALAPPDATA 'Programs\podspine\podspine.exe'
+          if (-not (Test-Path $dest)) { throw "podspine.exe was not installed at $dest" }
+          $h = & $dest --help
+          if ($LASTEXITCODE -ne 0) { throw "podspine.exe --help exited with $LASTEXITCODE" }
+          if (($h -join "`n") -notmatch 'podspine') { throw "unexpected --help output" }
+          ./uninstall.ps1
+          if (Test-Path $dest) { throw "uninstall.ps1 left podspine.exe at $dest" }
+
+  brew:
+    name: Homebrew (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15-intel] # Apple Silicon + Intel
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: brew install via a local tap + verify
+        run: |
+          set -euo pipefail
+          # Modern Homebrew refuses a bare local formula path — it must live in a tap.
+          # Stage our formula into an ephemeral local tap (mirrors real consumption via
+          # the homebrew-podspine repo) and install from there.
+          brew tap-new schubydoo/local --no-git
+          tap_dir="$(brew --repository schubydoo/local)"
+          mkdir -p "$tap_dir/Formula"
+          cp ./Formula/podspine.rb "$tap_dir/Formula/podspine.rb"
+          brew install --formula schubydoo/local/podspine
+          podspine --help | grep -qi podspine
+
+  nix:
+    name: Nix flake (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm] # x86_64 + arm64 Linux
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      # SHA-pinned Nix install (an unpinned `curl | sh` trips Scorecard Pinned-Deps).
+      - name: Install Nix
+        uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      # Builds THIS PR's source, so the freshly-added --version flag is present.
+      - name: Build + run the flake
+        run: |
+          set -euo pipefail
+          nix build .#podspine -L
+          ./result/bin/podspine --version
+          ./result/bin/podspine --version | grep -q '^podspine'
