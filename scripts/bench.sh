@@ -47,6 +47,23 @@ for tool in ffmpeg ffprobe curl awk sort; do
   command -v "$tool" >/dev/null 2>&1 || { echo "bench: missing required tool: $tool" >&2; exit 1; }
 done
 
+# Fractional epoch seconds, portably. `date +%s.%N` is GNU-only: BSD/macOS `date`
+# has no %N and prints it literally, which would poison the ingest timing. Prefer
+# bash 5's EPOCHREALTIME builtin (handles a comma decimal separator under some
+# locales); fall back to `date +%N` when it yields real digits; else degrade to
+# whole-second resolution (old macOS bash + BSD date) rather than lie.
+now() {
+  if [ -n "${EPOCHREALTIME:-}" ]; then
+    printf '%s' "${EPOCHREALTIME/,/.}"
+    return
+  fi
+  local s ns
+  s=$(date +%s)
+  ns=$(date +%N 2>/dev/null || echo 0)
+  case "$ns" in *[!0-9]*|'') ns=0 ;; esac
+  printf '%s.%09d' "$s" "$((10#$ns))"
+}
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/target/release/podspine"
 if [ ! -x "$BIN" ]; then
@@ -96,7 +113,7 @@ ffmpeg -y -loglevel error \
 
 # --- boot the server, timing ingest (scan + pre-split) --------------------
 echo "bench: booting server and timing ingest..." >&2
-t_start=$(date +%s.%N)
+t_start=$(now)
 "$BIN" --library "$LIBRARY" --data-dir "$DATA" \
   --bind "127.0.0.1:${PORT}" --base-url "$BASE" >"$WORK/server.log" 2>&1 &
 SERVER_PID=$!
@@ -113,7 +130,7 @@ for _ in $(seq 1 600); do
   [ -n "$SLUG" ] && break
   sleep 0.2
 done
-t_ready=$(date +%s.%N)
+t_ready=$(now)
 [ -n "$SLUG" ] || { echo "bench: book never appeared; log:" >&2; cat "$WORK/server.log" >&2; exit 1; }
 
 # Discover the capability feed_id from the book page.
@@ -183,7 +200,7 @@ P1    ingest (pre-split)             ${ingest_s}s (this book)     -           -
 P1    ingest extrapolated to 10h     ${ingest_10h}s              <=120s      $(verdict "$ingest_10h" 120)
 P2    feed render  p50/p95/p99       ${f50}/${f95}/${f99} ms   p95<200ms   $(verdict "$f95" 200)
 P3    audio TTFB   p50/p95/p99       ${a50}/${a95}/${a99} ms   p95<300ms   $(verdict "$a95" 300)
-P4    idle RSS                       ${rss_mb} MB            <50MB       $(awk -v v="$rss_mb" 'BEGIN{print (v+0 <= 50 && v!="") ? "PASS" : "CHECK"}')
+P4    idle RSS                       ${rss_mb} MB            <50MB       $(awk -v v="$rss_mb" 'BEGIN{if (v+0==v && v!="") print (v+0<=50) ? "PASS" : "FAIL"; else print "n/a"}')
 
 feed max ${fmax} ms   audio max ${amax} ms
 =============================================================
