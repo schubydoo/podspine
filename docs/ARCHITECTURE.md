@@ -131,7 +131,7 @@ split the way they are.
 - Copy-first: chapters are split by stream copy, no re-encode, so there's no quality
   loss.
 
-**Security (see [SECURITY.md](../SECURITY.md) for the threat model):**
+**Security (see [SECURITY.md](https://github.com/schubydoo/podspine/blob/main/SECURITY.md) for the threat model):**
 - Book/episode ids are **opaque index keys**. Slugs are validated against an
   allow-list charset and rejected with 404; the resolved audio path is canonicalized
   and asserted to stay under `<data_dir>`. A path is never built from user input.
@@ -146,4 +146,4 @@ split the way they are.
 
 - [DEVELOPMENT.md](DEVELOPMENT.md) — building, testing, and the crate layout in practice.
 - [DEPLOYMENT.md](DEPLOYMENT.md) — running it in production (Docker, reverse proxy, systemd).
-- [../CONTRIBUTING.md](../CONTRIBUTING.md) — contribution workflow.
+- [CONTRIBUTING.md](https://github.com/schubydoo/podspine/blob/main/CONTRIBUTING.md) — contribution workflow.

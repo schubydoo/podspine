@@ -1,0 +1,100 @@
+name: Docs
+
+# Build the MkDocs (Material) site and publish it to GitHub Pages via `mike`,
+# which keeps a version selector on the gh-pages branch:
+#   - every push to main updates the `latest` version (docs track main)
+#   - every stable release tag (vX.Y.Z) publishes an immutable `X.Y` snapshot
+# Pull requests only build with --strict (link/config validation), never deploy.
+#
+# NOTE: action refs are pinned to full commit SHAs (repo Actions policy + Scorecard);
+# pip caching is deliberately NOT used (cache-poisoning vector in a publishing
+# workflow — zizmor), and the deploy job pushes via an explicit tokened remote
+# rather than persisted checkout credentials (zizmor artipacked).
+
+on:
+  push:
+    branches: [main]
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  pull_request:
+    paths:
+      - docs/**
+      - mkdocs.yml
+      - CHANGELOG.md
+      - .github/workflows/docs.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Serialize deploys (they push to gh-pages); don't cancel a push mid-deploy.
+  group: docs-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build (strict)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.x"
+      - run: pip install -r docs/requirements.txt
+      - run: mkdocs build --strict
+
+  deploy:
+    name: deploy (mike)
+    needs: build
+    # Never on PRs (fork tokens are read-only anyway); same-repo only; and only
+    # for main or a release tag — otherwise a manual workflow_dispatch from a
+    # feature branch would fall through and overwrite `latest` with branch docs.
+    if: >-
+      github.event_name != 'pull_request'
+      && github.repository == 'schubydoo/podspine'
+      && (github.ref == 'refs/heads/main' || github.ref_type == 'tag')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # mike commits/pushes the built site to gh-pages
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0 # mike needs the gh-pages history to update it
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.x"
+      - run: pip install -r docs/requirements.txt
+      - name: Configure git + push auth
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch origin gh-pages --depth=1 || true
+      - name: Deploy
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          if [ "$REF_TYPE" = "tag" ]; then
+            # vX.Y.Z -> immutable "X.Y" snapshot; leaves `latest`/default untouched.
+            version="${REF_NAME#v}"
+            mike deploy --push "${version%.*}"
+          else
+            # main -> rolling `latest`. Note whether gh-pages exists BEFORE the
+            # deploy creates it, so we can set the root redirect exactly once.
+            first_deploy=true
+            git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1 && first_deploy=false
+            mike deploy --push --update-aliases latest
+            # Point the site root at `latest` — only needed on the first deploy;
+            # skipping it afterwards avoids a redundant redirect commit each push.
+            if [ "$first_deploy" = true ]; then
+              mike set-default --push latest
+            fi
+          fi

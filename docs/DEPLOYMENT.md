@@ -1,6 +1,6 @@
 # Deployment
 
-Running Podspine in a homelab. For a first run, the [README quick start](../README.md#quick-start)
+Running Podspine in a homelab. For a first run, the [quick start](index.md#quick-start)
 is enough; this page covers the production details: persistence, exposing it safely,
 and running it as a service.
 
@@ -8,7 +8,7 @@ and running it as a service.
 > [Exposing Podspine safely](#exposing-podspine-safely) below): the **feed/audio/cover**
 > routes are protected by an unguessable per-book **capability URL** and are safe to
 > expose to the internet, while the **browse UI** enumerates your whole library and
-> must stay on your LAN or behind proxy-auth. See [SECURITY.md](../SECURITY.md).
+> must stay on your LAN or behind proxy-auth. See [SECURITY.md](https://github.com/schubydoo/podspine/blob/main/SECURITY.md).
 
 ## Configuration
 
@@ -94,7 +94,7 @@ Download the static musl binary for your architecture from the
 [releases](https://github.com/schubydoo/podspine/releases) and make sure
 `ffmpeg`/`ffprobe` are installed. Releases are signed — verify before running:
 `cosign verify-blob --bundle checksums.txt.sigstore.json checksums.txt` then
-`sha256sum -c checksums.txt` (see [SECURITY.md](../SECURITY.md#release-artifacts)).
+`sha256sum -c checksums.txt` (see [SECURITY.md](https://github.com/schubydoo/podspine/blob/main/SECURITY.md#release-artifacts)).
 Example unit:
 
 ```ini
@@ -133,7 +133,7 @@ Linux binary above, behind a reverse proxy.
 They are **not code-signed or notarized** (that needs paid Apple/Microsoft
 certificates), so the OS warns on first launch. Verify the download the same way
 as Linux — cosign-signed `checksums.txt` + SLSA provenance (see
-[SECURITY.md](../SECURITY.md#release-artifacts)) — rather than relying on OS
+[SECURITY.md](https://github.com/schubydoo/podspine/blob/main/SECURITY.md#release-artifacts)) — rather than relying on OS
 signing, then clear the warning:
 
 - **macOS (Gatekeeper):** a browser download is quarantined. Remove it with
@@ -225,4 +225,4 @@ compose example above) or an uptime monitor.
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — how it works internally.
 - [importing.md](importing.md) — adding a feed to podcast apps + troubleshooting.
-- [../SECURITY.md](../SECURITY.md) — threat model and vulnerability reporting.
+- [SECURITY.md](https://github.com/schubydoo/podspine/blob/main/SECURITY.md) — threat model and vulnerability reporting.

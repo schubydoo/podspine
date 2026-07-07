@@ -21,3 +21,6 @@
 
 # Release build output (per-arch binaries for the Docker image)
 /dist/
+
+# MkDocs build output
+/site/
