@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+    <url>
+         <loc>https://schubydoo.github.io/podspine/latest/</loc>
+         <lastmod>2026-07-07</lastmod>
+    </url>
+    <url>
+         <loc>https://schubydoo.github.io/podspine/latest/ARCHITECTURE/</loc>
+         <lastmod>2026-07-07</lastmod>
+    </url>
+    <url>
+         <loc>https://schubydoo.github.io/podspine/latest/DEPLOYMENT/</loc>
+         <lastmod>2026-07-07</lastmod>
+    </url>
+    <url>
+         <loc>https://schubydoo.github.io/podspine/latest/DEVELOPMENT/</loc>
+         <lastmod>2026-07-07</lastmod>
+    </url>
+    <url>
+         <loc>https://schubydoo.github.io/podspine/latest/benchmarks/</loc>
+         <lastmod>2026-07-07</lastmod>
+    </url>
+    <url>
+         <loc>https://schubydoo.github.io/podspine/latest/changelog/</loc>
+         <lastmod>2026-07-07</lastmod>
+    </url>
+    <url>
+         <loc>https://schubydoo.github.io/podspine/latest/importing/</loc>
+         <lastmod>2026-07-07</lastmod>
+    </url>
+</urlset>
