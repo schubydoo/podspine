@@ -76,6 +76,7 @@ extra:
 
 nav:
   - Home: index.md
+  - Installing: installation.md
   - Deploying: DEPLOYMENT.md
   - Adding to your app: importing.md
   - Architecture: ARCHITECTURE.md

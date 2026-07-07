@@ -46,11 +46,26 @@ Then open <http://localhost:8080> to browse your books and copy feed URLs.
 `/data` holds the SQLite index and the split episode files, so keep it on a
 persistent volume.
 
-### Prebuilt binary
+### Install the binary
 
-Static (musl) binaries for `linux/amd64` and `linux/arm64` are attached to each
-[release](https://github.com/schubydoo/podspine/releases). `ffmpeg` and `ffprobe`
-must be on your `PATH`.
+Linux / macOS (downloads the signed binary for your OS/arch, verifies its
+checksum, installs to `~/.local/bin`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/schubydoo/podspine/main/install.sh | bash
+```
+
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/schubydoo/podspine/main/install.ps1 | iex
+```
+
+Or a package manager — `brew install schubydoo/podspine/podspine`, `scoop install
+podspine`, `nix profile install github:schubydoo/podspine`,
+or `cargo binstall --git https://github.com/schubydoo/podspine podspine`.
+`ffmpeg`/`ffprobe` must be on your `PATH`. Full matrix,
+version pinning, uninstall, and signature verification: **[Installing](https://schubydoo.github.io/podspine/latest/installation/)**.
 
 ```bash
 podspine --library /path/to/audiobooks --base-url http://<your-lan-ip>:8080

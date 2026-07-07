@@ -1,0 +1,162 @@
+name: Packaging manifest bump
+
+# Keep the in-repo package-manager manifests — Homebrew (Formula/podspine.rb), Scoop
+# (packaging/scoop/podspine.json), and the Nix flake's version — in lockstep with
+# published releases. Nothing auto-updates them
+# otherwise, so `brew`/`scoop`/`nix` would keep serving whatever the committed
+# manifests pin, frozen until someone bumps them by hand.
+#
+# On every published release we regenerate each manifest's version/url/hash from the
+# release's authoritative checksums.txt (via scripts/bump_packaging.py) and open a PR.
+# We DON'T push to main: main is branch-protected and the bump is reviewable. A manifest
+# not yet on main is skipped, so this can merge ahead of packaging landing.
+#
+# Trust root: the checksums.txt asset, fetched over GitHub TLS from our own just-published
+# release — the same trust model install.sh/install.ps1 use.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to sync manifests to (e.g. v1.2.0). Empty = latest."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: packaging-bump-${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    name: Sync packaging manifests to the release
+    # workflow_dispatch restricted to the default branch so a dispatch from an arbitrary
+    # ref can't run this write-capable job. (release events use the default branch anyway.)
+    if: ${{ github.event_name == 'release' || github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      # App token (NOT the default GITHUB_TOKEN): a PR opened by the default token would
+      # not trigger downstream CI, and it can't push a branch under branch protection.
+      - name: Mint GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.PODSPINE_CI_APP_ID }}
+          private-key: ${{ secrets.PODSPINE_CI_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Verify App token was minted
+        if: ${{ steps.app-token.outputs.token == '' }}
+        run: |
+          echo "::error::podspine-ci App token mint produced an empty token; refusing to \
+          proceed. Check PODSPINE_CI_APP_ID / PODSPINE_CI_APP_PRIVATE_KEY and the App install."
+          exit 1
+
+      - name: Check out repo
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Resolve + STRICTLY validate the tag before it reaches a shell (passed via env,
+      # never inlined) — a malformed/hostile tag can't inject.
+      - name: Resolve target release tag
+        id: tag
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "release" ]; then
+            tag="$RELEASE_TAG"
+          elif [ -n "$INPUT_TAG" ]; then
+            tag="$INPUT_TAG"
+          else
+            tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq '.tagName')"
+          fi
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::refusing to act on non-release tag '$tag' (expected vMAJOR.MINOR.PATCH)"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "Target tag: $tag"
+
+      # Regenerate version/url/hash for every present manifest from checksums.txt. The
+      # helper fails closed if an asset is missing or a stale version would survive.
+      - name: Regenerate packaging manifests
+        id: regen
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern checksums.txt --dir "$tmp"
+          python3 scripts/bump_packaging.py "$VERSION" "$GITHUB_REPOSITORY" "$tmp/checksums.txt"
+          if git diff --quiet; then
+            echo "Manifests already at $VERSION — nothing to do."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git --no-pager diff --stat
+          fi
+
+      # Push to a per-version branch and open (or update) a PR. Never main.
+      - name: Open packaging bump PR
+        if: ${{ steps.regen.outputs.changed == 'true' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          branch="packaging-bump/${TAG}"
+          case "$branch" in
+            packaging-bump/v[0-9]*) ;;
+            *) echo "::error::refusing to push to unexpected branch '$branch'"; exit 1 ;;
+          esac
+
+          git config user.name "podspine-ci[bot]"
+          git config user.email "podspine-ci[bot]@users.noreply.github.com"
+          git checkout -B "$branch"
+          for f in Formula/podspine.rb packaging/scoop/podspine.json flake.nix; do
+            [ -f "$f" ] && git add "$f"
+          done
+          git commit -m "chore(packaging): bump manifests to ${VERSION}"
+          git push --force-with-lease \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${branch}"
+
+          existing="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --head "$branch" --json number --jq 'length')"
+          if [ "$existing" = "0" ]; then
+            body="$(printf '%s\n' \
+              "Auto-generated by \`packaging-bump.yml\` on release **${TAG}**." \
+              "" \
+              "Regenerates the Homebrew / Scoop / Nix manifests' version, URLs, and" \
+              "checksums from the release's signed \`checksums.txt\` (only manifests present" \
+              "on main are touched). Merging syncs those package managers to the new version.")"
+            gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$branch" \
+              --title "chore(packaging): bump manifests to ${VERSION}" \
+              --body "$body"
+          else
+            echo "PR already open for $branch — pushed the updated manifests to it."
+          fi
+
+          # Enable native auto-merge (squash) so the deterministic, CI-verified bump lands
+          # once required checks pass — no manual merge per release. The bump is machine-
+          # generated from the release's signed checksums.txt (fails closed), not hand
+          # logic. Best-effort: a disabled "Allow auto-merge" setting just leaves it manual.
+          if ! gh pr merge --repo "$GITHUB_REPOSITORY" --auto --squash "$branch"; then
+            echo "::warning::could not enable auto-merge on $branch — merge it manually"
+          fi

@@ -24,3 +24,6 @@
 
 # MkDocs build output
 /site/
+
+# Nix build symlink
+/result

@@ -6,6 +6,12 @@
     "helpers:pinGitHubActionDigests"
   ],
   "labels": ["dependencies"],
+  "lockFileMaintenance": {
+    "description": "Keep flake.lock (nixpkgs/flake-utils) fresh weekly.",
+    "enabled": true,
+    "automerge": true,
+    "schedule": ["before 7am on monday"]
+  },
   "packageRules": [
     {
       "description": "One PR for all GitHub Actions bumps.",

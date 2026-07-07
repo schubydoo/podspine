@@ -1,0 +1,63 @@
+# INSTALL THIS INTO the schubydoo/homebrew-podspine repo at
+# .github/workflows/sync-formula.yml  (it does NOT run from the main podspine repo).
+#
+# The canonical podspine formula lives in the main repo (schubydoo/podspine), where its
+# version/url/hash are regenerated on every release by packaging-bump.yml. This tap just
+# mirrors that file: on a schedule (and on demand, dispatched by the main repo's
+# tap-sync-trigger.yml) it fetches Formula/podspine.rb from the public main repo and
+# commits it here if it changed. Auth-free: reads a public raw file over TLS, pushes with
+# this repo's own GITHUB_TOKEN.
+name: Sync formula from podspine
+
+on:
+  schedule:
+    - cron: "17 6 * * *" # daily ~06:17 UTC (fallback if the dispatch is missed)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-formula
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: Fetch + sync the canonical formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SRC: https://raw.githubusercontent.com/schubydoo/podspine/main/Formula/podspine.rb
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp)"
+          # Soft no-op if the source isn't fetchable yet (not on main, transient blip):
+          # keep the current valid formula and retry next run.
+          if ! curl -fsSL "$SRC" -o "$tmp"; then
+            echo "::notice::could not fetch $SRC (not on main yet?) — skipping this run"
+            exit 0
+          fi
+          # Fail closed if the fetch returned a non-formula (e.g. a 200 error page).
+          if ! grep -q '^class Podspine < Formula' "$tmp"; then
+            echo "::error::fetched content is not the podspine formula"
+            exit 1
+          fi
+          if cmp -s "$tmp" Formula/podspine.rb; then
+            echo "Formula already up to date — nothing to do."
+            exit 0
+          fi
+          mkdir -p Formula
+          cp "$tmp" Formula/podspine.rb
+          ver="$(grep -oE 'version "[0-9]+\.[0-9]+\.[0-9]+"' Formula/podspine.rb | head -1 \
+                 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/podspine.rb
+          git commit -m "chore: sync podspine formula ${ver:-update} from main"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main
+          echo "Synced formula ${ver:-(version unknown)}."
