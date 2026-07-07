@@ -9,10 +9,10 @@ files in this directory mirror them into those repos.
 
 1. A release publishes → `packaging-bump.yml` runs `scripts/bump_packaging.py`, which
    rewrites the version + checksums in `Formula/podspine.rb`, `packaging/scoop/podspine.json`,
-   and `packaging/aur/{PKGBUILD,.SRCINFO}` from the release `checksums.txt`, and opens a
+   and the `flake.nix` version from the release `checksums.txt`, and opens a
    `packaging-bump/vX.Y.Z` PR (auto-merge enabled).
 2. That PR merges → the main repo's `tap-sync-trigger.yml` dispatches the sync workflows
-   in the tap and bucket, and `aur-publish.yml` pushes the AUR package.
+   in the tap and bucket.
 3. The tap / bucket sync workflows (below) pull the updated manifest from `main` and
    commit it into their repo. A daily cron is the fallback if a dispatch is missed.
 
@@ -26,9 +26,8 @@ files in this directory mirror them into those repos.
 - `bucket/podspine.json` — seed with the main repo's `packaging/scoop/podspine.json`.
 - `.github/workflows/sync-manifest.yml` — copy from `sync-manifest.yml` here.
 
-**AUR** (`podspine-bin`):
-- Create an AUR account, add your SSH public key at aur.archlinux.org, and store the
-  matching private key as the repo secret `AUR_SSH_KEY`. `aur-publish.yml` handles the rest.
-
 **podspine-ci App** must be installed on `homebrew-podspine` and `scoop-podspine` with
 **Actions: write** (so `tap-sync-trigger.yml` can dispatch their syncs).
+
+> **AUR** (`podspine-bin`) is intentionally not included here — it lives on the
+> `feat/distribution-aur` branch until AUR account registration reopens.

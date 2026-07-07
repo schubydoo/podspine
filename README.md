@@ -62,7 +62,7 @@ irm https://raw.githubusercontent.com/schubydoo/podspine/main/install.ps1 | iex
 ```
 
 Or a package manager — `brew install schubydoo/podspine/podspine`, `scoop install
-podspine`, `yay -S podspine-bin`, `nix profile install github:schubydoo/podspine`,
+podspine`, `nix profile install github:schubydoo/podspine`,
 or `cargo binstall --git https://github.com/schubydoo/podspine podspine`.
 `ffmpeg`/`ffprobe` must be on your `PATH`. Full matrix,
 version pinning, uninstall, and signature verification: **[Installing](https://schubydoo.github.io/podspine/latest/installation/)**.

@@ -13,7 +13,6 @@ Pick whichever fits your setup:
 | [PowerShell](#windows-powershell) | Windows | `irm … \| iex` |
 | [Homebrew](#homebrew) | macOS / Linux | `brew install schubydoo/podspine/podspine` |
 | [Scoop](#scoop-windows) | Windows | `scoop install podspine` |
-| [AUR](#aur-arch-linux) | Arch Linux | `yay -S podspine-bin` |
 | [Nix](#nix) | NixOS / Nix users | `nix profile install github:schubydoo/podspine` |
 | [Cargo](#cargo) | Rust users / from source | `cargo binstall --git … podspine` |
 
@@ -98,14 +97,6 @@ scoop bucket add podspine https://github.com/schubydoo/scoop-podspine
 scoop install podspine
 ```
 
-## AUR (Arch Linux)
-
-A `-bin` package that installs the prebuilt binary (`ffmpeg` is a dependency):
-
-```bash
-yay -S podspine-bin      # or: paru -S podspine-bin
-```
-
 ## Nix
 
 With flakes enabled:
@@ -184,4 +175,4 @@ Podspine needs `ffmpeg` (which provides `ffprobe`) at runtime:
 | macOS | `brew install ffmpeg` |
 | Windows | `winget install Gyan.FFmpeg` or `scoop install ffmpeg` |
 
-Docker, Homebrew, AUR, and Nix installs pull it in for you.
+Docker, Homebrew, and Nix installs pull it in for you.

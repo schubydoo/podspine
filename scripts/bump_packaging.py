@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Regenerate podspine's packaging manifests to a released version from checksums.txt.
 
-After a release publishes, the Homebrew formula, the Scoop manifest, the AUR
-PKGBUILD/.SRCINFO, and the Nix flake's version must point at the new release. This
+After a release publishes, the Homebrew formula, the Scoop manifest, and the Nix
+flake's version must point at the new release. This
 helper rewrites whichever of those exist in the working tree, in place, keying every
 checksum off the release's authoritative ``checksums.txt`` (the list of what was
 actually built and signed). The Nix flake builds from source, so only its version
@@ -105,38 +105,6 @@ def bump_flake(text: str, version: str) -> str:
     return re.sub(r'(version = ")[^"]+(";)', rf"\g<1>{version}\g<2>", text, count=1)
 
 
-def bump_pkgbuild(text: str, version: str, bins: dict[str, str]) -> str:
-    """Rewrite the AUR PKGBUILD's pkgver, pkgrel, and per-arch sha256sums."""
-    x, a = bins.get("linux-amd64"), bins.get("linux-arm64")
-    if x is None or a is None:
-        raise ValueError("PKGBUILD: linux-amd64/arm64 missing from checksums.txt")
-    text = re.sub(r"(?m)^pkgver=.*$", f"pkgver={version}", text, count=1)
-    text = re.sub(r"(?m)^pkgrel=.*$", "pkgrel=1", text, count=1)
-    text = re.sub(r"(sha256sums_x86_64=\(')[0-9a-f]{64}(')", rf"\g<1>{x}\g<2>", text, count=1)
-    text = re.sub(r"(sha256sums_aarch64=\(')[0-9a-f]{64}(')", rf"\g<1>{a}\g<2>", text, count=1)
-    return text
-
-
-def bump_srcinfo(text: str, version: str, repo: str, bins: dict[str, str]) -> str:
-    """Rewrite the AUR .SRCINFO's pkgver, source URLs, and per-arch sha256sums."""
-    x, a = bins.get("linux-amd64"), bins.get("linux-arm64")
-    if x is None or a is None:
-        raise ValueError(".SRCINFO: linux-amd64/arm64 missing from checksums.txt")
-    amd = asset_url(repo, version, f"podspine-v{version}-linux-amd64")
-    arm = asset_url(repo, version, f"podspine-v{version}-linux-arm64")
-    subs = [
-        (r"(?m)^(\tpkgver = ).*$", rf"\g<1>{version}"),
-        (r"(?m)^(\tpkgrel = ).*$", r"\g<1>1"),
-        (r"(?m)^(\tsource_x86_64 = ).*$", rf"\g<1>podspine-{version}-x86_64::{amd}"),
-        (r"(?m)^(\tsource_aarch64 = ).*$", rf"\g<1>podspine-{version}-aarch64::{arm}"),
-        (r"(?m)^(\tsha256sums_x86_64 = )[0-9a-f]{64}$", rf"\g<1>{x}"),
-        (r"(?m)^(\tsha256sums_aarch64 = )[0-9a-f]{64}$", rf"\g<1>{a}"),
-    ]
-    for pat, repl in subs:
-        text = re.sub(pat, repl, text, count=1)
-    return text
-
-
 def main(argv: list[str]) -> int:
     """Bump every present packaging manifest to ``version`` from ``checksums.txt``."""
     if len(argv) != 4:
@@ -157,8 +125,6 @@ def main(argv: list[str]) -> int:
         Path("Formula/podspine.rb"): lambda t: bump_formula(t, version, repo, bins),
         Path("packaging/scoop/podspine.json"): lambda t: bump_scoop(t, version, repo, bins),
         Path("flake.nix"): lambda t: bump_flake(t, version),
-        Path("packaging/aur/PKGBUILD"): lambda t: bump_pkgbuild(t, version, bins),
-        Path("packaging/aur/.SRCINFO"): lambda t: bump_srcinfo(t, version, repo, bins),
     }
 
     # First pass: compute + validate every present manifest. Fail closed BEFORE any
