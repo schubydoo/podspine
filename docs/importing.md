@@ -1,8 +1,21 @@
 # Adding a Podspine feed to your podcast app
 
-Every book has its own feed URL — a private, unguessable **capability link**. In the
-Podspine web UI (`http://<host>:8080/`), open a book and use **Copy feed URL** (or
-scan the QR code with your phone). The URL looks like:
+Every book has its own feed URL — a private, unguessable **capability link**.
+
+## The easy way: the subscribe page
+
+In the Podspine web UI (`http://<host>:8080/`), open a book and **scan its QR code**
+with your phone (or open the book page directly). The QR opens that book's
+**subscribe page** (`/subscribe/<feed_id>`) — a set of one-tap **"Open in…"** deep
+links for Apple Podcasts, Overcast, Pocket Casts, Castro, AntennaPod, and Podcast
+Addict, with a per-app QR behind an expander. Tap the app you use and it opens with
+the feed ready to add. This is the phone-friendly path — especially on iOS, where
+Apple Podcasts has no "add by URL" of its own.
+
+## The manual way: add by URL
+
+Prefer to paste the URL yourself? On the book page use **Copy feed URL**. It looks
+like:
 
 ```
 http://<your-host>:8080/feed/<feed_id>.xml
@@ -14,13 +27,16 @@ to replace it (the old URL stops working). Then add it as a podcast **by URL** i
 app. Most apps hide this behind an "add by URL / RSS" option because these feeds are
 deliberately kept out of the public podcast directories.
 
-## Per-app steps
+## Per-app steps (adding by URL)
+
+These are the manual steps if you copied the feed URL. On a phone, the
+[subscribe page](#the-easy-way-the-subscribe-page) is usually quicker.
 
 ### Apple Podcasts
 - **macOS:** File → *Add a Show by URL…* → paste the feed URL.
-- **iOS:** there's no "add by URL" in the app itself. Subscribe once on a Mac
-  signed into the same Apple ID, or use a third-party app (below) for phone-only
-  setups.
+- **iOS:** Apple Podcasts has no "add by URL" of its own. Use the **subscribe
+  page's "Open in Apple Podcasts"** deep link (scan the book's QR), subscribe once
+  on a Mac signed into the same Apple ID, or use a third-party app (below).
 
 ### Pocket Casts
 - Profile → *Add Podcast* → *Add URL* → paste the feed URL.
@@ -78,3 +94,9 @@ playback order is correct.
 ### The cover art is missing
 - Books with no embedded cover show a lettered placeholder in the UI and no
   `itunes:image` unless you set `--default-cover-url`.
+
+## See also
+
+- [README](../README.md) — what Podspine is and the quick start.
+- [DEPLOYMENT.md](DEPLOYMENT.md) — running it, reverse proxy, and the full config reference.
+- [SECURITY.md](../SECURITY.md) — why feed URLs are capability links, and how to expose them safely.

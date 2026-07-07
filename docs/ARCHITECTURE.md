@@ -10,9 +10,11 @@ pipeline stage. It shells out to `ffmpeg`/`ffprobe` as separate processes (a GPL
 boundary; always invoked with an argument vector, never a shell string) and keeps
 its own state in a SQLite index plus a flat directory of split episode files.
 
-At startup it resolves configuration, scans the library once (splitting each book
-into per-chapter files and recording them in the index), then serves feeds, audio,
-and a small browse UI over HTTP.
+At startup it resolves configuration, scans the library (splitting each book into
+per-chapter files and recording them in the index), then serves feeds, audio, and a
+small browse UI over HTTP. A background watcher keeps the index reconciled with the
+library while it runs, so added, replaced, or removed books are picked up without a
+restart.
 
 ```mermaid
 flowchart LR
@@ -32,17 +34,17 @@ flowchart LR
 | Crate | Responsibility |
 |---|---|
 | `config` | Resolve settings from CLI flags → env → TOML (in that precedence); preflight `ffmpeg`/`ffprobe` so a missing toolchain fails at startup, not mid-request. |
-| `scanner` | Walk the library, classify each book (single audio file, per-book subfolder, or multi-track MP3 folder), and orchestrate probe → chapters → split → cover → index. Assigns collision-free slugs; one bad book never aborts the scan. |
+| `scanner` | Walk the library, classify each book (single audio file, per-book subfolder, or multi-track MP3 folder), and orchestrate probe → chapters → split → cover → index. Assigns collision-free slugs; one bad book never aborts the scan. Also hosts the background watcher that debounces filesystem changes and re-reconciles the index while the server runs. |
 | `prober` | Thin `ffprobe` wrapper → `ProbedBook` (duration, audio codec, cover presence/codec, track/title tags, embedded chapters). Parsing is separated from the subprocess call so it's unit-testable. |
 | `chapters` | Resolve the chapter source: a sibling `.cue` (75 fps `INDEX 01`) or `.ffmeta` sidecar wins over embedded markers (priority `.cue` > `.ffmeta` > embedded). `.opf`/`.nfo`/`.odm` are never chapter sources. |
 | `splitter` | `ffmpeg` wrapper: stream-copy each chapter into a codec-matching container (no re-encode). Bounds concurrency with a semaphore and enforces a per-child timeout/kill. Also extracts cover art. |
 | `index` | `rusqlite` (bundled SQLite) store for `book`, `episode`, and `feed_token` rows, with idempotent upserts keyed on stable ids. |
 | `feed` | Build one RSS 2.0 channel (itunes + podcast namespaces) per book, and a self-check that refuses to serve a malformed feed. |
 | `http` | Axum router: UI, feed, cover, and Range audio routes, plus the security/DoS middleware. |
-| `ui` | `maud` server-rendered pages (book grid, per-book copy-URL + QR, how-to panel). Pure presentation — no DB or HTTP dependency. |
+| `ui` | `maud` server-rendered pages: book grid, per-book copy-URL + QR + regenerate, and the per-book **subscribe page** (one-tap "Open in…" deep links + per-app QRs). Pure presentation — no DB or HTTP dependency. |
 
-Plus the `podspine` server binary (`src/main.rs`, wiring config → scan → serve) and
-a `podspine-cli` proof-of-concept for the single-file split pipeline.
+Plus the `podspine` server binary (`src/main.rs`, wiring config → scan → watch →
+serve) and a `podspine-cli` proof-of-concept for the single-file split pipeline.
 
 ## Ingest data flow
 
@@ -101,8 +103,9 @@ safe to expose externally (a guessed id 404s); see
 | Route | Surface | Purpose |
 |---|---|---|
 | `GET /` | UI (slug) | Browsable book grid. |
-| `GET /book/{slug}` | UI (slug) | Per-book page: copy capability-feed-URL, QR code, per-app how-to, **Regenerate link**. |
+| `GET /book/{slug}` | UI (slug) | Per-book page: copy capability-feed-URL, QR code (to the subscribe page), per-app how-to, **Regenerate link**. |
 | `POST /book/{slug}/regenerate` | UI (slug) | Rotate the book's `feed_id` (leak recovery); same-origin/CSRF-guarded. |
+| `GET /subscribe/{feed_id}` | capability | "Add to a podcast app" helper page: one-tap "Open in…" deep links + per-app QRs. |
 | `GET /feed/{feed_id}.xml` | capability | The podcast feed (built from the index, passed through the self-check); always `itunes:block` + `X-Robots-Tag: noindex`. |
 | `GET /audio/{feed_id}/{n}` | capability | Episode audio with HTTP Range (206 / `Content-Range` / 416) via `axum-range`. |
 | `GET /cover/{feed_id}` | capability | Book cover image. |

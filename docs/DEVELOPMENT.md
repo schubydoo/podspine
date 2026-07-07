@@ -19,7 +19,7 @@ for what each does):
 
 ```
 Cargo.toml            # workspace + the `podspine` server binary
-src/main.rs           # server entrypoint: config → scan → serve
+src/main.rs           # server entrypoint: config → scan → watch → serve
 crates/
 ├── config            # CLI/env/TOML resolution + ffmpeg preflight
 ├── scanner           # library walk + per-book orchestration
