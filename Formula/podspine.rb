@@ -8,7 +8,7 @@
 class Podspine < Formula
   desc "Self-hosted server that turns audiobooks into per-chapter podcast feeds"
   homepage "https://github.com/schubydoo/podspine"
-  version "1.1.0"
+  version "1.2.0"
   license "AGPL-3.0-only"
 
   # Podspine shells out to ffmpeg/ffprobe at runtime.
@@ -16,23 +16,23 @@ class Podspine < Formula
 
   on_macos do
     on_arm do
-      url "https://github.com/schubydoo/podspine/releases/download/v1.1.0/podspine-v1.1.0-darwin-arm64"
-      sha256 "00e10ce18fd3e009df9a50cf78614b20d90c1b342e93de8ccc1b212bcd94072b"
+      url "https://github.com/schubydoo/podspine/releases/download/v1.2.0/podspine-v1.2.0-darwin-arm64"
+      sha256 "7d98b149a1671120493cfa46d5325022244e92fca98ff859db92d77a4cc48351"
     end
     on_intel do
-      url "https://github.com/schubydoo/podspine/releases/download/v1.1.0/podspine-v1.1.0-darwin-amd64"
-      sha256 "ebae811e7a5649470eb6022c8399cf9869f11d6a8a6f5ebbf334986e91b519bf"
+      url "https://github.com/schubydoo/podspine/releases/download/v1.2.0/podspine-v1.2.0-darwin-amd64"
+      sha256 "8e71b1b6385a2698267dbec949e08429b4ab1711dd017df81492e1bbb46b375f"
     end
   end
 
   on_linux do
     on_intel do
-      url "https://github.com/schubydoo/podspine/releases/download/v1.1.0/podspine-v1.1.0-linux-amd64"
-      sha256 "fc1b8afa24c35010ac7cbfb49d62cfa659cfb9c69af0b65e110dbb3375a64f63"
+      url "https://github.com/schubydoo/podspine/releases/download/v1.2.0/podspine-v1.2.0-linux-amd64"
+      sha256 "bd49a60890260b0e731451ba8d4461b6d242960e1033c60bf5ac9c5b5dc9d7f1"
     end
     on_arm do
-      url "https://github.com/schubydoo/podspine/releases/download/v1.1.0/podspine-v1.1.0-linux-arm64"
-      sha256 "d129ae3c3355eb8a0c1dfc17156e1c0870d625a4ec8d94f1124cc76fabf16005"
+      url "https://github.com/schubydoo/podspine/releases/download/v1.2.0/podspine-v1.2.0-linux-arm64"
+      sha256 "d10992680d26361f8626a1fa11b065630d241a90686327edf7150500d6ce5206"
     end
   end
 

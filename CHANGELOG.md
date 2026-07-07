@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.0 (2026-07-07)
+
+### Features
+
+- Add a `--version`/`-V` flag so `podspine --version` reports the version (used by the install scripts and package-manager smoke tests). ([#36](https://github.com/schubydoo/podspine/pull/36))
+
 ## 1.1.0 (2026-07-05)
 
 ### Features

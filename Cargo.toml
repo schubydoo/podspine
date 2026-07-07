@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 rust-version = "1.88"  # raised from 1.85: time >=0.3.47 (RUSTSEC-2026-0009 fix) needs 1.88
 license = "AGPL-3.0-only"
