@@ -18,8 +18,10 @@ built-in player. Just a feed URL.
 - **Your files stay yours.** DRM-free input only — Podspine ships no DRM
   circumvention.
 
-> Status: MVP + v1 feature-complete (library scan, web UI, cover art, MP3 folders,
-> Tier-2 formats, chapter sidecars, security hardening). See [CHANGELOG](CHANGELOG.md).
+> Status: released and feature-complete — library scan with live auto-refresh, web
+> UI, cover art, MP3 folders, Tier-2 formats, chapter sidecars, private
+> capability-URL feeds (with one-click regenerate), a one-tap **subscribe page**
+> with per-app deep links + QR, and security hardening. See [CHANGELOG](CHANGELOG.md).
 
 ## Quick start
 
@@ -95,8 +97,10 @@ tools first, then drop the result in your library.
 
 ## Adding a feed to your podcast app
 
-Open the Podspine UI, click a book, and copy its feed URL (or scan the QR code).
-Then see the per-app steps and troubleshooting in **[docs/importing.md](docs/importing.md)**.
+Open the Podspine UI and click a book. Copy its feed URL, or scan the QR code with
+your phone to open its **subscribe page** — a set of one-tap "Open in…" deep links
+for Apple Podcasts, Overcast, Pocket Casts, Castro, AntennaPod, and Podcast Addict.
+For per-app steps and troubleshooting, see **[docs/importing.md](docs/importing.md)**.
 
 ## Documentation
 
