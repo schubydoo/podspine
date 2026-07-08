@@ -1,0 +1,10 @@
+# Documentation site toolchain (Material for MkDocs + versioning).
+# Top-level pins; Renovate keeps them current. The fully-resolved,
+# hash-pinned lockfile is docs/requirements.txt (generated via:
+#   pip-compile --generate-hashes docs/requirements.in
+# ). CI installs it with `pip install --require-hashes` so every
+# dependency — including transitive ones — is verified by hash
+# (OpenSSF Scorecard Pinned-Dependencies).
+mkdocs-material==9.7.6
+mkdocs-include-markdown-plugin==7.3.0
+mike==2.2.0
