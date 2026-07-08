@@ -110,7 +110,7 @@ jobs:
             esac
             mike delete --push latest 2>/dev/null || true
             mike alias --push --update-aliases "$PROMOTE" latest
-            mike set-default --push latest
+            mike set-default --push --template mike/redirect.html latest
           elif [ "$REF_TYPE" = "tag" ]; then
             # Release vX.Y.Z -> immutable "X.Y" snapshot, and move `latest` (the
             # site default) onto it: the newest release is what visitors land on.
@@ -118,7 +118,7 @@ jobs:
             # claim `latest` — re-point manually via promote_to_latest if so).
             version="${REF_NAME#v}"
             mike deploy --push --update-aliases "${version%.*}" latest
-            mike set-default --push latest
+            mike set-default --push --template mike/redirect.html latest
           else
             # Push to main -> rolling `dev` snapshot. Deliberately never touches
             # `latest`/default, so unreleased changes aren't what users see by
