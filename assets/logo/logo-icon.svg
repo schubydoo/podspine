@@ -1,0 +1,11 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Podspine">
+  <title>Podspine</title>
+  <rect width="512" height="512" rx="112" fill="#0A0A0A"/>
+  <g transform="translate(80,80) scale(5.5)" fill="#FF9E3D">
+    <rect x="8" y="32" width="6" height="24" rx="3"/>
+    <rect x="18.5" y="18" width="6" height="38" rx="3"/>
+    <rect x="29" y="8" width="6" height="48" rx="3"/>
+    <rect x="39.5" y="22" width="6" height="34" rx="3"/>
+    <rect x="50" y="38" width="6" height="18" rx="3"/>
+  </g>
+</svg>
