@@ -120,7 +120,20 @@ pub fn scan_book_as(
         let eps = index.episodes_for_book(&id)?;
         // In `saver` mode the split files are intentionally absent (regenerated
         // on demand), so don't require them on disk — the index entry is enough.
-        if !eps.is_empty() && (saver || eps.iter().all(|e| Path::new(&e.file_path).exists())) {
+        //
+        // BUT guard against a migrated database: `Index::migrate` back-fills
+        // `start_sec = 0` for pre-5.1 rows, and a non-first chapter with
+        // `start_sec == 0` can't drive correct on-demand regeneration (it would
+        // ffmpeg `-ss 0` and serve the book's opening seconds). Force a one-time
+        // re-split (skip this early return) so the real offsets are recorded
+        // before any eviction can serve the wrong segment. Chapter 0 legitimately
+        // starts at 0, so only non-first chapters are checked.
+        let start_secs_recorded =
+            !saver || eps.iter().filter(|e| e.idx > 0).all(|e| e.start_sec > 0.0);
+        if !eps.is_empty()
+            && start_secs_recorded
+            && (saver || eps.iter().all(|e| Path::new(&e.file_path).exists()))
+        {
             return Ok(existing);
         }
     }
@@ -1041,6 +1054,52 @@ mod tests {
         // being absent (the index entry alone satisfies the check in saver mode).
         let again = scan_book_as(&input, "saver-book", &data, &index, false, true).unwrap();
         assert_eq!(again.id, book.id);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saver_reingests_migrated_rows_with_zero_start_sec() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not available");
+            return;
+        }
+        let dir = scratch("saver-migrated");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = synth(&dir, true); // 3 chapters at 0s / 10s / 20s
+        let data = dir.join("data");
+        let index = Index::open_in_memory().unwrap();
+
+        // A normal full-mode ingest first: files on disk, real offsets recorded.
+        let book = scan_book_as(&input, "mig", &data, &index, false, false).unwrap();
+        let eps = index.episodes_for_book(&book.id).unwrap();
+        assert!(
+            eps.iter().any(|e| e.start_sec > 0.0),
+            "full ingest records real chapter offsets"
+        );
+
+        // Simulate a pre-5.1 -> 5.1 migration: back-fill start_sec = 0 everywhere.
+        for e in &eps {
+            let mut zeroed = e.clone();
+            zeroed.start_sec = 0.0;
+            index.upsert_episode(&zeroed).unwrap();
+        }
+
+        // Re-scan at the SAME mtime in saver mode. The zeroed non-first chapters
+        // must force a one-time re-split, not an idempotent skip.
+        let book2 = scan_book_as(&input, "mig", &data, &index, false, true).unwrap();
+        assert_eq!(book2.id, book.id);
+        let eps2 = index.episodes_for_book(&book.id).unwrap();
+        assert!(
+            (eps2[1].start_sec - 10.0).abs() < 0.5 && (eps2[2].start_sec - 20.0).abs() < 0.5,
+            "real start offsets are restored by the forced re-split: {:?}",
+            eps2.iter().map(|e| e.start_sec).collect::<Vec<_>>()
+        );
+        assert!(
+            eps2.iter().all(|e| !Path::new(&e.file_path).exists()),
+            "saver re-split leaves no files on disk"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

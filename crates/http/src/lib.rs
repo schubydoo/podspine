@@ -387,7 +387,15 @@ async fn audio(
             None => return Err(AppError::NotFound),
         }
     }
-    let path = target.path;
+    // Final defense-in-depth: the file now exists, so canonicalize it (resolving
+    // any symlink) and confirm it still lives under the data dir before opening.
+    // The resolver already checked the parent dir; this additionally catches a
+    // chapter file that is itself a symlink pointing outside the data dir.
+    let path = target.path.canonicalize().map_err(|_| AppError::NotFound)?;
+    if !path.starts_with(&state.data_dir) {
+        tracing::warn!(feed_id, number, "resolved audio file escaped the data dir");
+        return Err(AppError::NotFound);
+    }
     let mime = mime_for(&path.to_string_lossy());
     let file = File::open(&path).await.map_err(|_| AppError::NotFound)?;
     let body = KnownSize::file(file).await.map_err(AppError::internal)?;
