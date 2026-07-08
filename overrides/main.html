@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+
+<!--
+  Adds Open Graph / Twitter card meta so links to the docs site preview with the
+  Podspine social card. The image lives under docs/assets/ (bundled into every
+  built version) and is referenced at the `latest` mike alias — the versioned
+  paths are the only ones that actually exist on gh-pages; the site root is just
+  a redirect, so `config.site_url + assets/...` would 404.
+-->
+{% block extrahead %}
+  {{ super() }}
+  {% set social_image = config.site_url ~ "latest/assets/social-card.png" %}
+  {% if page and page.is_homepage %}
+    {% set social_title = config.site_name %}
+  {% elif page and page.title %}
+    {% set social_title = page.title ~ " · " ~ config.site_name %}
+  {% else %}
+    {% set social_title = config.site_name %}
+  {% endif %}
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="{{ config.site_name }}">
+  <meta property="og:title" content="{{ social_title }}">
+  <meta property="og:description" content="{{ config.site_description }}">
+  <meta property="og:image" content="{{ social_image }}">
+  {% if page and page.canonical_url %}<meta property="og:url" content="{{ page.canonical_url }}">{% endif %}
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="{{ social_title }}">
+  <meta name="twitter:description" content="{{ config.site_description }}">
+  <meta name="twitter:image" content="{{ social_image }}">
+{% endblock %}
