@@ -10,10 +10,10 @@
 <p align="center">
   <a href="https://github.com/schubydoo/podspine/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/schubydoo/podspine/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/schubydoo/podspine/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/schubydoo/podspine?label=release&color=FF9E3D"></a>
-  <a href="https://github.com/schubydoo/podspine/releases/latest"><img alt="Releases are signed with cosign/Sigstore and carry SLSA 3 provenance" src="https://img.shields.io/badge/releases-signed%20%28SLSA%203%29-brightgreen"></a>
+  <a href="https://github.com/schubydoo/podspine/actions/workflows/release.yml"><img alt="Signed release build (cosign/Sigstore + SLSA 3 provenance)" src="https://img.shields.io/github/actions/workflow/status/schubydoo/podspine/release.yml?label=signed%20release&logo=sigstore&logoColor=white"></a>
   <a href="https://schubydoo.github.io/podspine/"><img alt="Documentation" src="https://img.shields.io/badge/docs-schubydoo.github.io-FF9E3D?logo=materialformkdocs&logoColor=white"></a>
   <a href="https://github.com/schubydoo/podspine/blob/main/LICENSE"><img alt="License: AGPL-3.0" src="https://img.shields.io/github/license/schubydoo/podspine?color=blue"></a>
-  <a href="https://www.rust-lang.org"><img alt="Rust 2024, MSRV 1.88" src="https://img.shields.io/badge/rust-2024%20%281.88%2B%29-000000?logo=rust&logoColor=FF9E3D"></a>
+  <a href="https://www.rust-lang.org"><img alt="Rust 2024, MSRV 1.88" src="https://img.shields.io/badge/rust-2024%20%281.88%2B%29-B7410E?logo=rust&logoColor=white"></a>
   <a href="https://www.bestpractices.dev/projects/13535"><img alt="OpenSSF Best Practices" src="https://www.bestpractices.dev/projects/13535/badge"></a>
   <a href="https://scorecard.dev/viewer/?uri=github.com/schubydoo/podspine"><img alt="OpenSSF Scorecard" src="https://api.scorecard.dev/projects/github.com/schubydoo/podspine/badge"></a>
   <a href="https://greptile.com"><img alt="Reviewed by Greptile" src="https://img.shields.io/badge/reviewed%20by-Greptile-6f4ff2"></a>
