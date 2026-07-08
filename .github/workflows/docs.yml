@@ -2,8 +2,11 @@ name: Docs
 
 # Build the MkDocs (Material) site and publish it to GitHub Pages via `mike`,
 # which keeps a version selector on the gh-pages branch:
-#   - every push to main updates the `latest` version (docs track main)
-#   - every stable release tag (vX.Y.Z) publishes an immutable `X.Y` snapshot
+#   - every push to main updates the rolling `dev` snapshot (unreleased docs)
+#   - every release tag (vX.Y.Z) publishes an immutable `X.Y` snapshot AND moves
+#     the `latest` alias (the site default) to it, so visitors land on the newest
+#     release — the version they can actually install. `dev` is opt-in via the
+#     selector and carries a version-warning banner.
 # Pull requests only build with --strict (link/config validation), never deploy.
 #
 # NOTE: action refs are pinned to full commit SHAs (repo Actions policy + Scorecard);
@@ -22,6 +25,11 @@ on:
       - CHANGELOG.md
       - .github/workflows/docs.yml
   workflow_dispatch:
+    inputs:
+      promote_to_latest:
+        description: "One-time: point `latest`/default at an already-deployed release (X.Y, e.g. 1.2). Leave empty for a normal deploy."
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -81,20 +89,40 @@ jobs:
         env:
           REF_NAME: ${{ github.ref_name }}
           REF_TYPE: ${{ github.ref_type }}
+          PROMOTE: ${{ github.event.inputs.promote_to_latest }}
         run: |
-          if [ "$REF_TYPE" = "tag" ]; then
-            # vX.Y.Z -> immutable "X.Y" snapshot; leaves `latest`/default untouched.
+          set -euo pipefail
+          if [ -n "${PROMOTE:-}" ]; then
+            # One-time migration / manual re-point: make an already-deployed
+            # release the site default under the `latest` alias. Used once when
+            # switching from "latest tracks main" to the release-default model —
+            # it removes the legacy version literally named `latest` (the old main
+            # snapshot) so `latest` can become an alias on the release. `|| true`
+            # because on a healthy tree there's no such version to delete.
+            #
+            # Use `mike alias` (NOT `mike deploy`): we're only re-pointing the
+            # alias at an already-published snapshot. `mike deploy $PROMOTE` would
+            # rebuild the docs from the current checkout (main) into the $PROMOTE
+            # dir, clobbering the immutable release snapshot with main's content.
+            case "$PROMOTE" in
+              [0-9]*.[0-9]*) ;;
+              *) echo "::error::promote_to_latest must be an X.Y version (e.g. 1.2)"; exit 1 ;;
+            esac
+            mike delete --push latest 2>/dev/null || true
+            mike alias --push --update-aliases "$PROMOTE" latest
+            mike set-default --push latest
+          elif [ "$REF_TYPE" = "tag" ]; then
+            # Release vX.Y.Z -> immutable "X.Y" snapshot, and move `latest` (the
+            # site default) onto it: the newest release is what visitors land on.
+            # Assumes linear releases (a backport to an old line would wrongly
+            # claim `latest` — re-point manually via promote_to_latest if so).
             version="${REF_NAME#v}"
-            mike deploy --push "${version%.*}"
+            mike deploy --push --update-aliases "${version%.*}" latest
+            mike set-default --push latest
           else
-            # main -> rolling `latest`. Note whether gh-pages exists BEFORE the
-            # deploy creates it, so we can set the root redirect exactly once.
-            first_deploy=true
-            git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1 && first_deploy=false
-            mike deploy --push --update-aliases latest
-            # Point the site root at `latest` — only needed on the first deploy;
-            # skipping it afterwards avoids a redundant redirect commit each push.
-            if [ "$first_deploy" = true ]; then
-              mike set-default --push latest
-            fi
+            # Push to main -> rolling `dev` snapshot. Deliberately never touches
+            # `latest`/default, so unreleased changes aren't what users see by
+            # default; Material's version-warning banner flags `dev` as ahead of
+            # the release.
+            mike deploy --push --update-aliases dev
           fi
