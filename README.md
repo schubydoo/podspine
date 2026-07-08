@@ -89,6 +89,11 @@ The library path is the only required input; everything else has a default and c
 be set via CLI flag, environment variable, or a TOML file (`--config`), in that
 precedence. See the **[full option reference](docs/DEPLOYMENT.md#configuration)**.
 
+**Tight on disk?** Set `PODSPINE_STORAGE_MODE=saver` to split chapters on demand
+and cache them instead of pre-splitting every book to disk — roughly halves
+storage for a small first-play delay per chapter. See
+**[storage mode](docs/DEPLOYMENT.md#storage-mode-full-vs-saver)**.
+
 Each book's feed lives at an unguessable **capability URL** — `/feed/{feed_id}.xml`,
 with `/audio/{feed_id}/{n}` (episode audio, HTTP Range) and `/cover/{feed_id}`. The
 browse UI (`/`, `/book/{slug}`) enumerates your library, so keep it on the LAN or
