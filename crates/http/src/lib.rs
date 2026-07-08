@@ -25,7 +25,7 @@
 //! body-limit layers. Errors never leak filesystem paths or ffmpeg stderr (that
 //! detail is logged, collapsed to a bare status for the client). See TAD §4/§7.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -530,7 +530,11 @@ fn resolve_audio_target(
     }
     let path = out_dir.join(format!("{:03}.{out_ext}", idx + 1));
 
-    let regen = state.saver.then(|| Regen {
+    // Only single-file books are regenerable. An MP3-folder book copies each
+    // track verbatim (its `source_path` is a *directory*), so there's nothing to
+    // re-split — a missing file must be a clean 404, never a doomed
+    // `ffmpeg <directory>` (500). Eviction likewise leaves those tracks alone.
+    let regen = (state.saver && FsPath::new(&book.source_path).is_file()).then(|| Regen {
         source: PathBuf::from(&book.source_path),
         out_dir,
         out_ext,
@@ -605,22 +609,54 @@ async fn enforce_cache(state: &AppState, keep: &FsPath) {
         return; // unbounded + no TTL: nothing to evict
     }
     let books = state.data_dir.join("books");
+    // Only single-file-source books are regenerable; their cached chapters are
+    // safe to evict. MP3-folder tracks (directory source) are copied verbatim —
+    // deleting one would lose it until the next rescan — so restrict eviction to
+    // the regenerable book dirs. Snapshot the sources without holding the lock
+    // across the `is_file` stats.
+    let sources: Vec<(String, String)> = {
+        let Ok(index) = state.index.lock() else {
+            return;
+        };
+        match index.list_books() {
+            Ok(bs) => bs.into_iter().map(|b| (b.id, b.source_path)).collect(),
+            Err(_) => return,
+        }
+    };
+    let regenerable: HashSet<PathBuf> = sources
+        .into_iter()
+        .filter(|(_, src)| FsPath::new(src).is_file())
+        .map(|(id, _)| books.join(id))
+        .collect();
     let keep = keep.to_path_buf();
-    let _ = tokio::task::spawn_blocking(move || evict(&books, cap, ttl, &keep)).await;
+    let _ = tokio::task::spawn_blocking(move || evict(&books, cap, ttl, &keep, &regenerable)).await;
 }
 
-/// Collect cached chapter files (numeric stems under `books/*/`), drop
-/// TTL-expired ones, then delete oldest-first until under `cap`. mtime is the
-/// LRU key: regenerating a chapter refreshes it. Best-effort; per-file I/O
-/// errors are ignored.
-fn evict(books_dir: &FsPath, cap: Option<u64>, ttl: Option<Duration>, keep: &FsPath) {
+/// Collect cached chapter files (numeric stems under `books/*/`) from
+/// **regenerable** books only, drop TTL-expired ones, then delete oldest-first
+/// until under `cap`. mtime is the LRU key: regenerating a chapter refreshes it.
+/// Non-regenerable book dirs (e.g. MP3-folder tracks) are skipped entirely so a
+/// verbatim copy is never destroyed. Best-effort; per-file I/O errors are ignored.
+fn evict(
+    books_dir: &FsPath,
+    cap: Option<u64>,
+    ttl: Option<Duration>,
+    keep: &FsPath,
+    regenerable: &HashSet<PathBuf>,
+) {
     let now = std::time::SystemTime::now();
     let mut files: Vec<(PathBuf, u64, std::time::SystemTime)> = Vec::new();
     let Ok(book_dirs) = std::fs::read_dir(books_dir) else {
         return;
     };
     for book in book_dirs.flatten() {
-        let Ok(entries) = std::fs::read_dir(book.path()) else {
+        let book_path = book.path();
+        // Never touch a non-regenerable book's files (MP3-folder tracks would be
+        // lost until a rescan).
+        if !regenerable.contains(&book_path) {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&book_path) else {
             continue;
         };
         for e in entries.flatten() {
@@ -839,6 +875,10 @@ mod tests {
             .count()
     }
 
+    fn regen_set(dirs: &[&FsPath]) -> HashSet<PathBuf> {
+        dirs.iter().map(|d| d.to_path_buf()).collect()
+    }
+
     #[test]
     fn evict_enforces_size_cap_and_skips_non_chapter_files() {
         let dir = std::env::temp_dir().join("podspine-evict-size");
@@ -852,7 +892,7 @@ mod tests {
         let keep = bk.join("003.m4a");
 
         // Cap 150B: with `keep` (100B) protected, older chapters are evicted.
-        evict(&books, Some(150), None, &keep);
+        evict(&books, Some(150), None, &keep, &regen_set(&[&bk]));
 
         assert!(keep.exists(), "the just-served file is kept");
         assert!(
@@ -875,7 +915,13 @@ mod tests {
         // Ensure the files are measurably older than the (1ns) TTL.
         std::thread::sleep(Duration::from_millis(5));
 
-        evict(&books, None, Some(Duration::from_nanos(1)), &keep);
+        evict(
+            &books,
+            None,
+            Some(Duration::from_nanos(1)),
+            &keep,
+            &regen_set(&[&bk]),
+        );
 
         assert!(!bk.join("001.m4a").exists(), "TTL-expired chapter evicted");
         assert!(keep.exists(), "keep is never evicted, even past TTL");
@@ -891,7 +937,7 @@ mod tests {
         touch(&bk.join("001.m4a"), 100);
         let keep = bk.join("001.m4a");
 
-        evict(&books, None, None, &keep); // unbounded + no TTL
+        evict(&books, None, None, &keep, &regen_set(&[&bk])); // unbounded + no TTL
 
         assert!(keep.exists());
         assert_eq!(numeric_files(&bk), 1, "nothing evicted when unbounded");
@@ -899,34 +945,44 @@ mod tests {
     }
 
     #[test]
-    fn evict_tolerates_unreadable_paths() {
-        // A missing books dir: the top-level read_dir fails -> clean no-op.
+    fn evict_tolerates_a_missing_books_dir() {
+        // Top-level read_dir fails -> clean no-op, no panic.
         evict(
             FsPath::new("/no/such/podspine/books"),
             Some(1),
             None,
             FsPath::new("/no/such/keep"),
+            &HashSet::new(),
         );
+    }
 
-        // A non-directory entry directly under books/ (not a book dir): reading
-        // its "contents" fails and it's skipped, while real book dirs still get
-        // processed under the cap.
-        let dir = std::env::temp_dir().join("podspine-evict-badentry");
+    #[test]
+    fn evict_never_touches_non_regenerable_books() {
+        // A regenerable (single-file-source) book and an MP3-folder book whose
+        // tracks are copied verbatim. Only the regenerable one may be evicted;
+        // the MP3-folder tracks must survive even a tiny cap (Greptile P1).
+        let dir = std::env::temp_dir().join("podspine-evict-mp3safe");
         let _ = std::fs::remove_dir_all(&dir);
         let books = dir.join("books");
-        std::fs::create_dir_all(&books).unwrap();
-        std::fs::write(books.join("stray-file"), b"x").unwrap(); // where a book dir is expected
-        let bk = books.join("b1");
-        touch(&bk.join("001.m4a"), 100);
-        touch(&bk.join("002.m4a"), 100);
-        let keep = bk.join("002.m4a");
+        let split = books.join("splitbook"); // regenerable
+        touch(&split.join("001.m4a"), 100);
+        touch(&split.join("002.m4a"), 100);
+        let folder = books.join("mp3book"); // NOT regenerable (verbatim copies)
+        touch(&folder.join("001.mp3"), 100);
+        touch(&folder.join("002.mp3"), 100);
+        let keep = split.join("002.m4a");
 
-        evict(&books, Some(100), None, &keep); // cap forces eviction
+        // 1-byte cap: eviction is limited to the regenerable book dir.
+        evict(&books, Some(1), None, &keep, &regen_set(&[&split]));
 
-        assert!(keep.exists(), "real book dirs are still processed");
         assert!(
-            books.join("stray-file").exists(),
-            "non-directory entries under books/ are skipped, not touched"
+            folder.join("001.mp3").exists() && folder.join("002.mp3").exists(),
+            "MP3-folder tracks are never evicted (they can't be regenerated)"
+        );
+        assert!(keep.exists());
+        assert!(
+            !split.join("001.m4a").exists(),
+            "regenerable chapters are still evicted under the cap"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
