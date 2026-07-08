@@ -99,12 +99,17 @@ jobs:
             # it removes the legacy version literally named `latest` (the old main
             # snapshot) so `latest` can become an alias on the release. `|| true`
             # because on a healthy tree there's no such version to delete.
+            #
+            # Use `mike alias` (NOT `mike deploy`): we're only re-pointing the
+            # alias at an already-published snapshot. `mike deploy $PROMOTE` would
+            # rebuild the docs from the current checkout (main) into the $PROMOTE
+            # dir, clobbering the immutable release snapshot with main's content.
             case "$PROMOTE" in
               [0-9]*.[0-9]*) ;;
               *) echo "::error::promote_to_latest must be an X.Y version (e.g. 1.2)"; exit 1 ;;
             esac
             mike delete --push latest 2>/dev/null || true
-            mike deploy --push --update-aliases "$PROMOTE" latest
+            mike alias --push --update-aliases "$PROMOTE" latest
             mike set-default --push latest
           elif [ "$REF_TYPE" = "tag" ]; then
             # Release vX.Y.Z -> immutable "X.Y" snapshot, and move `latest` (the
