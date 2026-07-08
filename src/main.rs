@@ -50,6 +50,9 @@ async fn main() -> Result<()> {
         config.base_url.clone(),
         &config.data_dir,
         config.default_cover_url.clone(),
+        saver,
+        config.cache_size_bytes,
+        config.cache_ttl,
     );
     serve(config.bind, state).await.context("serving")?;
     Ok(())

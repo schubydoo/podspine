@@ -11,7 +11,7 @@ use tower::ServiceExt;
 
 use podspine_http::{AppState, router};
 use podspine_index::Index;
-use podspine_scanner::scan_book;
+use podspine_scanner::{scan_book, scan_book_as};
 
 fn ffmpeg_available() -> bool {
     Command::new("ffmpeg")
@@ -117,7 +117,15 @@ async fn serves_cover_when_present() {
         "cover should have been extracted"
     );
 
-    let state = AppState::new(index, "http://test".to_string(), &data, None);
+    let state = AppState::new(
+        index,
+        "http://test".to_string(),
+        &data,
+        None,
+        false,
+        None,
+        None,
+    );
     let app = router(state);
 
     // Covers are served by capability id, not the slug.
@@ -140,6 +148,141 @@ async fn serves_cover_when_present() {
 }
 
 #[tokio::test]
+async fn saver_mode_regenerates_a_chapter_on_demand() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+    let dir = std::env::temp_dir().join("podspine-http-saver");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let data = dir.join("data");
+
+    let index = Index::open_in_memory().unwrap();
+    let input = synth_three_chapters(&dir);
+    // Ingest in `saver` mode: sizes recorded, split files deleted.
+    let book = scan_book_as(&input, "saverbook", &data, &index, false, true).unwrap();
+    let feed_id = book.feed_id.clone();
+
+    let eps = index.episodes_for_book(&book.id).unwrap();
+    assert_eq!(eps.len(), 3);
+    let ch1 = eps[0].file_path.clone();
+    assert!(
+        !std::path::Path::new(&ch1).exists(),
+        "saver ingest leaves no split file on disk"
+    );
+    let recorded_len = eps[0].byte_length;
+
+    let state = AppState::new(
+        index,
+        "http://test".to_string(),
+        &data,
+        None,
+        true,
+        None,
+        None,
+    );
+    let app = router(state);
+
+    // First request: the file is missing, so it's regenerated and served.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/audio/{feed_id}/1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = body_bytes(resp).await;
+    assert_eq!(
+        bytes.len() as i64,
+        recorded_len,
+        "served body matches the recorded enclosure length"
+    );
+    assert!(
+        std::path::Path::new(&ch1).exists(),
+        "regenerated chapter is now cached on disk"
+    );
+
+    // A Range request against the now-cached file yields a 206 partial.
+    let resp = app
+        .oneshot(
+            Request::get(format!("/audio/{feed_id}/1"))
+                .header(header::RANGE, "bytes=0-9")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(body_bytes(resp).await.len(), 10, "range served 10 bytes");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn saver_cache_evicts_over_the_size_cap() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+    let dir = std::env::temp_dir().join("podspine-http-saver-evict");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let data = dir.join("data");
+
+    let index = Index::open_in_memory().unwrap();
+    let input = synth_three_chapters(&dir);
+    let book = scan_book_as(&input, "evictbook", &data, &index, false, true).unwrap();
+    let feed_id = book.feed_id.clone();
+    let book_out = data.join("books").join(&book.id);
+
+    // A 1-byte cap forces eviction of everything but the file just served.
+    let state = AppState::new(
+        index,
+        "http://test".to_string(),
+        &data,
+        None,
+        true,
+        Some(1),
+        None,
+    );
+    let app = router(state);
+
+    for n in [1u32, 2] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/audio/{feed_id}/{n}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = body_bytes(resp).await;
+    }
+
+    // After serving ch2 with a 1-byte cap, ch1 must have been evicted — leaving
+    // exactly one cached chapter file.
+    let cached = std::fs::read_dir(&book_out)
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            e.path()
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .count();
+    assert_eq!(cached, 1, "size cap keeps only the most-recent chapter");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn regenerate_rotates_the_capability() {
     if !ffmpeg_available() {
         eprintln!("skipping: ffmpeg not available");
@@ -156,7 +299,15 @@ async fn regenerate_rotates_the_capability() {
     let slug = book.slug.clone();
     let old_feed_id = book.feed_id.clone();
 
-    let state = AppState::new(index, "http://test".to_string(), &data, None);
+    let state = AppState::new(
+        index,
+        "http://test".to_string(),
+        &data,
+        None,
+        false,
+        None,
+        None,
+    );
     let app = router(state);
 
     // Every feed is always blocked from directories.
@@ -255,6 +406,9 @@ async fn serves_feed_and_range_audio() {
         "http://test".to_string(),
         &data,
         Some("http://test/default-cover.png".to_string()),
+        false,
+        None,
+        None,
     );
     let app = router(state);
 

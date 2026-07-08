@@ -18,6 +18,7 @@ tower = { version = "0.5", features = ["limit"] }
 tokio = { workspace = true }
 podspine-index = { path = "../index" }
 podspine-feed = { path = "../feed" }
+podspine-splitter = { path = "../splitter" }
 podspine-ui = { path = "../ui" }
 tracing = { workspace = true }
 

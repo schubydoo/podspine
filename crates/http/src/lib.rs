@@ -25,6 +25,7 @@
 //! body-limit layers. Errors never leak filesystem paths or ffmpeg stderr (that
 //! detail is logged, collapsed to a bare status for the client). See TAD §4/§7.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -46,6 +47,7 @@ use tower_http::trace::TraceLayer;
 
 use podspine_feed::{FeedBook, FeedEpisode, render_checked};
 use podspine_index::Index;
+use podspine_splitter::{ChapterCut, split_chapter};
 use podspine_ui::{BookCard, BookDetail, book_page, index_page, subscribe_page};
 
 /// Max concurrent in-flight requests before backpressure (DoS guard). Generous
@@ -109,15 +111,30 @@ pub struct AppState {
     pub data_dir: PathBuf,
     /// Feed-level fallback cover URL for books with no embedded art.
     pub default_cover_url: Option<String>,
+    /// `saver` storage mode: episode files aren't pre-split — the audio handler
+    /// regenerates a chapter on demand and caches it. `false` = pre-split.
+    pub saver: bool,
+    /// `saver`-mode cache cap in bytes (`None` = unbounded).
+    pub cache_size_bytes: Option<u64>,
+    /// `saver`-mode cache TTL (`None` = size-only eviction).
+    pub cache_ttl: Option<Duration>,
+    /// Per-chapter regeneration locks (single-flight): concurrent requests for
+    /// the same uncached chapter run ffmpeg once, not N times.
+    inflight: Arc<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl AppState {
-    /// Build state, canonicalizing the data dir for the path-safety check.
+    /// Build state, canonicalizing the data dir for the path-safety check. The
+    /// `saver`/cache args come from [`podspine_config::Config`] (pre-split
+    /// defaults: `saver=false`).
     pub fn new(
         index: Index,
         base_url: String,
         data_dir: &FsPath,
         default_cover_url: Option<String>,
+        saver: bool,
+        cache_size_bytes: Option<u64>,
+        cache_ttl: Option<Duration>,
     ) -> Self {
         let data_dir = data_dir
             .canonicalize()
@@ -127,6 +144,10 @@ impl AppState {
             base_url,
             data_dir,
             default_cover_url,
+            saver,
+            cache_size_bytes,
+            cache_ttl,
+            inflight: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -357,7 +378,16 @@ async fn audio(
     Path((feed_id, number)): Path<(String, u32)>,
     range: Option<TypedHeader<Range>>,
 ) -> Result<impl IntoResponse, AppError> {
-    let path = resolve_audio_path(&state, &feed_id, number)?;
+    let target = resolve_audio_target(&state, &feed_id, number)?;
+    // `saver` mode: the file isn't pre-split — regenerate (and cache) it on the
+    // first request. `full` mode: a missing file is a genuine 404.
+    if !target.path.exists() {
+        match &target.regen {
+            Some(regen) => ensure_chapter(&state, &target.path, regen).await?,
+            None => return Err(AppError::NotFound),
+        }
+    }
+    let path = target.path;
     let mime = mime_for(&path.to_string_lossy());
     let file = File::open(&path).await.map_err(|_| AppError::NotFound)?;
     let body = KnownSize::file(file).await.map_err(AppError::internal)?;
@@ -419,37 +449,183 @@ fn build_feed_xml(state: &AppState, feed_id: &str) -> Result<String, AppError> {
 }
 
 /// Resolve `(feed_id, episode number)` to a validated on-disk path.
-fn resolve_audio_path(state: &AppState, feed_id: &str, number: u32) -> Result<PathBuf, AppError> {
+/// What `/audio` needs: the canonical target file (which may not exist yet in
+/// `saver` mode) and, in `saver` mode, everything to regenerate it on demand.
+struct AudioTarget {
+    path: PathBuf,
+    regen: Option<Regen>,
+}
+
+/// Inputs to regenerate one chapter on demand (`saver` mode).
+struct Regen {
+    source: PathBuf,
+    out_dir: PathBuf,
+    out_ext: String,
+    cut: ChapterCut,
+}
+
+/// Resolve `/audio/{feed_id}/{number}` to its on-disk target.
+///
+/// The path is reconstructed from the canonical `data_dir` plus **opaque DB
+/// keys** (`book.id`, chapter index) and a validated audio extension — never
+/// built from request input — so it stays under the data dir by construction
+/// (no traversal). Existence is NOT required: in `saver` mode the file is
+/// regenerated on demand, so the resolver returns the target plus a [`Regen`].
+fn resolve_audio_target(
+    state: &AppState,
+    feed_id: &str,
+    number: u32,
+) -> Result<AudioTarget, AppError> {
     if !valid_feed_id(feed_id) {
         return Err(AppError::NotFound);
     }
     let idx = number.checked_sub(1).ok_or(AppError::NotFound)? as i64;
 
-    let file_path = {
+    let (book, ep) = {
         let index = state.index.lock().map_err(AppError::internal)?;
         let book = index
             .get_book_by_feed_id(feed_id)
             .map_err(AppError::internal)?
             .ok_or(AppError::NotFound)?;
-        index
+        let ep = index
             .episodes_for_book(&book.id)
             .map_err(AppError::internal)?
             .into_iter()
             .find(|e| e.idx == idx)
-            .ok_or(AppError::NotFound)?
-            .file_path
+            .ok_or(AppError::NotFound)?;
+        (book, ep)
     };
 
-    // Defense-in-depth: the path came from the DB, but confirm it resolves under
-    // the data dir before opening it.
-    let canonical = PathBuf::from(&file_path)
-        .canonicalize()
-        .map_err(|_| AppError::NotFound)?;
-    if !canonical.starts_with(&state.data_dir) {
-        tracing::warn!(feed_id, number, "resolved audio path escaped the data dir");
-        return Err(AppError::NotFound);
+    // The container extension is the audio ext the scanner recorded; reject
+    // anything non-alphanumeric so it can never introduce a path separator.
+    let out_ext = FsPath::new(&ep.file_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .filter(|e| !e.is_empty() && e.chars().all(|c| c.is_ascii_alphanumeric()))
+        .ok_or(AppError::NotFound)?;
+    let out_dir = state.data_dir.join("books").join(&book.id);
+    let path = out_dir.join(format!("{:03}.{out_ext}", idx + 1));
+    // The keys above are opaque, so this holds by construction; assert it.
+    debug_assert!(path.starts_with(&state.data_dir));
+
+    let regen = state.saver.then(|| Regen {
+        source: PathBuf::from(&book.source_path),
+        out_dir,
+        out_ext,
+        cut: ChapterCut {
+            idx: idx as usize,
+            start_sec: ep.start_sec,
+            end_sec: ep.start_sec + ep.duration_sec,
+        },
+    });
+    Ok(AudioTarget { path, regen })
+}
+
+/// Ensure `target` exists, regenerating it on demand (`saver` mode). A per-path
+/// single-flight lock means concurrent requests for the same uncached chapter
+/// run ffmpeg once; the blocking split runs off the async runtime.
+async fn ensure_chapter(state: &AppState, target: &FsPath, regen: &Regen) -> Result<(), AppError> {
+    let lock = {
+        let mut map = state.inflight.lock().map_err(AppError::internal)?;
+        map.entry(target.to_path_buf())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    let _guard = lock.lock().await;
+
+    // A concurrent request may have produced it while we waited on the lock.
+    if target.exists() {
+        return Ok(());
     }
-    Ok(canonical)
+
+    let source = regen.source.clone();
+    let out_dir = regen.out_dir.clone();
+    let out_ext = regen.out_ext.clone();
+    let cut = regen.cut.clone();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        std::fs::create_dir_all(&out_dir)?;
+        split_chapter(&source, &out_dir, &cut, &out_ext).map_err(std::io::Error::other)?;
+        Ok(())
+    })
+    .await
+    .map_err(AppError::internal)?
+    .map_err(AppError::internal)?;
+
+    // Keep the cache under its cap/TTL, never evicting what we just produced.
+    enforce_cache(state, target).await;
+    Ok(())
+}
+
+/// Evict cached chapter files to keep the `saver` cache under its size cap and
+/// TTL; `keep` (the file we just served) is never evicted. No-op when both
+/// limits are unset. Best-effort — eviction never fails a request.
+async fn enforce_cache(state: &AppState, keep: &FsPath) {
+    let (cap, ttl) = (state.cache_size_bytes, state.cache_ttl);
+    if cap.is_none() && ttl.is_none() {
+        return; // unbounded + no TTL: nothing to evict
+    }
+    let books = state.data_dir.join("books");
+    let keep = keep.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || evict(&books, cap, ttl, &keep)).await;
+}
+
+/// Collect cached chapter files (numeric stems under `books/*/`), drop
+/// TTL-expired ones, then delete oldest-first until under `cap`. mtime is the
+/// LRU key: regenerating a chapter refreshes it. Best-effort; per-file I/O
+/// errors are ignored.
+fn evict(books_dir: &FsPath, cap: Option<u64>, ttl: Option<Duration>, keep: &FsPath) {
+    let now = std::time::SystemTime::now();
+    let mut files: Vec<(PathBuf, u64, std::time::SystemTime)> = Vec::new();
+    let Ok(book_dirs) = std::fs::read_dir(books_dir) else {
+        return;
+    };
+    for book in book_dirs.flatten() {
+        let Ok(entries) = std::fs::read_dir(book.path()) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            // Only chapter files (`001.m4a`-style, numeric stem): skips covers.
+            let numeric = p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
+            if !numeric {
+                continue;
+            }
+            let Ok(meta) = e.metadata() else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            let mtime = meta.modified().unwrap_or(now);
+            if let Some(ttl) = ttl
+                && p != keep
+                && now.duration_since(mtime).is_ok_and(|age| age > ttl)
+            {
+                let _ = std::fs::remove_file(&p);
+                continue;
+            }
+            files.push((p, meta.len(), mtime));
+        }
+    }
+    let Some(cap) = cap else { return };
+    let mut total: u64 = files.iter().map(|(_, len, _)| *len).sum();
+    if total <= cap {
+        return;
+    }
+    files.sort_by_key(|(_, _, mtime)| *mtime); // oldest first
+    for (p, len, _) in files {
+        if total <= cap {
+            break;
+        }
+        if p == keep {
+            continue;
+        }
+        if std::fs::remove_file(&p).is_ok() {
+            total = total.saturating_sub(len);
+        }
+    }
 }
 
 /// Hardcoded MIME by extension (no content sniffing).
