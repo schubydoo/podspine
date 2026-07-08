@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS episode (
     file_path     TEXT NOT NULL,
     byte_length   INTEGER NOT NULL,
     duration_sec  REAL NOT NULL,
+    start_sec     REAL NOT NULL,
     pubdate_epoch INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS episode_book_idx ON episode(book_id, idx);
@@ -105,6 +106,9 @@ pub struct EpisodeRow {
     pub byte_length: i64,
     /// Duration in seconds.
     pub duration_sec: f64,
+    /// Chapter start offset in the source, in seconds. Needed to regenerate the
+    /// chapter on demand in `saver` storage mode.
+    pub start_sec: f64,
     /// pubDate epoch seconds.
     pub pubdate_epoch: i64,
 }
@@ -140,7 +144,32 @@ impl Index {
         // no-op for `:memory:` databases. (Task 4.3.)
         let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
         conn.execute_batch(SCHEMA)?;
+        Self::migrate(&conn)?;
         Ok(Self { conn })
+    }
+
+    /// Additive migrations for databases created by an older Podspine. Pre-v1 we
+    /// don't keep a full migration path, but silently breaking an existing DB at
+    /// request time is worse than a cheap `ADD COLUMN` here: `CREATE TABLE IF NOT
+    /// EXISTS` won't add a column to a table that already exists, so an older
+    /// `episode` table would be missing `start_sec` and every audio/feed query
+    /// would fail mid-request. `ADD COLUMN` preserves all rows (and the
+    /// capability `feed_id`s — a drop+recreate would rotate every feed URL).
+    /// Existing episodes get `start_sec = 0`; that value is only read for
+    /// `saver`-mode regeneration and is corrected on the next re-scan.
+    fn migrate(conn: &Connection) -> Result<(), IndexError> {
+        let has_start_sec: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('episode') WHERE name = 'start_sec'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_start_sec == 0 {
+            conn.execute(
+                "ALTER TABLE episode ADD COLUMN start_sec REAL NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        Ok(())
     }
 
     /// Insert or update a book by `id` (idempotent — no duplicate rows).
@@ -177,12 +206,13 @@ impl Index {
     pub fn upsert_episode(&self, e: &EpisodeRow) -> Result<(), IndexError> {
         self.conn.execute(
             "INSERT INTO episode
-               (guid, book_id, idx, title, file_path, byte_length, duration_sec, pubdate_epoch)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+               (guid, book_id, idx, title, file_path, byte_length, duration_sec, start_sec, pubdate_epoch)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(guid) DO UPDATE SET
                book_id=excluded.book_id, idx=excluded.idx, title=excluded.title,
                file_path=excluded.file_path, byte_length=excluded.byte_length,
-               duration_sec=excluded.duration_sec, pubdate_epoch=excluded.pubdate_epoch",
+               duration_sec=excluded.duration_sec, start_sec=excluded.start_sec,
+               pubdate_epoch=excluded.pubdate_epoch",
             params![
                 e.guid,
                 e.book_id,
@@ -191,6 +221,7 @@ impl Index {
                 e.file_path,
                 e.byte_length,
                 e.duration_sec,
+                e.start_sec,
                 e.pubdate_epoch,
             ],
         )?;
@@ -236,7 +267,7 @@ impl Index {
     /// Episodes for a book, ordered by chapter index (chapter 1 first).
     pub fn episodes_for_book(&self, book_id: &str) -> Result<Vec<EpisodeRow>, IndexError> {
         let mut stmt = self.conn.prepare(
-            "SELECT guid, book_id, idx, title, file_path, byte_length, duration_sec, pubdate_epoch
+            "SELECT guid, book_id, idx, title, file_path, byte_length, duration_sec, start_sec, pubdate_epoch
              FROM episode WHERE book_id = ?1 ORDER BY idx",
         )?;
         let rows = stmt.query_map([book_id], episode_from_row)?;
@@ -283,7 +314,7 @@ impl Index {
         Ok(self
             .conn
             .query_row(
-                "SELECT guid, book_id, idx, title, file_path, byte_length, duration_sec, pubdate_epoch
+                "SELECT guid, book_id, idx, title, file_path, byte_length, duration_sec, start_sec, pubdate_epoch
                  FROM episode WHERE guid = ?1",
                 [guid],
                 episode_from_row,
@@ -315,7 +346,8 @@ fn episode_from_row(row: &Row) -> rusqlite::Result<EpisodeRow> {
         file_path: row.get(4)?,
         byte_length: row.get(5)?,
         duration_sec: row.get(6)?,
-        pubdate_epoch: row.get(7)?,
+        start_sec: row.get(7)?,
+        pubdate_epoch: row.get(8)?,
     })
 }
 
@@ -346,6 +378,7 @@ mod tests {
             file_path: format!("/data/books/{book_id}/{:03}.m4a", idx + 1),
             byte_length: 1000 + idx,
             duration_sec: 60.0 * (idx as f64 + 1.0),
+            start_sec: 60.0 * (idx as f64),
             pubdate_epoch: 1_700_000_000 + idx,
         }
     }
@@ -441,6 +474,61 @@ mod tests {
         // Reopen the same file: the row (and schema) survived.
         let reopened = Index::open(&db).unwrap();
         assert_eq!(reopened.get_book("b1").unwrap().unwrap().title, "A Book");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_migrates_a_pre_start_sec_database() {
+        // Simulate a database created before `episode.start_sec` existed.
+        let dir = std::env::temp_dir().join("podspine-index-migrate");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("old.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE book (
+                    id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, feed_id TEXT NOT NULL UNIQUE,
+                    title TEXT NOT NULL, author TEXT, cover_path TEXT, source_path TEXT NOT NULL,
+                    source_mtime INTEGER NOT NULL, status TEXT NOT NULL);
+                 CREATE TABLE episode (
+                    guid TEXT PRIMARY KEY, book_id TEXT NOT NULL, idx INTEGER NOT NULL,
+                    title TEXT NOT NULL, file_path TEXT NOT NULL, byte_length INTEGER NOT NULL,
+                    duration_sec REAL NOT NULL, pubdate_epoch INTEGER NOT NULL);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO book VALUES ('b1','a-book','cap-b1','A Book',NULL,NULL,'/lib/b1.m4b',1,'ready')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO episode VALUES ('b1-0','b1',0,'One','/data/b1/001.m4a',1234,60.0,100)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Opening runs the additive migration: start_sec is added (default 0),
+        // existing rows and the capability feed_id survive.
+        let idx = Index::open(&db).unwrap();
+        let eps = idx.episodes_for_book("b1").unwrap();
+        assert_eq!(eps.len(), 1);
+        assert_eq!(
+            eps[0].start_sec, 0.0,
+            "migrated rows default to start_sec 0"
+        );
+        assert_eq!(eps[0].byte_length, 1234);
+        assert_eq!(
+            idx.get_book_by_feed_id("cap-b1").unwrap().unwrap().id,
+            "b1",
+            "capability feed_id preserved across migration"
+        );
+
+        // Idempotent: reopening an already-migrated DB is a no-op.
+        drop(idx);
+        assert!(Index::open(&db).is_ok());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

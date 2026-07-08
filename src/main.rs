@@ -7,7 +7,7 @@
 //! [`podspine_scanner`].
 
 use anyhow::{Context, Result};
-use podspine_config::Config;
+use podspine_config::{Config, StorageMode};
 use podspine_http::{AppState, serve};
 use podspine_index::Index;
 use podspine_scanner::{reconcile, spawn_library_watcher};
@@ -23,6 +23,7 @@ async fn main() -> Result<()> {
     let config = Config::load().context("resolving configuration")?;
     let db_path = config.data_dir.join("podspine.db");
     let index = Index::open(&db_path).context("opening the index")?;
+    let saver = matches!(config.storage_mode, StorageMode::Saver);
 
     // Initial reconcile: index new/changed books and prune ones deleted while the
     // server was down.
@@ -31,6 +32,7 @@ async fn main() -> Result<()> {
         &config.data_dir,
         &index,
         config.force_embedded_chapters,
+        saver,
     );
 
     // Auto-refresh: a background thread (its own WAL index connection) re-runs the
@@ -40,6 +42,7 @@ async fn main() -> Result<()> {
         config.data_dir.clone(),
         db_path,
         config.force_embedded_chapters,
+        saver,
     );
 
     let state = AppState::new(
@@ -47,6 +50,9 @@ async fn main() -> Result<()> {
         config.base_url.clone(),
         &config.data_dir,
         config.default_cover_url.clone(),
+        saver,
+        config.cache_size_bytes,
+        config.cache_ttl,
     );
     serve(config.bind, state).await.context("serving")?;
     Ok(())

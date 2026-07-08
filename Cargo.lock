@@ -1132,6 +1132,7 @@ dependencies = [
  "podspine-feed",
  "podspine-index",
  "podspine-scanner",
+ "podspine-splitter",
  "podspine-ui",
  "tokio",
  "tower",

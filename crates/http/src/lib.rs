@@ -25,6 +25,7 @@
 //! body-limit layers. Errors never leak filesystem paths or ffmpeg stderr (that
 //! detail is logged, collapsed to a bare status for the client). See TAD §4/§7.
 
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -46,6 +47,7 @@ use tower_http::trace::TraceLayer;
 
 use podspine_feed::{FeedBook, FeedEpisode, render_checked};
 use podspine_index::Index;
+use podspine_splitter::{ChapterCut, split_chapter};
 use podspine_ui::{BookCard, BookDetail, book_page, index_page, subscribe_page};
 
 /// Max concurrent in-flight requests before backpressure (DoS guard). Generous
@@ -109,15 +111,30 @@ pub struct AppState {
     pub data_dir: PathBuf,
     /// Feed-level fallback cover URL for books with no embedded art.
     pub default_cover_url: Option<String>,
+    /// `saver` storage mode: episode files aren't pre-split — the audio handler
+    /// regenerates a chapter on demand and caches it. `false` = pre-split.
+    pub saver: bool,
+    /// `saver`-mode cache cap in bytes (`None` = unbounded).
+    pub cache_size_bytes: Option<u64>,
+    /// `saver`-mode cache TTL (`None` = size-only eviction).
+    pub cache_ttl: Option<Duration>,
+    /// Per-chapter regeneration locks (single-flight): concurrent requests for
+    /// the same uncached chapter run ffmpeg once, not N times.
+    inflight: Arc<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl AppState {
-    /// Build state, canonicalizing the data dir for the path-safety check.
+    /// Build state, canonicalizing the data dir for the path-safety check. The
+    /// `saver`/cache args come from [`podspine_config::Config`] (pre-split
+    /// defaults: `saver=false`).
     pub fn new(
         index: Index,
         base_url: String,
         data_dir: &FsPath,
         default_cover_url: Option<String>,
+        saver: bool,
+        cache_size_bytes: Option<u64>,
+        cache_ttl: Option<Duration>,
     ) -> Self {
         let data_dir = data_dir
             .canonicalize()
@@ -127,6 +144,10 @@ impl AppState {
             base_url,
             data_dir,
             default_cover_url,
+            saver,
+            cache_size_bytes,
+            cache_ttl,
+            inflight: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -357,7 +378,24 @@ async fn audio(
     Path((feed_id, number)): Path<(String, u32)>,
     range: Option<TypedHeader<Range>>,
 ) -> Result<impl IntoResponse, AppError> {
-    let path = resolve_audio_path(&state, &feed_id, number)?;
+    let target = resolve_audio_target(&state, &feed_id, number)?;
+    // `saver` mode: the file isn't pre-split — regenerate (and cache) it on the
+    // first request. `full` mode: a missing file is a genuine 404.
+    if !target.path.exists() {
+        match &target.regen {
+            Some(regen) => ensure_chapter(&state, &target.path, regen).await?,
+            None => return Err(AppError::NotFound),
+        }
+    }
+    // Final defense-in-depth: the file now exists, so canonicalize it (resolving
+    // any symlink) and confirm it still lives under the data dir before opening.
+    // The resolver already checked the parent dir; this additionally catches a
+    // chapter file that is itself a symlink pointing outside the data dir.
+    let path = target.path.canonicalize().map_err(|_| AppError::NotFound)?;
+    if !path.starts_with(&state.data_dir) {
+        tracing::warn!(feed_id, number, "resolved audio file escaped the data dir");
+        return Err(AppError::NotFound);
+    }
     let mime = mime_for(&path.to_string_lossy());
     let file = File::open(&path).await.map_err(|_| AppError::NotFound)?;
     let body = KnownSize::file(file).await.map_err(AppError::internal)?;
@@ -419,37 +457,250 @@ fn build_feed_xml(state: &AppState, feed_id: &str) -> Result<String, AppError> {
 }
 
 /// Resolve `(feed_id, episode number)` to a validated on-disk path.
-fn resolve_audio_path(state: &AppState, feed_id: &str, number: u32) -> Result<PathBuf, AppError> {
+/// What `/audio` needs: the canonical target file (which may not exist yet in
+/// `saver` mode) and, in `saver` mode, everything to regenerate it on demand.
+struct AudioTarget {
+    path: PathBuf,
+    regen: Option<Regen>,
+}
+
+/// Inputs to regenerate one chapter on demand (`saver` mode).
+struct Regen {
+    source: PathBuf,
+    out_dir: PathBuf,
+    out_ext: String,
+    cut: ChapterCut,
+}
+
+/// Resolve `/audio/{feed_id}/{number}` to its on-disk target.
+///
+/// The path is reconstructed from the canonical `data_dir` plus **opaque DB
+/// keys** (`book.id`, chapter index) and a validated audio extension — never
+/// built from request input — so it stays under the data dir by construction
+/// (no traversal). Existence is NOT required: in `saver` mode the file is
+/// regenerated on demand, so the resolver returns the target plus a [`Regen`].
+fn resolve_audio_target(
+    state: &AppState,
+    feed_id: &str,
+    number: u32,
+) -> Result<AudioTarget, AppError> {
     if !valid_feed_id(feed_id) {
         return Err(AppError::NotFound);
     }
     let idx = number.checked_sub(1).ok_or(AppError::NotFound)? as i64;
 
-    let file_path = {
+    let (book, ep) = {
         let index = state.index.lock().map_err(AppError::internal)?;
         let book = index
             .get_book_by_feed_id(feed_id)
             .map_err(AppError::internal)?
             .ok_or(AppError::NotFound)?;
-        index
+        let ep = index
             .episodes_for_book(&book.id)
             .map_err(AppError::internal)?
             .into_iter()
             .find(|e| e.idx == idx)
-            .ok_or(AppError::NotFound)?
-            .file_path
+            .ok_or(AppError::NotFound)?;
+        (book, ep)
     };
 
-    // Defense-in-depth: the path came from the DB, but confirm it resolves under
-    // the data dir before opening it.
-    let canonical = PathBuf::from(&file_path)
+    // The container extension is the audio ext the scanner recorded; reject
+    // anything non-alphanumeric so it can never introduce a path separator.
+    let out_ext = FsPath::new(&ep.file_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .filter(|e| !e.is_empty() && e.chars().all(|c| c.is_ascii_alphanumeric()))
+        .ok_or(AppError::NotFound)?;
+    // Defense-in-depth, at runtime (not a debug_assert that vanishes in release):
+    // resolve the book dir and confirm it stays under the canonical data dir
+    // before anything is opened or written. The components are opaque DB keys,
+    // but a poisoned row must never let a path escape. The chapter file itself
+    // may not exist yet (saver), so canonicalize the parent dir; a book dir that
+    // doesn't exist (never ingested) is a clean 404.
+    let out_dir = state
+        .data_dir
+        .join("books")
+        .join(&book.id)
         .canonicalize()
         .map_err(|_| AppError::NotFound)?;
-    if !canonical.starts_with(&state.data_dir) {
+    if !out_dir.starts_with(&state.data_dir) {
         tracing::warn!(feed_id, number, "resolved audio path escaped the data dir");
         return Err(AppError::NotFound);
     }
-    Ok(canonical)
+    let path = out_dir.join(format!("{:03}.{out_ext}", idx + 1));
+
+    // Only single-file books are regenerable. An MP3-folder book copies each
+    // track verbatim (its `source_path` is a *directory*), so there's nothing to
+    // re-split — a missing file must be a clean 404, never a doomed
+    // `ffmpeg <directory>` (500). Eviction likewise leaves those tracks alone.
+    let regen = (state.saver && FsPath::new(&book.source_path).is_file()).then(|| Regen {
+        source: PathBuf::from(&book.source_path),
+        out_dir,
+        out_ext,
+        // `end_sec` is reconstructed as start + duration. This is EXACT, not an
+        // approximation: the scanner stores `duration_sec = cut.end - cut.start`
+        // (the requested cut length, not a measured output duration), so this
+        // yields the same `[start, end)` the ingest split used — and ffmpeg's
+        // 6-decimal arg formatting absorbs any float round-trip. The stream copy
+        // is therefore byte-identical (asserted in the serve test).
+        cut: ChapterCut {
+            idx: idx as usize,
+            start_sec: ep.start_sec,
+            end_sec: ep.start_sec + ep.duration_sec,
+        },
+    });
+    Ok(AudioTarget { path, regen })
+}
+
+/// Ensure `target` exists, regenerating it on demand (`saver` mode). A per-path
+/// single-flight lock means concurrent requests for the same uncached chapter
+/// run ffmpeg once; the blocking split runs off the async runtime.
+async fn ensure_chapter(state: &AppState, target: &FsPath, regen: &Regen) -> Result<(), AppError> {
+    let lock = {
+        let mut map = state.inflight.lock().map_err(AppError::internal)?;
+        map.entry(target.to_path_buf())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    let _guard = lock.lock().await;
+
+    let outcome = async {
+        // A concurrent request may have produced it while we waited on the lock.
+        if target.exists() {
+            return Ok(());
+        }
+        let source = regen.source.clone();
+        let out_dir = regen.out_dir.clone();
+        let out_ext = regen.out_ext.clone();
+        let cut = regen.cut.clone();
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            std::fs::create_dir_all(&out_dir)?;
+            split_chapter(&source, &out_dir, &cut, &out_ext).map_err(std::io::Error::other)?;
+            Ok(())
+        })
+        .await
+        .map_err(AppError::internal)?
+        .map_err(AppError::internal)?;
+
+        // Keep the cache under its cap/TTL, never evicting what we just produced.
+        enforce_cache(state, target).await;
+        Ok(())
+    }
+    .await;
+
+    // Drop the single-flight entry so the map stays bounded to *in-flight*
+    // regenerations, not every chapter ever served. Any waiter still blocked on
+    // `.lock()` holds its own `Arc` clone of this same mutex, and every path
+    // re-checks `target.exists()` after acquiring it, so removing the map entry
+    // here can never cause a duplicate ffmpeg run.
+    if let Ok(mut map) = state.inflight.lock() {
+        map.remove(target);
+    }
+    outcome
+}
+
+/// Evict cached chapter files to keep the `saver` cache under its size cap and
+/// TTL; `keep` (the file we just served) is never evicted. No-op when both
+/// limits are unset. Best-effort — eviction never fails a request.
+async fn enforce_cache(state: &AppState, keep: &FsPath) {
+    let (cap, ttl) = (state.cache_size_bytes, state.cache_ttl);
+    if cap.is_none() && ttl.is_none() {
+        return; // unbounded + no TTL: nothing to evict
+    }
+    let books = state.data_dir.join("books");
+    // Only single-file-source books are regenerable; their cached chapters are
+    // safe to evict. MP3-folder tracks (directory source) are copied verbatim —
+    // deleting one would lose it until the next rescan — so restrict eviction to
+    // the regenerable book dirs. Snapshot the sources without holding the lock
+    // across the `is_file` stats.
+    let sources: Vec<(String, String)> = {
+        let Ok(index) = state.index.lock() else {
+            return;
+        };
+        match index.list_books() {
+            Ok(bs) => bs.into_iter().map(|b| (b.id, b.source_path)).collect(),
+            Err(_) => return,
+        }
+    };
+    let regenerable: HashSet<PathBuf> = sources
+        .into_iter()
+        .filter(|(_, src)| FsPath::new(src).is_file())
+        .map(|(id, _)| books.join(id))
+        .collect();
+    let keep = keep.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || evict(&books, cap, ttl, &keep, &regenerable)).await;
+}
+
+/// Collect cached chapter files (numeric stems under `books/*/`) from
+/// **regenerable** books only, drop TTL-expired ones, then delete oldest-first
+/// until under `cap`. mtime is the LRU key: regenerating a chapter refreshes it.
+/// Non-regenerable book dirs (e.g. MP3-folder tracks) are skipped entirely so a
+/// verbatim copy is never destroyed. Best-effort; per-file I/O errors are ignored.
+fn evict(
+    books_dir: &FsPath,
+    cap: Option<u64>,
+    ttl: Option<Duration>,
+    keep: &FsPath,
+    regenerable: &HashSet<PathBuf>,
+) {
+    let now = std::time::SystemTime::now();
+    let mut files: Vec<(PathBuf, u64, std::time::SystemTime)> = Vec::new();
+    let Ok(book_dirs) = std::fs::read_dir(books_dir) else {
+        return;
+    };
+    for book in book_dirs.flatten() {
+        let book_path = book.path();
+        // Never touch a non-regenerable book's files (MP3-folder tracks would be
+        // lost until a rescan).
+        if !regenerable.contains(&book_path) {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&book_path) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            // Only chapter files (`001.m4a`-style, numeric stem): skips covers.
+            let numeric = p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
+            if !numeric {
+                continue;
+            }
+            let Ok(meta) = e.metadata() else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            let mtime = meta.modified().unwrap_or(now);
+            if let Some(ttl) = ttl
+                && p != keep
+                && now.duration_since(mtime).is_ok_and(|age| age > ttl)
+            {
+                let _ = std::fs::remove_file(&p);
+                continue;
+            }
+            files.push((p, meta.len(), mtime));
+        }
+    }
+    let Some(cap) = cap else { return };
+    let mut total: u64 = files.iter().map(|(_, len, _)| *len).sum();
+    if total <= cap {
+        return;
+    }
+    files.sort_by_key(|(_, _, mtime)| *mtime); // oldest first
+    for (p, len, _) in files {
+        if total <= cap {
+            break;
+        }
+        if p == keep {
+            continue;
+        }
+        if std::fs::remove_file(&p).is_ok() {
+            total = total.saturating_sub(len);
+        }
+    }
 }
 
 /// Hardcoded MIME by extension (no content sniffing).
@@ -602,5 +853,137 @@ mod tests {
         assert_eq!(image_mime("/x/cover.png"), "image/png");
         assert_eq!(image_mime("/x/cover.webp"), "image/webp");
         assert_eq!(image_mime("/x/blob"), "image/jpeg");
+    }
+
+    // ---- saver-mode cache eviction (unit-tested without ffmpeg) ----
+
+    fn touch(path: &FsPath, bytes: usize) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, vec![0u8; bytes]).unwrap();
+    }
+
+    fn numeric_files(dir: &FsPath) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.path()
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            })
+            .count()
+    }
+
+    fn regen_set(dirs: &[&FsPath]) -> HashSet<PathBuf> {
+        dirs.iter().map(|d| d.to_path_buf()).collect()
+    }
+
+    #[test]
+    fn evict_enforces_size_cap_and_skips_non_chapter_files() {
+        let dir = std::env::temp_dir().join("podspine-evict-size");
+        let _ = std::fs::remove_dir_all(&dir);
+        let books = dir.join("books");
+        let bk = books.join("b1");
+        for n in 1..=3 {
+            touch(&bk.join(format!("{n:03}.m4a")), 100);
+        }
+        touch(&bk.join("cover.jpg"), 500); // non-numeric stem: never a cache file
+        let keep = bk.join("003.m4a");
+
+        // Cap 150B: with `keep` (100B) protected, older chapters are evicted.
+        evict(&books, Some(150), None, &keep, &regen_set(&[&bk]));
+
+        assert!(keep.exists(), "the just-served file is kept");
+        assert!(
+            bk.join("cover.jpg").exists(),
+            "non-chapter files are untouched"
+        );
+        assert!(numeric_files(&bk) <= 1, "size cap evicted older chapters");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn evict_drops_ttl_expired_chapters_except_keep() {
+        let dir = std::env::temp_dir().join("podspine-evict-ttl");
+        let _ = std::fs::remove_dir_all(&dir);
+        let books = dir.join("books");
+        let bk = books.join("b1");
+        touch(&bk.join("001.m4a"), 100);
+        touch(&bk.join("002.m4a"), 100);
+        let keep = bk.join("002.m4a");
+        // Ensure the files are measurably older than the (1ns) TTL.
+        std::thread::sleep(Duration::from_millis(5));
+
+        evict(
+            &books,
+            None,
+            Some(Duration::from_nanos(1)),
+            &keep,
+            &regen_set(&[&bk]),
+        );
+
+        assert!(!bk.join("001.m4a").exists(), "TTL-expired chapter evicted");
+        assert!(keep.exists(), "keep is never evicted, even past TTL");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn evict_is_a_noop_without_a_cap_or_ttl() {
+        let dir = std::env::temp_dir().join("podspine-evict-noop");
+        let _ = std::fs::remove_dir_all(&dir);
+        let books = dir.join("books");
+        let bk = books.join("b1");
+        touch(&bk.join("001.m4a"), 100);
+        let keep = bk.join("001.m4a");
+
+        evict(&books, None, None, &keep, &regen_set(&[&bk])); // unbounded + no TTL
+
+        assert!(keep.exists());
+        assert_eq!(numeric_files(&bk), 1, "nothing evicted when unbounded");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn evict_tolerates_a_missing_books_dir() {
+        // Top-level read_dir fails -> clean no-op, no panic.
+        evict(
+            FsPath::new("/no/such/podspine/books"),
+            Some(1),
+            None,
+            FsPath::new("/no/such/keep"),
+            &HashSet::new(),
+        );
+    }
+
+    #[test]
+    fn evict_never_touches_non_regenerable_books() {
+        // A regenerable (single-file-source) book and an MP3-folder book whose
+        // tracks are copied verbatim. Only the regenerable one may be evicted;
+        // the MP3-folder tracks must survive even a tiny cap (Greptile P1).
+        let dir = std::env::temp_dir().join("podspine-evict-mp3safe");
+        let _ = std::fs::remove_dir_all(&dir);
+        let books = dir.join("books");
+        let split = books.join("splitbook"); // regenerable
+        touch(&split.join("001.m4a"), 100);
+        touch(&split.join("002.m4a"), 100);
+        let folder = books.join("mp3book"); // NOT regenerable (verbatim copies)
+        touch(&folder.join("001.mp3"), 100);
+        touch(&folder.join("002.mp3"), 100);
+        let keep = split.join("002.m4a");
+
+        // 1-byte cap: eviction is limited to the regenerable book dir.
+        evict(&books, Some(1), None, &keep, &regen_set(&[&split]));
+
+        assert!(
+            folder.join("001.mp3").exists() && folder.join("002.mp3").exists(),
+            "MP3-folder tracks are never evicted (they can't be regenerated)"
+        );
+        assert!(keep.exists());
+        assert!(
+            !split.join("001.m4a").exists(),
+            "regenerable chapters are still evicted under the cap"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

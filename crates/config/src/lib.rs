@@ -9,12 +9,27 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use serde::Deserialize;
 
 const DEFAULT_BIND: &str = "0.0.0.0:8080";
 const DEFAULT_DATA_DIR: &str = "./data";
+/// Default `saver`-mode cache cap when unset: 2 GiB.
+const DEFAULT_CACHE_SIZE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// How per-chapter episode files are produced and stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StorageMode {
+    /// Pre-split every chapter to disk at ingest (fast serves, ~2× storage).
+    #[default]
+    Full,
+    /// Split chapters on demand and cache recently played ones (minimal disk,
+    /// a small first-play delay per uncached chapter).
+    Saver,
+}
 
 /// Command-line / environment inputs. All optional here; required-ness is
 /// enforced during [`Config::resolve`] so a value may instead come from TOML.
@@ -43,6 +58,19 @@ pub struct Cli {
     /// Force embedded chapters, ignoring any `.cue`/`.ffmeta` sidecar.
     #[arg(long, env = "PODSPINE_FORCE_EMBEDDED_CHAPTERS")]
     pub force_embedded_chapters: bool,
+    /// Chapter storage strategy: `full` pre-splits every chapter to disk (fast,
+    /// ~2× storage); `saver` splits on demand and caches recently played
+    /// chapters (minimal disk, a small first-play delay).
+    #[arg(long, env = "PODSPINE_STORAGE_MODE")]
+    pub storage_mode: Option<StorageMode>,
+    /// Max disk for the on-demand chapter cache in `saver` mode (e.g. `2GB`,
+    /// `500MB`; `0`/`off` = unbounded). Ignored in `full` mode.
+    #[arg(long, env = "PODSPINE_CACHE_SIZE")]
+    pub cache_size: Option<String>,
+    /// TTL for cached chapters in `saver` mode (e.g. `30d`, `12h`; `off` =
+    /// size-only eviction). Ignored in `full` mode.
+    #[arg(long, env = "PODSPINE_CACHE_TTL")]
+    pub cache_ttl: Option<String>,
     /// Optional TOML config file.
     #[arg(long, env = "PODSPINE_CONFIG")]
     pub config: Option<PathBuf>,
@@ -64,6 +92,12 @@ pub struct FileConfig {
     pub default_cover_url: Option<String>,
     /// Force embedded chapters, ignoring sidecars.
     pub force_embedded_chapters: Option<bool>,
+    /// Chapter storage strategy (`full` | `saver`).
+    pub storage_mode: Option<StorageMode>,
+    /// On-demand cache size cap (e.g. `2GB`; `0`/`off` = unbounded).
+    pub cache_size: Option<String>,
+    /// On-demand cache TTL (e.g. `30d`; `off` = size-only eviction).
+    pub cache_ttl: Option<String>,
 }
 
 /// Fully resolved, validated configuration.
@@ -82,6 +116,13 @@ pub struct Config {
     pub default_cover_url: Option<String>,
     /// Ignore `.cue`/`.ffmeta` sidecars and always use embedded chapters.
     pub force_embedded_chapters: bool,
+    /// How chapters are produced/stored: `full` (pre-split) or `saver`
+    /// (on-demand + cache). A per-book `.podspine.toml` may override this.
+    pub storage_mode: StorageMode,
+    /// Cache size cap in bytes for `saver` mode (`None` = unbounded).
+    pub cache_size_bytes: Option<u64>,
+    /// TTL for cached chapters in `saver` mode (`None` = size-only eviction).
+    pub cache_ttl: Option<Duration>,
 }
 
 /// Configuration failures — all fatal, all reported at startup.
@@ -115,6 +156,22 @@ pub enum ConfigError {
     /// A required external tool is missing from PATH.
     #[error("`{0}` not found on PATH (install ffmpeg)")]
     ToolMissing(&'static str),
+    /// The cache size value could not be parsed.
+    #[error("invalid cache size {value:?}: {reason}")]
+    BadCacheSize {
+        /// The offending value.
+        value: String,
+        /// Why it failed.
+        reason: String,
+    },
+    /// The cache TTL value could not be parsed.
+    #[error("invalid cache TTL {value:?}: {reason}")]
+    BadCacheTtl {
+        /// The offending value.
+        value: String,
+        /// Why it failed.
+        reason: String,
+    },
     /// The config file could not be read.
     #[error("could not read config {path}: {source}")]
     ReadConfig {
@@ -187,6 +244,21 @@ impl Config {
         let force_embedded_chapters =
             cli.force_embedded_chapters || file.force_embedded_chapters.unwrap_or(false);
 
+        let storage_mode = cli.storage_mode.or(file.storage_mode).unwrap_or_default();
+
+        let cache_size_bytes = match cli.cache_size.clone().or_else(|| file.cache_size.clone()) {
+            Some(s) => {
+                parse_size(&s).map_err(|reason| ConfigError::BadCacheSize { value: s, reason })?
+            }
+            None => Some(DEFAULT_CACHE_SIZE_BYTES),
+        };
+
+        let cache_ttl = match cli.cache_ttl.clone().or_else(|| file.cache_ttl.clone()) {
+            Some(s) => parse_duration(&s)
+                .map_err(|reason| ConfigError::BadCacheTtl { value: s, reason })?,
+            None => None,
+        };
+
         Ok(Self {
             library,
             data_dir,
@@ -194,6 +266,9 @@ impl Config {
             base_url,
             default_cover_url,
             force_embedded_chapters,
+            storage_mode,
+            cache_size_bytes,
+            cache_ttl,
         })
     }
 
@@ -243,6 +318,69 @@ pub fn preflight() -> Result<(), ConfigError> {
         }
     }
     Ok(())
+}
+
+/// Split a value like `2gb` / `30d` into its numeric prefix and unit suffix.
+fn split_number_unit(t: &str) -> (&str, &str) {
+    let at = t.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(t.len());
+    let (num, unit) = t.split_at(at);
+    (num.trim(), unit.trim())
+}
+
+/// Parse a human byte size (`2GB`, `500mb`, `1048576`, `2 gib`) into bytes.
+/// Units are binary (1024-based). `0`/`off`/`none`/`unbounded` → `None`
+/// (no cap). Used for the `saver`-mode cache.
+fn parse_size(s: &str) -> Result<Option<u64>, String> {
+    let t = s.trim().to_ascii_lowercase();
+    if matches!(
+        t.as_str(),
+        "" | "0" | "off" | "none" | "unbounded" | "unlimited"
+    ) {
+        return Ok(None);
+    }
+    let (num, unit) = split_number_unit(&t);
+    let value: f64 = num.parse().map_err(|_| format!("not a number: {num:?}"))?;
+    if !value.is_finite() || value < 0.0 {
+        return Err(format!("not a positive size: {s:?}"));
+    }
+    let mult: u64 = match unit {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1 << 10,
+        "m" | "mb" | "mib" => 1 << 20,
+        "g" | "gb" | "gib" => 1 << 30,
+        "t" | "tb" | "tib" => 1 << 40,
+        other => return Err(format!("unknown size unit {other:?} (use B/KB/MB/GB/TB)")),
+    };
+    let bytes = (value * mult as f64) as u64;
+    // A positive-but-tiny value rounding to 0 bytes is a mistake, not "unbounded".
+    Ok(if bytes == 0 { None } else { Some(bytes) })
+}
+
+/// Parse a human duration (`30d`, `12h`, `45m`, `90s`, `2w`) into a `Duration`.
+/// `0`/`off`/`none`/`never` → `None` (no TTL). Used for `saver`-mode cache
+/// eviction. Bare numbers are seconds.
+fn parse_duration(s: &str) -> Result<Option<Duration>, String> {
+    let t = s.trim().to_ascii_lowercase();
+    if matches!(t.as_str(), "" | "0" | "off" | "none" | "never") {
+        return Ok(None);
+    }
+    let (num, unit) = split_number_unit(&t);
+    let value: u64 = num
+        .parse()
+        .map_err(|_| format!("not a whole number: {num:?}"))?;
+    let secs = match unit {
+        "" | "s" | "sec" | "secs" => value,
+        "m" | "min" | "mins" => value.saturating_mul(60),
+        "h" | "hr" | "hrs" => value.saturating_mul(3600),
+        "d" | "day" | "days" => value.saturating_mul(86_400),
+        "w" | "week" | "weeks" => value.saturating_mul(604_800),
+        other => return Err(format!("unknown duration unit {other:?} (use s/m/h/d/w)")),
+    };
+    Ok(if secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(secs))
+    })
 }
 
 #[cfg(test)]
@@ -361,6 +499,9 @@ mod tests {
             base_url: "http://localhost:8080".to_string(),
             default_cover_url: None,
             force_embedded_chapters: false,
+            storage_mode: StorageMode::Full,
+            cache_size_bytes: Some(DEFAULT_CACHE_SIZE_BYTES),
+            cache_ttl: None,
         };
         assert!(matches!(c.validate(), Err(ConfigError::LibraryNotFound(_))));
     }
@@ -378,6 +519,9 @@ mod tests {
             base_url: "http://localhost:8080".to_string(),
             default_cover_url: None,
             force_embedded_chapters: false,
+            storage_mode: StorageMode::Full,
+            cache_size_bytes: Some(DEFAULT_CACHE_SIZE_BYTES),
+            cache_ttl: None,
         };
         c.validate().unwrap();
         assert!(data.is_dir(), "data dir created");
@@ -399,6 +543,7 @@ mod tests {
             base_url: Some("https://toml.example/".to_string()),
             default_cover_url: Some("https://toml/cover.png".to_string()),
             force_embedded_chapters: Some(true),
+            ..Default::default()
         };
         let c = Config::resolve(&cli(None), &file).unwrap();
         assert_eq!(c.data_dir, PathBuf::from("/from-toml-data"));
@@ -409,6 +554,103 @@ mod tests {
             Some("https://toml/cover.png")
         );
         assert!(c.force_embedded_chapters);
+    }
+
+    #[test]
+    fn storage_mode_defaults_to_full_and_cache_defaults_apply() {
+        let c = Config::resolve(&cli(Some("/books")), &FileConfig::default()).unwrap();
+        assert_eq!(c.storage_mode, StorageMode::Full);
+        assert_eq!(c.cache_size_bytes, Some(DEFAULT_CACHE_SIZE_BYTES));
+        assert_eq!(c.cache_ttl, None);
+    }
+
+    #[test]
+    fn storage_knobs_resolve_from_cli_over_file() {
+        let file = FileConfig {
+            storage_mode: Some(StorageMode::Full),
+            cache_size: Some("1GB".to_string()),
+            cache_ttl: Some("7d".to_string()),
+            ..Default::default()
+        };
+        let mut cl = cli(Some("/books"));
+        cl.storage_mode = Some(StorageMode::Saver);
+        cl.cache_size = Some("512MB".to_string());
+        cl.cache_ttl = Some("30d".to_string());
+        let c = Config::resolve(&cl, &file).unwrap();
+        assert_eq!(c.storage_mode, StorageMode::Saver);
+        assert_eq!(c.cache_size_bytes, Some(512 * 1024 * 1024));
+        assert_eq!(c.cache_ttl, Some(Duration::from_secs(30 * 86_400)));
+    }
+
+    #[test]
+    fn storage_knobs_resolve_from_the_file_layer() {
+        let file = FileConfig {
+            storage_mode: Some(StorageMode::Saver),
+            cache_size: Some("off".to_string()),
+            cache_ttl: Some("12h".to_string()),
+            ..Default::default()
+        };
+        let c = Config::resolve(&cli(Some("/books")), &file).unwrap();
+        assert_eq!(c.storage_mode, StorageMode::Saver);
+        assert_eq!(c.cache_size_bytes, None); // "off" = unbounded
+        assert_eq!(c.cache_ttl, Some(Duration::from_secs(12 * 3600)));
+    }
+
+    #[test]
+    fn parse_size_handles_units_and_unbounded() {
+        assert_eq!(parse_size("2GB").unwrap(), Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(parse_size("500 mb").unwrap(), Some(500 * 1024 * 1024));
+        assert_eq!(parse_size("1048576").unwrap(), Some(1_048_576));
+        assert_eq!(parse_size("1.5gb").unwrap(), Some(1_610_612_736));
+        for unbounded in ["0", "off", "none", "unbounded", ""] {
+            assert_eq!(parse_size(unbounded).unwrap(), None, "{unbounded:?}");
+        }
+        assert!(parse_size("banana").is_err());
+        assert!(parse_size("10 zb").is_err());
+        assert!(parse_size("-5gb").is_err(), "negative size rejected");
+    }
+
+    #[test]
+    fn parse_duration_handles_units_and_off() {
+        assert_eq!(
+            parse_duration("30d").unwrap(),
+            Some(Duration::from_secs(2_592_000))
+        );
+        assert_eq!(
+            parse_duration("12h").unwrap(),
+            Some(Duration::from_secs(43_200))
+        );
+        assert_eq!(parse_duration("90").unwrap(), Some(Duration::from_secs(90)));
+        assert_eq!(
+            parse_duration("2w").unwrap(),
+            Some(Duration::from_secs(1_209_600))
+        );
+        for off in ["0", "off", "none", "never", ""] {
+            assert_eq!(parse_duration(off).unwrap(), None, "{off:?}");
+        }
+        assert!(parse_duration("5 fortnights").is_err());
+        assert!(parse_duration("1.5h").is_err()); // whole numbers only
+        assert_eq!(
+            parse_duration("0h").unwrap(),
+            None,
+            "zero with a unit is no-TTL"
+        );
+    }
+
+    #[test]
+    fn bad_cache_size_and_ttl_are_config_errors() {
+        let mut cl = cli(Some("/books"));
+        cl.cache_size = Some("lots".to_string());
+        assert!(matches!(
+            Config::resolve(&cl, &FileConfig::default()),
+            Err(ConfigError::BadCacheSize { .. })
+        ));
+        let mut cl = cli(Some("/books"));
+        cl.cache_ttl = Some("soon".to_string());
+        assert!(matches!(
+            Config::resolve(&cl, &FileConfig::default()),
+            Err(ConfigError::BadCacheTtl { .. })
+        ));
     }
 
     #[test]
