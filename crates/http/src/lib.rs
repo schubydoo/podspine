@@ -889,4 +889,37 @@ mod tests {
         assert_eq!(numeric_files(&bk), 1, "nothing evicted when unbounded");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn evict_tolerates_unreadable_paths() {
+        // A missing books dir: the top-level read_dir fails -> clean no-op.
+        evict(
+            FsPath::new("/no/such/podspine/books"),
+            Some(1),
+            None,
+            FsPath::new("/no/such/keep"),
+        );
+
+        // A non-directory entry directly under books/ (not a book dir): reading
+        // its "contents" fails and it's skipped, while real book dirs still get
+        // processed under the cap.
+        let dir = std::env::temp_dir().join("podspine-evict-badentry");
+        let _ = std::fs::remove_dir_all(&dir);
+        let books = dir.join("books");
+        std::fs::create_dir_all(&books).unwrap();
+        std::fs::write(books.join("stray-file"), b"x").unwrap(); // where a book dir is expected
+        let bk = books.join("b1");
+        touch(&bk.join("001.m4a"), 100);
+        touch(&bk.join("002.m4a"), 100);
+        let keep = bk.join("002.m4a");
+
+        evict(&books, Some(100), None, &keep); // cap forces eviction
+
+        assert!(keep.exists(), "real book dirs are still processed");
+        assert!(
+            books.join("stray-file").exists(),
+            "non-directory entries under books/ are skipped, not touched"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
