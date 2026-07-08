@@ -14,10 +14,12 @@
 
 {# The bare site_name ("Podspine", 8 chars) is too short for SERP/social. Give
    the homepage a descriptive ~57-char title; subpages keep Material's default
-   "<page> - <site_name>". Kept in sync with the homepage social title below. #}
+   "<page> - <site_name>". Defined once here and reused by both <title> and the
+   homepage social title below. #}
+{%- set _homepage_title = "Podspine — turn audiobooks into per-chapter podcast feeds" -%}
 {% block htmltitle %}
   {% if page and page.is_homepage %}
-    <title>Podspine — turn audiobooks into per-chapter podcast feeds</title>
+    <title>{{ _homepage_title }}</title>
   {% else %}
     {{ super() }}
   {% endif %}
@@ -28,7 +30,7 @@
   {% set _base = config.site_url[:-1] if config.site_url.endswith('/') else config.site_url %}
   {% set social_image = _base ~ "/assets/social-card.png" %}
   {% if page and page.is_homepage %}
-    {% set social_title = "Podspine — turn audiobooks into per-chapter podcast feeds" %}
+    {% set social_title = _homepage_title %}
   {% elif page and page.title %}
     {% set social_title = page.title ~ " · " ~ config.site_name %}
   {% else %}
