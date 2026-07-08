@@ -3,15 +3,34 @@
 <!--
   Adds Open Graph / Twitter card meta so links to the docs site preview with the
   Podspine social card. The image lives under docs/assets/ (bundled into every
-  built version) and is referenced at the `latest` mike alias — the versioned
-  paths are the only ones that actually exist on gh-pages; the site root is just
-  a redirect, so `config.site_url + assets/...` would 404.
+  built version).
+
+  mike rewrites config.site_url to the *versioned* base at deploy time
+  (e.g. https://schubydoo.github.io/podspine/latest), so the card just lives at
+  "<site_url>/assets/social-card.png". We must NOT hardcode "latest/" — that
+  would double-stack into ".../latestlatest/...". Normalise the trailing slash
+  (mike drops it; the configured root keeps it) before appending.
 -->
+
+{# The bare site_name ("Podspine", 8 chars) is too short for SERP/social. Give
+   the homepage a descriptive ~57-char title; subpages keep Material's default
+   "<page> - <site_name>". Defined once here and reused by both <title> and the
+   homepage social title below. #}
+{%- set _homepage_title = "Podspine — turn audiobooks into per-chapter podcast feeds" -%}
+{% block htmltitle %}
+  {% if page and page.is_homepage %}
+    <title>{{ _homepage_title }}</title>
+  {% else %}
+    {{ super() }}
+  {% endif %}
+{% endblock %}
+
 {% block extrahead %}
   {{ super() }}
-  {% set social_image = config.site_url ~ "latest/assets/social-card.png" %}
+  {% set _base = config.site_url[:-1] if config.site_url.endswith('/') else config.site_url %}
+  {% set social_image = _base ~ "/assets/social-card.png" %}
   {% if page and page.is_homepage %}
-    {% set social_title = config.site_name %}
+    {% set social_title = _homepage_title %}
   {% elif page and page.title %}
     {% set social_title = page.title ~ " · " ~ config.site_name %}
   {% else %}
