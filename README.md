@@ -1,6 +1,11 @@
-# Podspine
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo/logo-white.svg">
+    <img alt="Podspine" src="assets/logo/logo-full.svg" width="360">
+  </picture>
+</p>
 
-**Turn your audiobook files into per-chapter podcast feeds any podcast app can play.**
+<p align="center"><strong>Turn your audiobook files into per-chapter podcast feeds any podcast app can play.</strong></p>
 
 Podspine is a small self-hosted server. Point it at a folder of audiobooks and it
 gives each book its own podcast RSS feed — one episode per chapter, in the right

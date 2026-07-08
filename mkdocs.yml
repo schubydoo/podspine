@@ -12,6 +12,8 @@ docs_dir: docs
 
 theme:
   name: material
+  logo: assets/logo-mark.svg
+  favicon: assets/favicon.svg
   icon:
     repo: fontawesome/brands/github
   features:
