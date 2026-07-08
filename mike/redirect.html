@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <!--
+    Custom `mike set-default` redirect stub for the site root
+    (https://schubydoo.github.io/podspine/). The default mike template is a bare
+    "Redirecting" page with no metadata, so sharing the root URL previews as
+    "Redirecting" with no image — social scrapers read this stub and don't follow
+    the JS/meta redirect to /latest/. Mirror the latest page's title + social card
+    here so the bare root previews correctly. Wired in via docs.yml `set-default
+    --template mike/redirect.html`. URLs are absolute + point at the `latest`
+    alias, which always resolves to the newest release.
+  -->
+  <title>Podspine — turn audiobooks into per-chapter podcast feeds</title>
+  <link rel="canonical" href="https://schubydoo.github.io/podspine/latest/">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Podspine">
+  <meta property="og:title" content="Podspine — turn audiobooks into per-chapter podcast feeds">
+  <meta property="og:description" content="Turn your audiobook files into per-chapter podcast feeds any podcast app can play.">
+  <meta property="og:image" content="https://schubydoo.github.io/podspine/latest/assets/og-card.png">
+  <meta property="og:url" content="https://schubydoo.github.io/podspine/latest/">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Podspine — turn audiobooks into per-chapter podcast feeds">
+  <meta name="twitter:description" content="Turn your audiobook files into per-chapter podcast feeds any podcast app can play.">
+  <meta name="twitter:image" content="https://schubydoo.github.io/podspine/latest/assets/og-card.png">
+  <noscript>
+    <meta http-equiv="refresh" content="1; url={{href}}" />
+  </noscript>
+  <script>
+    window.location.replace(
+      "{{href}}" + window.location.search + window.location.hash
+    );
+  </script>
+</head>
+<body>
+  Redirecting to <a href="{{href}}">{{href}}</a>…
+</body>
+</html>
