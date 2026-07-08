@@ -28,7 +28,7 @@
 {% block extrahead %}
   {{ super() }}
   {% set _base = config.site_url[:-1] if config.site_url.endswith('/') else config.site_url %}
-  {% set social_image = _base ~ "/assets/social-card.png" %}
+  {% set social_image = _base ~ "/assets/og-card.png" %}
   {% if page and page.is_homepage %}
     {% set social_title = _homepage_title %}
   {% elif page and page.title %}
