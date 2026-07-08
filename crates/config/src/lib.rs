@@ -607,6 +607,7 @@ mod tests {
         }
         assert!(parse_size("banana").is_err());
         assert!(parse_size("10 zb").is_err());
+        assert!(parse_size("-5gb").is_err(), "negative size rejected");
     }
 
     #[test]
@@ -629,6 +630,11 @@ mod tests {
         }
         assert!(parse_duration("5 fortnights").is_err());
         assert!(parse_duration("1.5h").is_err()); // whole numbers only
+        assert_eq!(
+            parse_duration("0h").unwrap(),
+            None,
+            "zero with a unit is no-TTL"
+        );
     }
 
     #[test]

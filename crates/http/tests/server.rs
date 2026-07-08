@@ -283,6 +283,49 @@ async fn saver_cache_evicts_over_the_size_cap() {
 }
 
 #[tokio::test]
+async fn full_mode_missing_file_is_a_404_not_a_regeneration() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+    let dir = std::env::temp_dir().join("podspine-http-fullmiss");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let data = dir.join("data");
+
+    let index = Index::open_in_memory().unwrap();
+    let input = synth_three_chapters(&dir);
+    let book = scan_book(&input, &data, &index).unwrap(); // full mode: files kept
+    let feed_id = book.feed_id.clone();
+
+    // Simulate a lost split file. In `full` mode this must 404, never regenerate.
+    let eps = index.episodes_for_book(&book.id).unwrap();
+    std::fs::remove_file(&eps[0].file_path).unwrap();
+
+    let state = AppState::new(
+        index,
+        "http://test".to_string(),
+        &data,
+        None,
+        false,
+        None,
+        None,
+    );
+    let app = router(state);
+    let resp = app
+        .oneshot(
+            Request::get(format!("/audio/{feed_id}/1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn regenerate_rotates_the_capability() {
     if !ffmpeg_available() {
         eprintln!("skipping: ffmpeg not available");

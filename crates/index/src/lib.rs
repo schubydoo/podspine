@@ -144,7 +144,32 @@ impl Index {
         // no-op for `:memory:` databases. (Task 4.3.)
         let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
         conn.execute_batch(SCHEMA)?;
+        Self::migrate(&conn)?;
         Ok(Self { conn })
+    }
+
+    /// Additive migrations for databases created by an older Podspine. Pre-v1 we
+    /// don't keep a full migration path, but silently breaking an existing DB at
+    /// request time is worse than a cheap `ADD COLUMN` here: `CREATE TABLE IF NOT
+    /// EXISTS` won't add a column to a table that already exists, so an older
+    /// `episode` table would be missing `start_sec` and every audio/feed query
+    /// would fail mid-request. `ADD COLUMN` preserves all rows (and the
+    /// capability `feed_id`s — a drop+recreate would rotate every feed URL).
+    /// Existing episodes get `start_sec = 0`; that value is only read for
+    /// `saver`-mode regeneration and is corrected on the next re-scan.
+    fn migrate(conn: &Connection) -> Result<(), IndexError> {
+        let has_start_sec: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('episode') WHERE name = 'start_sec'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_start_sec == 0 {
+            conn.execute(
+                "ALTER TABLE episode ADD COLUMN start_sec REAL NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        Ok(())
     }
 
     /// Insert or update a book by `id` (idempotent — no duplicate rows).
@@ -449,6 +474,61 @@ mod tests {
         // Reopen the same file: the row (and schema) survived.
         let reopened = Index::open(&db).unwrap();
         assert_eq!(reopened.get_book("b1").unwrap().unwrap().title, "A Book");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_migrates_a_pre_start_sec_database() {
+        // Simulate a database created before `episode.start_sec` existed.
+        let dir = std::env::temp_dir().join("podspine-index-migrate");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("old.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE book (
+                    id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, feed_id TEXT NOT NULL UNIQUE,
+                    title TEXT NOT NULL, author TEXT, cover_path TEXT, source_path TEXT NOT NULL,
+                    source_mtime INTEGER NOT NULL, status TEXT NOT NULL);
+                 CREATE TABLE episode (
+                    guid TEXT PRIMARY KEY, book_id TEXT NOT NULL, idx INTEGER NOT NULL,
+                    title TEXT NOT NULL, file_path TEXT NOT NULL, byte_length INTEGER NOT NULL,
+                    duration_sec REAL NOT NULL, pubdate_epoch INTEGER NOT NULL);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO book VALUES ('b1','a-book','cap-b1','A Book',NULL,NULL,'/lib/b1.m4b',1,'ready')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO episode VALUES ('b1-0','b1',0,'One','/data/b1/001.m4a',1234,60.0,100)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Opening runs the additive migration: start_sec is added (default 0),
+        // existing rows and the capability feed_id survive.
+        let idx = Index::open(&db).unwrap();
+        let eps = idx.episodes_for_book("b1").unwrap();
+        assert_eq!(eps.len(), 1);
+        assert_eq!(
+            eps[0].start_sec, 0.0,
+            "migrated rows default to start_sec 0"
+        );
+        assert_eq!(eps[0].byte_length, 1234);
+        assert_eq!(
+            idx.get_book_by_feed_id("cap-b1").unwrap().unwrap().id,
+            "b1",
+            "capability feed_id preserved across migration"
+        );
+
+        // Idempotent: reopening an already-migrated DB is a no-op.
+        drop(idx);
+        assert!(Index::open(&db).is_ok());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
