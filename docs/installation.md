@@ -9,7 +9,7 @@ Pick whichever fits your setup:
 | Method | Best for | Command |
 |---|---|---|
 | [Docker](#docker) | Servers / homelab (recommended) | `docker run … ghcr.io/schubydoo/podspine` |
-| [Install script](#linux--macos-script) | Linux / macOS, no package manager | `curl … \| bash` |
+| [Install script](#linux-macos-script) | Linux / macOS, no package manager | `curl … \| bash` |
 | [PowerShell](#windows-powershell) | Windows | `irm … \| iex` |
 | [Homebrew](#homebrew) | macOS / Linux | `brew install schubydoo/podspine/podspine` |
 | [Scoop](#scoop-windows) | Windows | `scoop install podspine` |
