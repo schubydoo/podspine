@@ -1,9 +1,9 @@
-<p align="center">
+<h1 align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/logo/logo-white.svg">
     <img alt="Podspine" src="assets/logo/logo-full.svg" width="360">
   </picture>
-</p>
+</h1>
 
 <p align="center"><strong>Turn your audiobook files into per-chapter podcast feeds any podcast app can play.</strong></p>
 
