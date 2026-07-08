@@ -12,6 +12,7 @@ docs_dir: docs
 
 theme:
   name: material
+  custom_dir: overrides
   logo: assets/logo-mark.svg
   favicon: assets/favicon.svg
   icon:
