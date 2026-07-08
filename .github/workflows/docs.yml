@@ -12,7 +12,11 @@ name: Docs
 # NOTE: action refs are pinned to full commit SHAs (repo Actions policy + Scorecard);
 # pip caching is deliberately NOT used (cache-poisoning vector in a publishing
 # workflow — zizmor), and the deploy job pushes via an explicit tokened remote
-# rather than persisted checkout credentials (zizmor artipacked).
+# rather than persisted checkout credentials (zizmor artipacked). Python deps are
+# hash-pinned: docs/requirements.txt is a pip-compile lockfile installed with
+# --require-hashes, so every transitive package is verified (Scorecard
+# Pinned-Dependencies). Bump via docs/requirements.in + pip-compile (Renovate
+# regenerates it).
 
 on:
   push:
@@ -51,7 +55,7 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.x"
-      - run: pip install -r docs/requirements.txt
+      - run: pip install --require-hashes -r docs/requirements.txt
       - run: mkdocs build --strict
 
   deploy:
@@ -76,7 +80,7 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.x"
-      - run: pip install -r docs/requirements.txt
+      - run: pip install --require-hashes -r docs/requirements.txt
       - name: Configure git + push auth
         env:
           GH_TOKEN: ${{ github.token }}
