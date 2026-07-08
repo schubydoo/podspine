@@ -54,12 +54,10 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Install ffmpeg (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
-      - name: Install ffmpeg (macOS)
-        if: runner.os == 'macOS'
-        run: brew install ffmpeg
+      # Real ffmpeg, cached static build on Linux (seconds vs. apt pulling the
+      # whole libav* tree); see .github/actions/setup-ffmpeg for the why.
+      - name: Set up ffmpeg
+        uses: ./.github/actions/setup-ffmpeg
       - name: Test
         run: cargo test --workspace --all-features
 
@@ -76,8 +74,8 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Install ffmpeg
-        run: choco install ffmpeg -y
+      - name: Set up ffmpeg
+        uses: ./.github/actions/setup-ffmpeg
       - name: Test
         run: cargo test --workspace --all-features
 
@@ -95,8 +93,8 @@ jobs:
       - uses: taiki-e/install-action@50414676f9f5d50a65992c6dd2ed02641263226c # v2
         with:
           tool: cargo-llvm-cov
-      - name: Install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Set up ffmpeg
+        uses: ./.github/actions/setup-ffmpeg
       # Enforce the line floor (the real gate; baseline ~94%) and emit lcov.
       # cargo-llvm-cov writes lcov.info before the threshold check, so the upload
       # below still runs on a floor failure — surfacing a drop when it matters.

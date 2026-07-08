@@ -1,0 +1,74 @@
+name: Set up ffmpeg
+description: >-
+  Put real ffmpeg + ffprobe on PATH for the test/coverage jobs. On Linux a
+  pinned, sha256-verified John Van Sickle static build is cached across runs
+  (restore is seconds vs. apt pulling the whole libav* tree); macOS and the
+  informational Windows job fall back to their package managers. ffmpeg stays
+  real, so the split/probe/scan correctness tests are unaffected.
+
+# Why a local composite action rather than a published one (e.g.
+# AnimMouse/setup-ffmpeg): the repo ruleset requires every action — including
+# ones nested inside a composite action — to be pinned to a full commit SHA.
+# Published setup-ffmpeg actions call actions/cache and tool-cache by version
+# tag internally, which we can't pin, so they're rejected. Vendoring the logic
+# here keeps every ref under our control.
+#
+# Why ffmpeg 6.0.1 (not the newest 8.x): it's a deliberate *minimum-version
+# floor*. John Van Sickle's old-releases archive is the only source that is both
+# permanent AND immutable (BtbN's dated builds get pruned; its `latest` tag is
+# mutable, so a pinned hash would drift). Every ffmpeg flag Podspine uses is
+# stable across 4→8, and distro users (Debian/Ubuntu LTS) often run older
+# ffmpeg — proving it works on 6.0.1 covers them, and newer ffmpeg is
+# backward-compatible for this flag surface. Bump the version + FFMPEG_SHA256 +
+# cache key together to move the floor.
+
+runs:
+  using: composite
+  steps:
+    - name: Restore cached static ffmpeg (Linux)
+      if: runner.os == 'Linux'
+      id: cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/podspine-ffmpeg/bin
+        key: ffmpeg-static-6.0.1-linux64-jvs
+
+    - name: Download static ffmpeg (Linux)
+      if: runner.os == 'Linux' && steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        FFMPEG_URL: https://johnvansickle.com/ffmpeg/old-releases/ffmpeg-6.0.1-amd64-static.tar.xz
+        FFMPEG_SHA256: 28268bf402f1083833ea269331587f60a242848880073be8016501d864bd07a5
+      run: |
+        set -euo pipefail
+        tmp="$(mktemp -d)"
+        curl -fsSL --retry 3 -o "$tmp/ffmpeg.tar.xz" "$FFMPEG_URL"
+        echo "${FFMPEG_SHA256}  ${tmp}/ffmpeg.tar.xz" | sha256sum -c -
+        dest="$HOME/.cache/podspine-ffmpeg/bin"
+        mkdir -p "$dest"
+        # Extract just the two binaries from the versioned top-level dir.
+        tar -xJf "$tmp/ffmpeg.tar.xz" --strip-components=1 -C "$dest" \
+          --wildcards '*/ffmpeg' '*/ffprobe'
+        rm -rf "$tmp"
+
+    - name: Add ffmpeg to PATH (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      # $dest is a hardcoded constant (no untrusted input), so this GITHUB_PATH
+      # write can't be influenced by an attacker. Podspine runs `ffmpeg` via a
+      # PATH lookup, and GITHUB_PATH is the sanctioned way to extend PATH.
+      run: | # zizmor: ignore[github-env]
+        set -euo pipefail
+        dest="$HOME/.cache/podspine-ffmpeg/bin"
+        chmod +x "$dest/ffmpeg" "$dest/ffprobe"
+        echo "$dest" >> "$GITHUB_PATH"
+
+    - name: Install ffmpeg (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: brew install ffmpeg
+
+    - name: Install ffmpeg (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: choco install ffmpeg -y
