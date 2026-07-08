@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo-mark.svg" alt="" width="96">
+</p>
+
 # Podspine
 
 **Turn your audiobook files into per-chapter podcast feeds any podcast app can play.**
