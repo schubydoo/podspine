@@ -25,6 +25,15 @@
   {% endif %}
 {% endblock %}
 
+{# Version-warning banner. Material renders it (via extra.version.provider: mike)
+   on any version that is NOT the `latest` alias — i.e. the rolling `dev`/main
+   build or a superseded release — so readers who land on unreleased docs know
+   they're ahead of what they can install. #}
+{% block outdated %}
+  You're reading docs for an unreleased or older version of Podspine.
+  <a href="{{ '../' ~ base_url }}"><strong>Go to the latest release →</strong></a>
+{% endblock %}
+
 {% block extrahead %}
   {{ super() }}
   {% set _base = config.site_url[:-1] if config.site_url.endswith('/') else config.site_url %}
