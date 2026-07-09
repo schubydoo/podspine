@@ -82,7 +82,11 @@ depends on whether it is a whole source file or a sub-range of a container:
   is **served in place** from the read-only library (Sprint 6.2). Its
   `episode.source_path` records the library file; nothing is copied under
   `<data_dir>`, and the audio handler streams it (with Range) after asserting the
-  path stays under the canonical library root.
+  path stays under the canonical library root. If it's a non-faststart mp4
+  (`moov` after `mdat`, flagged `episode.needs_faststart` at ingest) and
+  `PODSPINE_REMUX_NON_FASTSTART` is on, the handler instead serves a faststart
+  **remux** regenerated on demand into the cache (`file_path != source_path`) —
+  Sprint 6.3; otherwise it logs a callout and serves in place.
 - **Chaptered episode** — a sub-range of a container — must be **extracted** under
   `<data_dir>` (a raw byte range of an `.m4b` isn't a standalone file). In `full`
   mode (default) every chapter is pre-split at ingest and kept; in `saver` mode

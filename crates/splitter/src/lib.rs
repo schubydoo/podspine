@@ -393,6 +393,77 @@ pub fn split_chapter(
     })
 }
 
+/// Remux a whole (chapterless) MP4 to **faststart** — stream-copied, `moov`
+/// relocated to the front — so podcast clients seek immediately. Serves a
+/// non-faststart whole-file episode from the cache when `PODSPINE_REMUX_NON_FASTSTART`
+/// is on (Sprint 6.3); the source is never touched. Like [`split_chapter`] it is a
+/// deterministic `-c copy`, so the output size is a stable `enclosure length`.
+/// `idx`/`out_ext` name the cache file (`NNN.<ext>`); `duration_sec` is the whole
+/// file's duration (the enclosure duration, carried through unchanged).
+pub fn remux_faststart(
+    input: &Path,
+    out_dir: &Path,
+    idx: usize,
+    out_ext: &str,
+    duration_sec: f64,
+) -> Result<SplitEpisode, SplitError> {
+    let out_path = out_dir.join(format!("{:03}.{out_ext}", idx + 1));
+    let args = build_remux_args(input, &out_path);
+
+    match run_ffmpeg(&args) {
+        Ok(()) => {}
+        Err(RunError::Spawn(e)) => return Err(SplitError::Spawn(e)),
+        Err(RunError::Failed { code, stderr }) => {
+            return Err(SplitError::Ffmpeg { idx, code, stderr });
+        }
+        Err(RunError::TimedOut) => return Err(SplitError::TimedOut { idx }),
+    }
+
+    // enclosure length MUST come from the real file, never prorated.
+    let byte_length = fs::metadata(&out_path)
+        .map_err(|source| SplitError::Metadata {
+            path: out_path.clone(),
+            source,
+        })?
+        .len();
+    if byte_length == 0 {
+        return Err(SplitError::OutputMissing {
+            idx,
+            path: out_path,
+        });
+    }
+
+    Ok(SplitEpisode {
+        idx,
+        path: out_path,
+        byte_length,
+        duration_sec,
+    })
+}
+
+/// argv for a whole-file faststart remux: keep audio only, drop chapters, copy
+/// codecs (no re-encode), relocate `moov`. No `-ss`/`-t` — the whole file. An
+/// argument vector, never a shell string (untrusted paths).
+fn build_remux_args(input: &Path, output: &Path) -> Vec<OsString> {
+    vec![
+        "-nostdin".into(),
+        "-y".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-i".into(),
+        input.as_os_str().to_os_string(),
+        "-map".into(),
+        "0:a:0".into(),
+        "-map_chapters".into(),
+        "-1".into(),
+        "-c".into(),
+        "copy".into(),
+        "-movflags".into(),
+        "+faststart".into(),
+        output.as_os_str().to_os_string(),
+    ]
+}
+
 /// Build the exact ffmpeg argv for a stream-copy chapter cut.
 ///
 /// Factored out so the ordering invariants (`-ss` before `-i`, `-t` not `-to`,
@@ -526,6 +597,27 @@ mod tests {
     }
 
     #[test]
+    fn remux_args_are_whole_file_copy_faststart() {
+        let args: Vec<String> = build_remux_args(Path::new("in.m4b"), Path::new("out/001.m4b"))
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let pair = |a: &str, b: &str| args.windows(2).any(|w| w[0] == a && w[1] == b);
+        assert!(pair("-c", "copy"), "stream copy, no re-encode");
+        assert!(
+            pair("-movflags", "+faststart"),
+            "relocates moov to the front"
+        );
+        assert!(pair("-map", "0:a:0"), "audio only");
+        assert!(pair("-map_chapters", "-1"), "drops chapters");
+        assert!(
+            !args.iter().any(|a| a == "-ss" || a == "-t"),
+            "whole file — no seek/duration cut"
+        );
+        assert_eq!(args.last().unwrap(), "out/001.m4b", "output path is last");
+    }
+
+    #[test]
     fn cover_args_copy_first_video_stream_to_named_output() {
         let args: Vec<String> = build_cover_args(Path::new("in.m4b"), Path::new("out/cover.jpg"))
             .iter()
@@ -649,6 +741,71 @@ mod tests {
         let err = split_book(&bad, &dir.join("out"), std::slice::from_ref(&ch), "m4a")
             .expect_err("bad input must fail");
         assert!(matches!(err, SplitError::Ffmpeg { idx: 0, .. }), "{err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remux_faststart_produces_a_deterministic_faststart_file() {
+        if !have_ffmpeg() {
+            eprintln!("skipping: ffmpeg not available");
+            return;
+        }
+        let dir = std::env::temp_dir().join("podspine-remux-ft");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // ffmpeg's mp4 muxer writes `moov` at the END unless +faststart is asked,
+        // so a plain encode gives us a non-faststart source.
+        let src = dir.join("src.m4a");
+        let ok = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=300:duration=3",
+                "-c:a",
+                "aac",
+            ])
+            .arg(&src)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            eprintln!("skipping: no aac encoder");
+            return;
+        }
+
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let ep = remux_faststart(&src, &out, 0, "m4a", 3.0).unwrap();
+        assert_eq!(ep.idx, 0);
+        assert_eq!(ep.duration_sec, 3.0);
+        assert!(ep.byte_length > 0);
+        assert_eq!(ep.path, out.join("001.m4a"));
+
+        // The output is faststart: `moov` now precedes `mdat` in the byte stream.
+        let find = |hay: &[u8], n: &[u8]| hay.windows(n.len()).position(|w| w == n);
+        let bytes = std::fs::read(&ep.path).unwrap();
+        let (moov, mdat) = (find(&bytes, b"moov"), find(&bytes, b"mdat"));
+        assert!(
+            moov.is_some() && mdat.is_some() && moov < mdat,
+            "moov must precede mdat (faststart)"
+        );
+
+        // Byte-deterministic: a second remux is identical, so the recorded
+        // enclosure length stays valid across cache eviction + regeneration.
+        let out2 = dir.join("out2");
+        std::fs::create_dir_all(&out2).unwrap();
+        let ep2 = remux_faststart(&src, &out2, 0, "m4a", 3.0).unwrap();
+        assert_eq!(ep.byte_length, ep2.byte_length);
+        assert_eq!(
+            std::fs::read(&ep.path).unwrap(),
+            std::fs::read(&ep2.path).unwrap(),
+            "remux is byte-identical run-to-run"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -33,6 +33,7 @@ async fn main() -> Result<()> {
         &index,
         config.force_embedded_chapters,
         saver,
+        config.remux_non_faststart,
     );
 
     // Auto-refresh: a background thread (its own WAL index connection) re-runs the
@@ -43,6 +44,7 @@ async fn main() -> Result<()> {
         db_path,
         config.force_embedded_chapters,
         saver,
+        config.remux_non_faststart,
     );
 
     let state = AppState::new(

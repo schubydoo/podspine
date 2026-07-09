@@ -61,7 +61,8 @@ CREATE TABLE IF NOT EXISTS episode (
     duration_sec  REAL NOT NULL,
     start_sec     REAL NOT NULL,
     pubdate_epoch INTEGER NOT NULL,
-    source_path   TEXT NOT NULL DEFAULT ''
+    source_path   TEXT NOT NULL DEFAULT '',
+    needs_faststart INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS episode_book_idx ON episode(book_id, idx);
 ";
@@ -101,15 +102,21 @@ pub struct EpisodeRow {
     pub idx: i64,
     /// Episode title.
     pub title: String,
-    /// Path to the served audio file. For an extracted (chaptered) episode this
-    /// is the split under `<data_dir>`; for a whole-file episode served in place
-    /// it is the original file in the read-only library (same as `source_path`).
+    /// Path to the served audio file. Extracted (chaptered) episode → the split
+    /// under `<data_dir>`. Whole-file episode served in place → the original
+    /// library file (`== source_path`). Whole-file episode remuxed to faststart
+    /// (Sprint 6.3) → the cache file under `<data_dir>` (`!= source_path`).
     pub file_path: String,
-    /// When non-empty, the episode IS a whole source file streamed in place from
-    /// the library (MP3-folder track, or a chapterless single file) — nothing is
-    /// copied under `<data_dir>`. Empty = an extracted sub-range served from
-    /// `<data_dir>` (`full`/`saver`). See TAD §5.3.
+    /// When non-empty, the episode IS a whole source file (MP3-folder track, or a
+    /// chapterless single file). `file_path == source_path` ⇒ streamed in place
+    /// from the library; `file_path != source_path` ⇒ remuxed to faststart and
+    /// cached under `<data_dir>`. Empty ⇒ an extracted sub-range (`full`/`saver`).
+    /// See TAD §5.3.
     pub source_path: String,
+    /// `true` when the source is a non-faststart MP4 (`moov` after `mdat`), so a
+    /// whole-file serve seeks slowly. Recorded at ingest; drives the callout and,
+    /// with `PODSPINE_REMUX_NON_FASTSTART` on, the remux-vs-in-place decision.
+    pub needs_faststart: bool,
     /// Real output size in bytes.
     pub byte_length: i64,
     /// Duration in seconds.
@@ -191,6 +198,19 @@ impl Index {
                 [],
             )?;
         }
+        // `needs_faststart` (faststart detection, Sprint 6.3). Existing rows
+        // default to `0`; a re-scan re-detects and records it per whole-file mp4.
+        let has_needs_faststart: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('episode') WHERE name = 'needs_faststart'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_needs_faststart == 0 {
+            conn.execute(
+                "ALTER TABLE episode ADD COLUMN needs_faststart INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -228,13 +248,14 @@ impl Index {
     pub fn upsert_episode(&self, e: &EpisodeRow) -> Result<(), IndexError> {
         self.conn.execute(
             "INSERT INTO episode
-               (guid, book_id, idx, title, file_path, byte_length, duration_sec, start_sec, pubdate_epoch, source_path)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+               (guid, book_id, idx, title, file_path, byte_length, duration_sec, start_sec, pubdate_epoch, source_path, needs_faststart)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(guid) DO UPDATE SET
                book_id=excluded.book_id, idx=excluded.idx, title=excluded.title,
                file_path=excluded.file_path, byte_length=excluded.byte_length,
                duration_sec=excluded.duration_sec, start_sec=excluded.start_sec,
-               pubdate_epoch=excluded.pubdate_epoch, source_path=excluded.source_path",
+               pubdate_epoch=excluded.pubdate_epoch, source_path=excluded.source_path,
+               needs_faststart=excluded.needs_faststart",
             params![
                 e.guid,
                 e.book_id,
@@ -246,6 +267,7 @@ impl Index {
                 e.start_sec,
                 e.pubdate_epoch,
                 e.source_path,
+                e.needs_faststart,
             ],
         )?;
         Ok(())
@@ -290,7 +312,7 @@ impl Index {
     /// Episodes for a book, ordered by chapter index (chapter 1 first).
     pub fn episodes_for_book(&self, book_id: &str) -> Result<Vec<EpisodeRow>, IndexError> {
         let mut stmt = self.conn.prepare(
-            "SELECT guid, book_id, idx, title, file_path, byte_length, duration_sec, start_sec, pubdate_epoch, source_path
+            "SELECT guid, book_id, idx, title, file_path, byte_length, duration_sec, start_sec, pubdate_epoch, source_path, needs_faststart
              FROM episode WHERE book_id = ?1 ORDER BY idx",
         )?;
         let rows = stmt.query_map([book_id], episode_from_row)?;
@@ -337,7 +359,7 @@ impl Index {
         Ok(self
             .conn
             .query_row(
-                "SELECT guid, book_id, idx, title, file_path, byte_length, duration_sec, start_sec, pubdate_epoch, source_path
+                "SELECT guid, book_id, idx, title, file_path, byte_length, duration_sec, start_sec, pubdate_epoch, source_path, needs_faststart
                  FROM episode WHERE guid = ?1",
                 [guid],
                 episode_from_row,
@@ -372,6 +394,7 @@ fn episode_from_row(row: &Row) -> rusqlite::Result<EpisodeRow> {
         start_sec: row.get(7)?,
         pubdate_epoch: row.get(8)?,
         source_path: row.get(9)?,
+        needs_faststart: row.get(10)?,
     })
 }
 
@@ -401,6 +424,7 @@ mod tests {
             title: format!("Chapter {}", idx + 1),
             file_path: format!("/data/books/{book_id}/{:03}.m4a", idx + 1),
             source_path: String::new(),
+            needs_faststart: false,
             byte_length: 1000 + idx,
             duration_sec: 60.0 * (idx as f64 + 1.0),
             start_sec: 60.0 * (idx as f64),
@@ -547,6 +571,10 @@ mod tests {
         assert_eq!(
             eps[0].source_path, "",
             "migrated rows default to empty source_path (extracted, not in-place)"
+        );
+        assert!(
+            !eps[0].needs_faststart,
+            "migrated rows default to needs_faststart = false"
         );
         assert_eq!(
             idx.get_book_by_feed_id("cap-b1").unwrap().unwrap().id,

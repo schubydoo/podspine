@@ -114,6 +114,11 @@ disk (not ingest time) for a small first-play delay. So budget extra space for
 chaptered libraries; whole-file libraries cost only their index and covers. Full
 details: **[storage mode](docs/DEPLOYMENT.md#storage-mode-full-vs-saver)**.
 
+A whole-file `.m4a`/`.m4b` that isn't "faststart" plays fine but seeks slowly;
+Podspine flags it at ingest, and `PODSPINE_REMUX_NON_FASTSTART=true` will remux it
+to faststart on demand (cache-managed, no re-encode) — see
+**[faststart](docs/DEPLOYMENT.md#faststart-for-whole-file-mp4)**.
+
 Each book's feed lives at an unguessable **capability URL** — `/feed/{feed_id}.xml`,
 with `/audio/{feed_id}/{n}` (episode audio, HTTP Range) and `/cover/{feed_id}`. The
 browse UI (`/`, `/book/{slug}`) enumerates your library, so keep it on the LAN or
