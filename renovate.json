@@ -6,6 +6,7 @@
     "helpers:pinGitHubActionDigests"
   ],
   "labels": ["dependencies"],
+  "schedule": ["before 6am on monday"],
   "lockFileMaintenance": {
     "description": "Keep flake.lock (nixpkgs/flake-utils) fresh weekly.",
     "enabled": true,
