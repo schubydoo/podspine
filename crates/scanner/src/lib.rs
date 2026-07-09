@@ -33,9 +33,9 @@ use std::time::UNIX_EPOCH;
 
 use podspine_feed::{episode_guid, pubdate_epoch};
 use podspine_index::{BookRow, EpisodeRow, Index, IndexError};
-use podspine_prober::{ProbeError, probe};
+use podspine_prober::{ProbeError, needs_faststart, probe};
 use podspine_splitter::{
-    ChapterCut, SplitEpisode, SplitError, extract_cover, split_book, split_chapter,
+    ChapterCut, SplitEpisode, SplitError, extract_cover, remux_faststart, split_book, split_chapter,
 };
 
 /// Extensions we refuse to ingest (DRM). Matched case-insensitively.
@@ -84,7 +84,7 @@ pub enum ScanError {
 /// name. Convenience wrapper over [`scan_book_as`] for single-book callers.
 pub fn scan_book(input: &Path, data_dir: &Path, index: &Index) -> Result<BookRow, ScanError> {
     let id = slugify(&file_stem(input));
-    scan_book_as(input, &id, data_dir, index, false, false)
+    scan_book_as(input, &id, data_dir, index, false, false, false)
 }
 
 /// Scan one audiobook `input` into `index` under the explicit `id` (also used as
@@ -107,6 +107,7 @@ pub fn scan_book_as(
     index: &Index,
     force_embedded: bool,
     saver: bool,
+    remux_non_faststart: bool,
 ) -> Result<BookRow, ScanError> {
     if !input.is_file() {
         return Err(ScanError::NotAFile(input.to_path_buf()));
@@ -144,10 +145,25 @@ pub fn scan_book_as(
         // starts at 0, so only non-first chapters are checked.
         let start_secs_recorded =
             !saver || eps.iter().filter(|e| e.idx > 0).all(|e| e.start_sec > 0.0);
-        if !eps.is_empty()
-            && start_secs_recorded
-            && (saver || eps.iter().all(|e| Path::new(&e.file_path).exists()))
-        {
+        // Faststart re-ingest guard (Sprint 6.3): if PODSPINE_REMUX_NON_FASTSTART
+        // was toggled since the last scan, a `needs_faststart` whole-file episode's
+        // recorded serve mode (in place ⇒ `file_path == source_path`; remuxed ⇒
+        // `file_path != source_path`) no longer matches the flag — re-ingest so
+        // `byte_length`/`file_path` are re-recorded for the current mode.
+        let faststart_consistent = eps.iter().all(|e| {
+            !e.needs_faststart
+                || e.source_path.is_empty()
+                || (e.file_path != e.source_path) == remux_non_faststart
+        });
+        // An episode's file may legitimately be absent when it's regenerated on
+        // demand: a saver chapter, or a remuxed whole-file cache copy. Everything
+        // else (full chapters, in-place whole files) must be present on disk.
+        let files_present = eps.iter().all(|e| {
+            let regenerable = (saver && e.source_path.is_empty())
+                || (!e.source_path.is_empty() && e.file_path != e.source_path);
+            regenerable || Path::new(&e.file_path).exists()
+        });
+        if !eps.is_empty() && start_secs_recorded && faststart_consistent && files_present {
             return Ok(existing);
         }
     }
@@ -202,23 +218,53 @@ pub fn scan_book_as(
     let cuts: Vec<ChapterCut> = specs.iter().map(|(cut, _)| cut.clone()).collect();
     // Stream-copy into a container matching the source codec (Task 3.9).
     let out_ext = output_ext(probed.audio_codec.as_deref());
+    // Set for the single whole-file episode below; chaptered episodes never need
+    // faststart (`split_chapter` already writes `moov`-first).
+    let mut needs_ft = false;
     let episodes = if serve_in_place {
-        // Whole source file: stream it in place from the read-only library. No
-        // ffmpeg, no copy under <data_dir>; the enclosure length is the real
-        // source size. Reclaim any per-episode copy a pre-6.2 ingest left behind.
+        // Whole source file. Reclaim any per-episode copy a pre-6.2 ingest left.
         remove_stale_episode_copies(&book_out);
-        let byte_length = std::fs::metadata(input)
-            .map_err(|source| ScanError::Io {
-                path: input.to_path_buf(),
+        // Faststart (Sprint 6.3): a non-faststart whole-file mp4 (`moov` after
+        // `mdat`) seeks slowly when streamed in place. Detect it ffmpeg-free.
+        needs_ft = needs_faststart(input);
+        if needs_ft && remux_non_faststart {
+            // Opt-in remux: write a faststart cache copy (byte-deterministic
+            // `-c copy`), measure it, then delete — the http layer regenerates it
+            // on demand and evicts it under the cache cap. The source is untouched.
+            std::fs::create_dir_all(&book_out).map_err(|source| ScanError::Io {
+                path: book_out.clone(),
                 source,
-            })?
-            .len();
-        vec![SplitEpisode {
-            idx: 0,
-            path: input.to_path_buf(),
-            byte_length,
-            duration_sec: probed.duration_sec,
-        }]
+            })?;
+            let ep = remux_faststart(input, &book_out, 0, out_ext, probed.duration_sec)?;
+            std::fs::remove_file(&ep.path).map_err(|source| ScanError::Io {
+                path: ep.path.clone(),
+                source,
+            })?;
+            vec![ep]
+        } else {
+            // Serve in place from the read-only library — no ffmpeg, no copy; the
+            // enclosure length is the real source size. A non-faststart mp4 still
+            // plays, so just log a one-line callout naming the (opt-in) fix.
+            if needs_ft {
+                tracing::warn!(
+                    id = %id,
+                    book = %file_stem(input),
+                    "non-faststart MP4 (moov after mdat): plays but seeks slowly. Set PODSPINE_REMUX_NON_FASTSTART=true to remux it to faststart."
+                );
+            }
+            let byte_length = std::fs::metadata(input)
+                .map_err(|source| ScanError::Io {
+                    path: input.to_path_buf(),
+                    source,
+                })?
+                .len();
+            vec![SplitEpisode {
+                idx: 0,
+                path: input.to_path_buf(),
+                byte_length,
+                duration_sec: probed.duration_sec,
+            }]
+        }
     } else if saver {
         // Split each chapter to record its real byte size, then delete it — the
         // http layer regenerates on demand (deterministic stream-copy, so the
@@ -276,13 +322,17 @@ pub fn scan_book_as(
             idx: ep.idx as i64,
             title: title.clone(),
             file_path: ep.path.to_string_lossy().into_owned(),
-            // Non-empty only for a whole-file episode served in place; empty for
-            // an extracted chapter served from <data_dir>.
+            // Non-empty for a whole-file episode (source path); empty for an
+            // extracted chapter under <data_dir>. `file_path == source_path` ⇒
+            // in place, `file_path != source_path` ⇒ remuxed to the faststart cache.
             source_path: if serve_in_place {
                 input.to_string_lossy().into_owned()
             } else {
                 String::new()
             },
+            // Only ever true for the single whole-file episode; drives the http
+            // remux-vs-in-place decision + the toggle guard above.
+            needs_faststart: needs_ft,
             byte_length: ep.byte_length as i64,
             duration_sec: ep.duration_sec,
             start_sec: cut.start_sec,
@@ -430,6 +480,8 @@ fn scan_mp3_folder(
             file_path: t.path.to_string_lossy().into_owned(),
             // A folder track IS a whole source file — stream it in place.
             source_path: t.path.to_string_lossy().into_owned(),
+            // MP3 has no `moov` atom, so faststart never applies.
+            needs_faststart: false,
             byte_length: byte_length as i64,
             duration_sec: t.duration_sec,
             // Whole files (not sub-ranges of a container), so each starts at 0.
@@ -534,6 +586,7 @@ pub fn scan_library(
     index: &Index,
     force_embedded: bool,
     saver: bool,
+    remux_non_faststart: bool,
 ) -> ScanSummary {
     let sources = discover(library);
 
@@ -545,7 +598,15 @@ pub fn scan_library(
         let slug = unique_slug(&slugify(&source.base_name()), &mut seen);
         match source {
             BookSource::File(path) => {
-                match scan_book_as(&path, &slug, data_dir, index, force_embedded, saver) {
+                match scan_book_as(
+                    &path,
+                    &slug,
+                    data_dir,
+                    index,
+                    force_embedded,
+                    saver,
+                    remux_non_faststart,
+                ) {
                     Ok(book) => {
                         summary.indexed += 1;
                         tracing::info!(slug = %book.slug, title = %book.title, "indexed book");
@@ -625,8 +686,16 @@ pub fn reconcile(
     index: &Index,
     force_embedded: bool,
     saver: bool,
+    remux_non_faststart: bool,
 ) -> ScanSummary {
-    let mut summary = scan_library(library, data_dir, index, force_embedded, saver);
+    let mut summary = scan_library(
+        library,
+        data_dir,
+        index,
+        force_embedded,
+        saver,
+        remux_non_faststart,
+    );
     summary.pruned = prune_orphans(library, data_dir, index).unwrap_or_else(|err| {
         tracing::warn!(error = %err, "orphan prune failed");
         0
@@ -652,9 +721,17 @@ pub fn spawn_library_watcher(
     db_path: PathBuf,
     force_embedded: bool,
     saver: bool,
+    remux_non_faststart: bool,
 ) {
     std::thread::spawn(move || {
-        if let Err(err) = watch_loop(&library, &data_dir, &db_path, force_embedded, saver) {
+        if let Err(err) = watch_loop(
+            &library,
+            &data_dir,
+            &db_path,
+            force_embedded,
+            saver,
+            remux_non_faststart,
+        ) {
             tracing::error!(error = %err, "library watcher stopped — auto-refresh disabled");
         }
     });
@@ -666,6 +743,7 @@ fn watch_loop(
     db_path: &Path,
     force_embedded: bool,
     saver: bool,
+    remux_non_faststart: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use notify::{RecursiveMode, Watcher};
 
@@ -683,7 +761,14 @@ fn watch_loop(
     while rx.recv().is_ok() {
         while rx.recv_timeout(WATCH_DEBOUNCE).is_ok() {}
         tracing::info!("library changed — reconciling");
-        let s = reconcile(library, data_dir, &index, force_embedded, saver);
+        let s = reconcile(
+            library,
+            data_dir,
+            &index,
+            force_embedded,
+            saver,
+            remux_non_faststart,
+        );
         tracing::info!(
             indexed = s.indexed,
             skipped = s.skipped,
@@ -992,7 +1077,7 @@ mod tests {
 
         let data = root.join("data");
         let index = Index::open_in_memory().unwrap();
-        let summary = scan_library(&root, &data, &index, false, false);
+        let summary = scan_library(&root, &data, &index, false, false, false);
         assert_eq!(summary.indexed, 1);
         assert_eq!(summary.skipped, 0);
 
@@ -1057,7 +1142,10 @@ mod tests {
 
         let data = root.join("data");
         let index = Index::open_in_memory().unwrap();
-        assert_eq!(scan_library(&root, &data, &index, false, false).indexed, 1);
+        assert_eq!(
+            scan_library(&root, &data, &index, false, false, false).indexed,
+            1
+        );
         let books = index.list_books().unwrap();
         let eps = index.episodes_for_book(&books[0].id).unwrap();
         assert_eq!(eps.len(), 2);
@@ -1096,7 +1184,7 @@ mod tests {
         // force_embedded ignores the sidecar -> back to 3 embedded chapters.
         let data2 = dir.join("data2");
         let index2 = Index::open_in_memory().unwrap();
-        let book2 = scan_book_as(&input, "forced", &data2, &index2, true, false).unwrap();
+        let book2 = scan_book_as(&input, "forced", &data2, &index2, true, false, false).unwrap();
         assert_eq!(
             index2.episodes_for_book(&book2.id).unwrap().len(),
             3,
@@ -1119,7 +1207,7 @@ mod tests {
         let data = dir.join("data");
         let index = Index::open_in_memory().unwrap();
 
-        let book = scan_book_as(&input, "saver-book", &data, &index, false, true).unwrap();
+        let book = scan_book_as(&input, "saver-book", &data, &index, false, true, false).unwrap();
         let eps = index.episodes_for_book(&book.id).unwrap();
         assert_eq!(eps.len(), 3);
         for (i, e) in eps.iter().enumerate() {
@@ -1142,7 +1230,7 @@ mod tests {
 
         // Idempotent: re-scanning at the same mtime is a no-op despite the files
         // being absent (the index entry alone satisfies the check in saver mode).
-        let again = scan_book_as(&input, "saver-book", &data, &index, false, true).unwrap();
+        let again = scan_book_as(&input, "saver-book", &data, &index, false, true, false).unwrap();
         assert_eq!(again.id, book.id);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1162,7 +1250,7 @@ mod tests {
         let index = Index::open_in_memory().unwrap();
 
         // A normal full-mode ingest first: files on disk, real offsets recorded.
-        let book = scan_book_as(&input, "mig", &data, &index, false, false).unwrap();
+        let book = scan_book_as(&input, "mig", &data, &index, false, false, false).unwrap();
         let eps = index.episodes_for_book(&book.id).unwrap();
         assert!(
             eps.iter().any(|e| e.start_sec > 0.0),
@@ -1178,7 +1266,7 @@ mod tests {
 
         // Re-scan at the SAME mtime in saver mode. The zeroed non-first chapters
         // must force a one-time re-split, not an idempotent skip.
-        let book2 = scan_book_as(&input, "mig", &data, &index, false, true).unwrap();
+        let book2 = scan_book_as(&input, "mig", &data, &index, false, true, false).unwrap();
         assert_eq!(book2.id, book.id);
         let eps2 = index.episodes_for_book(&book.id).unwrap();
         assert!(
@@ -1419,7 +1507,7 @@ mod tests {
 
         let data = root.join("data");
         let index = Index::open_in_memory().unwrap();
-        let summary = scan_library(&root, &data, &index, false, false);
+        let summary = scan_library(&root, &data, &index, false, false, false);
 
         assert_eq!(summary.indexed, 2, "both books indexed");
         assert_eq!(summary.skipped, 0);
@@ -1448,7 +1536,7 @@ mod tests {
 
         let data = root.join("data");
         let index = Index::open_in_memory().unwrap();
-        let summary = scan_library(&root, &data, &index, false, false);
+        let summary = scan_library(&root, &data, &index, false, false, false);
 
         assert_eq!(summary.indexed, 1, "only the good book");
         assert_eq!(summary.skipped, 2, "unprobeable file + MP3 folder skipped");
@@ -1523,6 +1611,148 @@ mod tests {
     }
 
     #[test]
+    fn non_faststart_single_file_is_flagged_and_optionally_remuxed() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not available");
+            return;
+        }
+        let dir = scratch("faststart");
+        // ffmpeg's mp4 muxer writes `moov` at the END by default → non-faststart.
+        let input = synth(&dir, false);
+        assert!(
+            needs_faststart(&input),
+            "precondition: synthesized m4a is non-faststart"
+        );
+        let input_c = input.canonicalize().unwrap();
+
+        // remux OFF (default): flagged, but still streamed in place.
+        {
+            let data = dir.join("data-off");
+            let index = Index::open_in_memory().unwrap();
+            let book = scan_book_as(&input, "ft", &data, &index, false, false, false).unwrap();
+            let eps = index.episodes_for_book(&book.id).unwrap();
+            assert!(eps[0].needs_faststart, "non-faststart mp4 flagged");
+            assert_eq!(
+                eps[0].source_path, eps[0].file_path,
+                "served in place when remux is off"
+            );
+            assert_eq!(
+                eps[0].byte_length as u64,
+                std::fs::metadata(&input).unwrap().len()
+            );
+        }
+
+        // remux ON: remuxed to a faststart cache file under the data dir; measured
+        // then deleted at ingest (regenerated on demand, like a saver chapter).
+        {
+            let data = dir.join("data-on");
+            let index = Index::open_in_memory().unwrap();
+            let book = scan_book_as(&input, "ft", &data, &index, false, false, true).unwrap();
+            let eps = index.episodes_for_book(&book.id).unwrap();
+            assert!(eps[0].needs_faststart);
+            assert_ne!(
+                eps[0].source_path, eps[0].file_path,
+                "remuxed: file_path is the cache copy, not the source"
+            );
+            assert_eq!(eps[0].source_path, input_c.to_string_lossy());
+            assert!(
+                Path::new(&eps[0].file_path).starts_with(&data),
+                "cache under data dir"
+            );
+            assert!(eps[0].byte_length > 0);
+            assert!(
+                !Path::new(&eps[0].file_path).exists(),
+                "measured then deleted for on-demand regen"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn faststart_single_file_is_never_remuxed() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not available");
+            return;
+        }
+        let dir = scratch("faststart-ok");
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("fast.m4a");
+        let ok = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=300:duration=3",
+                "-c:a",
+                "aac",
+                "-movflags",
+                "+faststart",
+            ])
+            .arg(&input)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            eprintln!("skipping: no aac encoder");
+            return;
+        }
+        assert!(!needs_faststart(&input), "precondition: file is faststart");
+
+        // Even with remux ON, a faststart mp4 is served in place (nothing to fix).
+        let data = dir.join("data");
+        let index = Index::open_in_memory().unwrap();
+        let book = scan_book_as(&input, "ok", &data, &index, false, false, true).unwrap();
+        let eps = index.episodes_for_book(&book.id).unwrap();
+        assert!(!eps[0].needs_faststart);
+        assert_eq!(
+            eps[0].source_path, eps[0].file_path,
+            "faststart mp4 is not remuxed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn toggling_remux_flag_reingests_the_episode() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not available");
+            return;
+        }
+        let dir = scratch("faststart-toggle");
+        let input = synth(&dir, false); // non-faststart m4a
+        let data = dir.join("data");
+        let index = Index::open_in_memory().unwrap();
+
+        // remux OFF → in place.
+        scan_book_as(&input, "t", &data, &index, false, false, false).unwrap();
+        let e1 = index.episodes_for_book("t").unwrap();
+        assert_eq!(e1[0].source_path, e1[0].file_path, "remux off → in place");
+
+        // Same mtime, flag flipped ON: the faststart toggle guard forces a
+        // re-ingest instead of the idempotent early return.
+        scan_book_as(&input, "t", &data, &index, false, false, true).unwrap();
+        let e2 = index.episodes_for_book("t").unwrap();
+        assert_ne!(
+            e2[0].source_path, e2[0].file_path,
+            "remux on → served from the cache copy"
+        );
+
+        // Flip back OFF: re-ingest again, back to in place.
+        scan_book_as(&input, "t", &data, &index, false, false, false).unwrap();
+        let e3 = index.episodes_for_book("t").unwrap();
+        assert_eq!(
+            e3[0].source_path, e3[0].file_path,
+            "remux off again → in place"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn chapterless_file_becomes_a_single_episode() {
         if !ffmpeg_available() {
             eprintln!("skipping: ffmpeg not available");
@@ -1571,14 +1801,14 @@ mod tests {
         let data = root.join("data");
         let index = Index::open_in_memory().unwrap();
 
-        scan_library(&root, &data, &index, false, false);
+        scan_library(&root, &data, &index, false, false, false);
         let id = index.list_books().unwrap()[0].id.clone();
         let first = index.episodes_for_book(&id).unwrap();
         assert!(first.iter().all(|e| !e.source_path.is_empty()));
 
         // Re-scan the unchanged folder: the `source_path` idempotency guard takes
         // the early return — episodes are unchanged and still served in place.
-        scan_library(&root, &data, &index, false, false);
+        scan_library(&root, &data, &index, false, false, false);
         let second = index.episodes_for_book(&id).unwrap();
         assert_eq!(first.len(), second.len());
         for (x, y) in first.iter().zip(&second) {
@@ -1644,7 +1874,7 @@ mod tests {
         std::fs::rename(&b, root.join("beta.m4a")).unwrap();
         let index = Index::open_in_memory().unwrap();
 
-        scan_library(&root, &data, &index, false, false);
+        scan_library(&root, &data, &index, false, false, false);
         assert_eq!(index.list_books().unwrap().len(), 2);
         let beta_out = data.join("books").join("beta");
         assert!(beta_out.exists(), "beta was split");
@@ -1670,7 +1900,7 @@ mod tests {
             return;
         }
         let (root, data, index) = two_book_library("prune-guard");
-        scan_library(&root, &data, &index, false, false);
+        scan_library(&root, &data, &index, false, false, false);
         assert_eq!(index.list_books().unwrap().len(), 2);
 
         // Simulate an unmount: every source vanishes and the root goes empty.
@@ -1698,13 +1928,13 @@ mod tests {
         let (root, data, index) = two_book_library("reconcile");
 
         // First pass indexes both, prunes none.
-        let s = reconcile(&root, &data, &index, false, false);
+        let s = reconcile(&root, &data, &index, false, false, false);
         assert_eq!(index.list_books().unwrap().len(), 2);
         assert_eq!(s.pruned, 0);
 
         // Remove one source, reconcile again -> it is pruned.
         std::fs::remove_file(root.join("beta.m4a")).unwrap();
-        let s = reconcile(&root, &data, &index, false, false);
+        let s = reconcile(&root, &data, &index, false, false, false);
         assert_eq!(s.pruned, 1);
         let books = index.list_books().unwrap();
         assert_eq!(books.len(), 1);

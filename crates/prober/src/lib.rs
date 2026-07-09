@@ -21,6 +21,9 @@
 use std::path::Path;
 use std::process::Command;
 
+mod faststart;
+pub use faststart::needs_faststart;
+
 /// One embedded chapter, with times already resolved to seconds.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Chapter {

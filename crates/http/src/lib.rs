@@ -48,7 +48,7 @@ use tower_http::trace::TraceLayer;
 
 use podspine_feed::{FeedBook, FeedEpisode, render_checked};
 use podspine_index::Index;
-use podspine_splitter::{ChapterCut, split_chapter};
+use podspine_splitter::{ChapterCut, remux_faststart, split_chapter};
 use podspine_ui::{BookCard, BookDetail, book_page, index_page, subscribe_page};
 
 /// Max concurrent in-flight requests before backpressure (DoS guard). Generous
@@ -391,11 +391,12 @@ async fn audio(
     range: Option<TypedHeader<Range>>,
 ) -> Result<impl IntoResponse, AppError> {
     let target = resolve_audio_target(&state, &feed_id, number)?;
-    // `saver` mode: the file isn't pre-split — regenerate (and cache) it on the
-    // first request. `full` mode: a missing file is a genuine 404.
+    // A missing file is regenerated on demand when the resolver supplied a `Regen`
+    // (a `saver` chapter split, or a faststart remux of a whole-file episode);
+    // otherwise (e.g. `full`-mode chapter, in-place whole file) it's a genuine 404.
     if !target.path.exists() {
         match &target.regen {
-            Some(regen) => ensure_chapter(&state, &target.path, regen).await?,
+            Some(regen) => ensure_cached(&state, &target.path, regen).await?,
             None => return Err(AppError::NotFound),
         }
     }
@@ -481,26 +482,41 @@ struct AudioTarget {
     regen: Option<Regen>,
 }
 
-/// Inputs to regenerate one chapter on demand (`saver` mode).
+/// Inputs to regenerate one cache file on demand — a `saver` chapter split, or a
+/// faststart remux of a whole-file episode (Sprint 6.3). The source is always a
+/// validated file under a trusted root; the op decides which ffmpeg call rebuilds
+/// the deterministic output.
 struct Regen {
     source: PathBuf,
     out_dir: PathBuf,
     out_ext: String,
-    cut: ChapterCut,
+    op: RegenOp,
 }
 
-/// Resolve `/audio/{feed_id}/{number}` to its on-disk target. Two path-safe
-/// shapes, depending on whether the episode is a whole file or a chapter:
+/// Which ffmpeg operation regenerates the cache file.
+#[derive(Clone)]
+enum RegenOp {
+    /// Re-split one chapter (`saver` mode) — a sub-range of the container.
+    Chapter(ChapterCut),
+    /// Remux a whole file to faststart (`PODSPINE_REMUX_NON_FASTSTART`).
+    Faststart { idx: usize, duration_sec: f64 },
+}
+
+/// Resolve `/audio/{feed_id}/{number}` to its on-disk target. Three path-safe
+/// shapes, by whether the episode is a whole file (and how it's stored):
 ///
-/// - **In place (whole-file episode):** when the episode carries a `source_path`,
-///   it's a whole file streamed from the library — canonicalized, asserted under
-///   the library root, and size-checked against the recorded length (Sprint 6.2).
+/// - **In place (whole-file episode, `file_path == source_path`):** a whole file
+///   streamed from the library — canonicalized, asserted under the library root,
+///   and size-checked against the recorded length (Sprint 6.2).
+/// - **Faststart remux (whole-file episode, `file_path != source_path`):** the
+///   served file is a cache copy under the data dir; it's regenerated on demand by
+///   remuxing the library source to faststart (Sprint 6.3), so the resolver returns
+///   a [`Regen`] carrying [`RegenOp::Faststart`].
 /// - **Extracted (chaptered episode):** the path is reconstructed from the
 ///   canonical `data_dir` plus **opaque DB keys** (`book.id`, chapter index) and a
 ///   validated audio extension — never built from request input — so it stays
-///   under the data dir by construction (no traversal). Existence is NOT required:
-///   in `saver` mode the file is regenerated on demand, so the resolver returns
-///   the target plus a [`Regen`].
+///   under the data dir by construction (no traversal). In `saver` mode it's
+///   regenerated on demand ([`RegenOp::Chapter`]); existence is not required.
 fn resolve_audio_target(
     state: &AppState,
     feed_id: &str,
@@ -526,10 +542,11 @@ fn resolve_audio_target(
         (book, ep)
     };
 
-    // Serve-in-place (Sprint 6.2): a whole-file episode (MP3-folder track, or a
-    // chapterless single file) is streamed directly from the read-only library —
-    // never copied under the data dir. `source_path` is the persisted library
-    // file. Three guards before it's served, all 404 on failure (no oracle):
+    // Serve-in-place (Sprint 6.2): a whole-file episode streamed directly from the
+    // read-only library — never copied under the data dir. Recognized by a
+    // non-empty `source_path` whose value equals `file_path` (a whole-file episode
+    // whose `file_path != source_path` was remuxed to a faststart cache copy and
+    // is handled by the data-dir path below). Three guards, all 404 on failure:
     //   1. canonicalize + assert under the library root (reject `..`/symlink
     //      escape) — the A01 "assert under the library root" rule (TAD §7);
     //   2. the recorded enclosure length must equal the on-disk source size —
@@ -540,7 +557,7 @@ fn resolve_audio_target(
     //      under the chapter's enclosure length.
     // Returns before the data-dir/regeneration logic below, so a poisoned row can
     // never fall through into it.
-    if !ep.source_path.is_empty() {
+    if !ep.source_path.is_empty() && ep.file_path == ep.source_path {
         let src = FsPath::new(&ep.source_path)
             .canonicalize()
             .map_err(|_| AppError::NotFound)?;
@@ -591,35 +608,61 @@ fn resolve_audio_target(
     }
     let path = out_dir.join(format!("{:03}.{out_ext}", idx + 1));
 
-    // Only chaptered single-file books reach here: whole-file episodes (MP3-folder
-    // tracks, chapterless singles) carry a `source_path` and were served in place
-    // and returned above, so they never regenerate. Regen is possible only in
-    // saver mode when the book's source is a single file to re-split; the
-    // `is_file` guard stays as belt-and-suspenders (a directory source would make
-    // `ffmpeg <directory>` fail), so a missing file is a clean 404, not a 500.
-    let regen = (state.saver && FsPath::new(&book.source_path).is_file()).then(|| Regen {
-        source: PathBuf::from(&book.source_path),
-        out_dir,
-        out_ext,
-        // `end_sec` is reconstructed as start + duration. This is EXACT, not an
-        // approximation: the scanner stores `duration_sec = cut.end - cut.start`
-        // (the requested cut length, not a measured output duration), so this
-        // yields the same `[start, end)` the ingest split used — and ffmpeg's
-        // 6-decimal arg formatting absorbs any float round-trip. The stream copy
-        // is therefore byte-identical (asserted in the serve test).
-        cut: ChapterCut {
-            idx: idx as usize,
-            start_sec: ep.start_sec,
-            end_sec: ep.start_sec + ep.duration_sec,
-        },
-    });
+    // Two kinds of episode materialize under the data dir here:
+    let regen = if !ep.source_path.is_empty() && ep.needs_faststart {
+        // A non-faststart whole-file episode remuxed to a faststart cache copy
+        // (Sprint 6.3, `file_path != source_path`). Regenerate it on demand from
+        // the library source — always, independent of storage_mode. The
+        // `needs_faststart` gate means a chaptered row that merely carries a stray
+        // `source_path` is NOT remuxed into its container here; it drops to the
+        // chaptered arm and serves its actual split (or 404s). Validate the source
+        // stays under the library root first (the A01 rule), 404 on escape.
+        let src = FsPath::new(&ep.source_path)
+            .canonicalize()
+            .map_err(|_| AppError::NotFound)?;
+        if !src.starts_with(&state.library_dir) {
+            tracing::warn!(feed_id, number, "remux source escaped the library root");
+            return Err(AppError::NotFound);
+        }
+        Some(Regen {
+            source: src,
+            out_dir,
+            out_ext,
+            op: RegenOp::Faststart {
+                idx: idx as usize,
+                duration_sec: ep.duration_sec,
+            },
+        })
+    } else {
+        // A chaptered episode. Regen is possible only in `saver` mode when the
+        // book's source is a single file to re-split; the `is_file` guard is
+        // belt-and-suspenders (a directory source would make `ffmpeg <directory>`
+        // fail), so a missing file is a clean 404, not a 500.
+        (state.saver && FsPath::new(&book.source_path).is_file()).then(|| Regen {
+            source: PathBuf::from(&book.source_path),
+            out_dir,
+            out_ext,
+            // `end_sec` is reconstructed as start + duration. This is EXACT, not an
+            // approximation: the scanner stores `duration_sec = cut.end - cut.start`
+            // (the requested cut length, not a measured output duration), so this
+            // yields the same `[start, end)` the ingest split used — and ffmpeg's
+            // 6-decimal arg formatting absorbs any float round-trip. The stream
+            // copy is therefore byte-identical (asserted in the serve test).
+            op: RegenOp::Chapter(ChapterCut {
+                idx: idx as usize,
+                start_sec: ep.start_sec,
+                end_sec: ep.start_sec + ep.duration_sec,
+            }),
+        })
+    };
     Ok(AudioTarget { path, regen })
 }
 
-/// Ensure `target` exists, regenerating it on demand (`saver` mode). A per-path
-/// single-flight lock means concurrent requests for the same uncached chapter
-/// run ffmpeg once; the blocking split runs off the async runtime.
-async fn ensure_chapter(state: &AppState, target: &FsPath, regen: &Regen) -> Result<(), AppError> {
+/// Ensure `target` exists, regenerating it on demand: a `saver` chapter split, or
+/// a whole-file faststart remux (Sprint 6.3). A per-path single-flight lock means
+/// concurrent requests for the same uncached file run ffmpeg once; the blocking
+/// ffmpeg work runs off the async runtime.
+async fn ensure_cached(state: &AppState, target: &FsPath, regen: &Regen) -> Result<(), AppError> {
     let lock = {
         let mut map = state.inflight.lock().map_err(AppError::internal)?;
         map.entry(target.to_path_buf())
@@ -636,10 +679,19 @@ async fn ensure_chapter(state: &AppState, target: &FsPath, regen: &Regen) -> Res
         let source = regen.source.clone();
         let out_dir = regen.out_dir.clone();
         let out_ext = regen.out_ext.clone();
-        let cut = regen.cut.clone();
+        let op = regen.op.clone();
         tokio::task::spawn_blocking(move || -> std::io::Result<()> {
             std::fs::create_dir_all(&out_dir)?;
-            split_chapter(&source, &out_dir, &cut, &out_ext).map_err(std::io::Error::other)?;
+            match op {
+                RegenOp::Chapter(cut) => {
+                    split_chapter(&source, &out_dir, &cut, &out_ext)
+                        .map_err(std::io::Error::other)?;
+                }
+                RegenOp::Faststart { idx, duration_sec } => {
+                    remux_faststart(&source, &out_dir, idx, &out_ext, duration_sec)
+                        .map_err(std::io::Error::other)?;
+                }
+            }
             Ok(())
         })
         .await

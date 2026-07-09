@@ -162,7 +162,7 @@ async fn saver_mode_regenerates_a_chapter_on_demand() {
     let index = Index::open_in_memory().unwrap();
     let input = synth_three_chapters(&dir);
     // Ingest in `saver` mode: sizes recorded, split files deleted.
-    let book = scan_book_as(&input, "saverbook", &data, &index, false, true).unwrap();
+    let book = scan_book_as(&input, "saverbook", &data, &index, false, true, false).unwrap();
     let feed_id = book.feed_id.clone();
 
     let eps = index.episodes_for_book(&book.id).unwrap();
@@ -237,7 +237,7 @@ async fn saver_cache_evicts_over_the_size_cap() {
 
     let index = Index::open_in_memory().unwrap();
     let input = synth_three_chapters(&dir);
-    let book = scan_book_as(&input, "evictbook", &data, &index, false, true).unwrap();
+    let book = scan_book_as(&input, "evictbook", &data, &index, false, true, false).unwrap();
     let feed_id = book.feed_id.clone();
     let book_out = data.join("books").join(&book.id);
 
@@ -513,11 +513,14 @@ async fn in_place_source_on_a_chaptered_episode_is_rejected() {
         "a chaptered episode has no source_path"
     );
 
-    // Corrupt the row: mark chapter 1 as in-place pointing at the WHOLE container
-    // (under the library, so the library-root check passes). Its recorded
-    // byte_length is the chapter's size, not the container's — so the whole-file
-    // size invariant must reject it rather than serve the full container's bytes.
-    ep.source_path = input.canonicalize().unwrap().to_string_lossy().into_owned();
+    // Corrupt the row: mark chapter 1 as an in-place whole-file episode pointing at
+    // the WHOLE container (`file_path == source_path`, under the library so the
+    // library-root check passes). Its recorded byte_length is the chapter's size,
+    // not the container's — so the whole-file size invariant must reject it rather
+    // than serve the full container's bytes.
+    let container = input.canonicalize().unwrap().to_string_lossy().into_owned();
+    ep.source_path = container.clone();
+    ep.file_path = container;
     assert_ne!(
         ep.byte_length as u64,
         std::fs::metadata(&input).unwrap().len(),
@@ -549,6 +552,96 @@ async fn in_place_source_on_a_chaptered_episode_is_rejected() {
         StatusCode::NOT_FOUND,
         "a chaptered episode with a stray source_path must not serve the container"
     );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[tokio::test]
+async fn serves_a_remuxed_faststart_copy_on_demand() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+    let base = std::env::temp_dir().join("podspine-http-remux");
+    let _ = std::fs::remove_dir_all(&base);
+    let library = base.join("library");
+    let data = base.join("data");
+    std::fs::create_dir_all(&library).unwrap();
+
+    let index = Index::open_in_memory().unwrap();
+    // A non-faststart m4a (moov at end) under the library. Ingest with remux ON.
+    let input = synth_flat(&library);
+    let book = scan_book_as(&input, "remuxbook", &data, &index, false, false, true).unwrap();
+    let feed_id = book.feed_id.clone();
+
+    // Recorded as a faststart cache episode: file_path (cache) != source_path, and
+    // the cache file was measured then deleted at ingest (regenerated on demand).
+    let eps = index.episodes_for_book(&book.id).unwrap();
+    assert_eq!(eps.len(), 1);
+    assert!(eps[0].needs_faststart);
+    assert_ne!(
+        eps[0].source_path, eps[0].file_path,
+        "remuxed: a cache copy, not in place"
+    );
+    assert!(std::path::Path::new(&eps[0].file_path).starts_with(&data));
+    assert!(
+        !std::path::Path::new(&eps[0].file_path).exists(),
+        "cache file deleted at ingest"
+    );
+    let recorded_len = eps[0].byte_length;
+
+    let state = AppState::new(
+        index,
+        "http://test".to_string(),
+        &data,
+        &library,
+        None,
+        false,
+        None,
+        None,
+    );
+    let app = router(state);
+
+    // First request regenerates the remux and serves it; the body matches the
+    // recorded enclosure length and is faststart (moov before mdat).
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/audio/{feed_id}/1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_bytes(resp).await;
+    assert_eq!(
+        body.len() as i64,
+        recorded_len,
+        "served body matches the recorded enclosure length"
+    );
+    let find = |h: &[u8], n: &[u8]| h.windows(n.len()).position(|w| w == n);
+    assert!(
+        find(&body, b"moov") < find(&body, b"mdat"),
+        "the served copy is faststart (moov before mdat)"
+    );
+    assert!(
+        std::path::Path::new(&eps[0].file_path).exists(),
+        "the remux is now cached on disk"
+    );
+
+    // A Range request against the cached remux yields a 206 partial.
+    let resp = app
+        .oneshot(
+            Request::get(format!("/audio/{feed_id}/1"))
+                .header(header::RANGE, "bytes=0-9")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(body_bytes(resp).await.len(), 10, "range served 10 bytes");
 
     let _ = std::fs::remove_dir_all(&base);
 }

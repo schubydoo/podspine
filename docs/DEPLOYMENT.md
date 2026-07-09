@@ -26,6 +26,7 @@ that precedence. The library path is the only required input.
 | `--storage-mode` | `PODSPINE_STORAGE_MODE` | `full` | `full` keeps every chapter split on disk; `saver` still splits once at ingest but caches on demand. See below. |
 | `--cache-size` | `PODSPINE_CACHE_SIZE` | `2GB` | `saver` only: cache cap (`2GB`, `500MB`; `0`/`off` = unbounded). |
 | `--cache-ttl` | `PODSPINE_CACHE_TTL` | off | `saver` only: evict chapters unplayed this long (`30d`, `12h`; `off` = size-only). |
+| `--remux-non-faststart` | `PODSPINE_REMUX_NON_FASTSTART` | off | Remux a non-faststart whole-file mp4 to faststart on demand (cache-managed). See below. |
 | `--config` | `PODSPINE_CONFIG` | none | Path to a TOML config file. |
 
 > **`PODSPINE_BASE_URL` is the one that bites people.** Feed and enclosure (audio)
@@ -79,6 +80,21 @@ cache cap (`PODSPINE_CACHE_SIZE`) rather than a second copy of every book.
 is cheap and you want every play to start instantly. Either way you only need to
 size `--data-dir` for your chaptered books — whole-file books add essentially
 nothing beyond their index rows and covers.
+
+### Faststart for whole-file mp4
+
+A whole-file `.m4a`/`.m4b` served in place plays fine but can **seek slowly** if
+its `moov` atom (the index) sits after the audio ("non-faststart"). Podspine
+detects this at ingest (a quick header read, no ffmpeg) and logs a one-line
+callout naming the book. MP3/OGG/FLAC and chaptered books are never affected (a
+chaptered episode is already written moov-first).
+
+Set `PODSPINE_REMUX_NON_FASTSTART=true` to fix it automatically: such a book is
+**remuxed to faststart on demand** — a stream-copy (no re-encode) served from the
+`saver` cache, evicted and regenerated under `PODSPINE_CACHE_SIZE` like any cached
+chapter, **not** a pinned second copy. The default is **off** because in-place
+serving costs no disk; enable it if slow seeking on those books bothers you and
+you can spare the cache. (A faststart mp4, or any non-mp4, is left untouched.)
 
 ## Exposing Podspine safely
 

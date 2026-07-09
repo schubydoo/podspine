@@ -61,6 +61,12 @@ pub struct Cli {
     /// Force embedded chapters, ignoring any `.cue`/`.ffmeta` sidecar.
     #[arg(long, env = "PODSPINE_FORCE_EMBEDDED_CHAPTERS")]
     pub force_embedded_chapters: bool,
+    /// Remux a non-faststart whole-file mp4 (`moov` after `mdat`) to faststart on
+    /// demand so podcast clients seek quickly, instead of serving it in place. The
+    /// remux is stream-copied and cache-managed (counts against the `saver` cache
+    /// cap), never a pinned duplicate. Default off: serve in place + log a callout.
+    #[arg(long, env = "PODSPINE_REMUX_NON_FASTSTART")]
+    pub remux_non_faststart: bool,
     /// Chapter storage strategy for **chaptered** books: `full` pre-splits every
     /// chapter to disk (fast, ~2× storage); `saver` still splits at ingest but
     /// keeps chapters in a bounded on-demand cache (minimal steady-state disk, a
@@ -97,6 +103,8 @@ pub struct FileConfig {
     pub default_cover_url: Option<String>,
     /// Force embedded chapters, ignoring sidecars.
     pub force_embedded_chapters: Option<bool>,
+    /// Remux non-faststart whole-file mp4 to faststart on demand (cache-managed).
+    pub remux_non_faststart: Option<bool>,
     /// Chapter storage strategy (`full` | `saver`).
     pub storage_mode: Option<StorageMode>,
     /// On-demand cache size cap (e.g. `2GB`; `0`/`off` = unbounded).
@@ -121,6 +129,13 @@ pub struct Config {
     pub default_cover_url: Option<String>,
     /// Ignore `.cue`/`.ffmeta` sidecars and always use embedded chapters.
     pub force_embedded_chapters: bool,
+    /// Remux a non-faststart whole-file mp4 (`moov` after `mdat`) to faststart on
+    /// demand rather than serving it in place — so podcast clients seek quickly.
+    /// The remuxed copy is stream-copied and cache-managed (evicted under the
+    /// `saver` cap, regenerated on demand), never a pinned duplicate. Default off:
+    /// such books serve in place and a one-line callout is logged at ingest. No
+    /// effect on faststart mp4, MP3/OGG/FLAC, or chaptered books (Sprint 6.3).
+    pub remux_non_faststart: bool,
     /// How **chaptered** books are produced/stored: `full` (pre-split every
     /// chapter to disk) or `saver` (split at ingest, then cache regenerations on
     /// demand). Applies library-wide to chaptered books, which materialize under
@@ -252,6 +267,9 @@ impl Config {
         let force_embedded_chapters =
             cli.force_embedded_chapters || file.force_embedded_chapters.unwrap_or(false);
 
+        let remux_non_faststart =
+            cli.remux_non_faststart || file.remux_non_faststart.unwrap_or(false);
+
         let storage_mode = cli.storage_mode.or(file.storage_mode).unwrap_or_default();
 
         let cache_size_bytes = match cli.cache_size.clone().or_else(|| file.cache_size.clone()) {
@@ -274,6 +292,7 @@ impl Config {
             base_url,
             default_cover_url,
             force_embedded_chapters,
+            remux_non_faststart,
             storage_mode,
             cache_size_bytes,
             cache_ttl,
@@ -507,6 +526,7 @@ mod tests {
             base_url: "http://localhost:8080".to_string(),
             default_cover_url: None,
             force_embedded_chapters: false,
+            remux_non_faststart: false,
             storage_mode: StorageMode::Full,
             cache_size_bytes: Some(DEFAULT_CACHE_SIZE_BYTES),
             cache_ttl: None,
@@ -527,6 +547,7 @@ mod tests {
             base_url: "http://localhost:8080".to_string(),
             default_cover_url: None,
             force_embedded_chapters: false,
+            remux_non_faststart: false,
             storage_mode: StorageMode::Full,
             cache_size_bytes: Some(DEFAULT_CACHE_SIZE_BYTES),
             cache_ttl: None,
@@ -570,6 +591,32 @@ mod tests {
         assert_eq!(c.storage_mode, StorageMode::Full);
         assert_eq!(c.cache_size_bytes, Some(DEFAULT_CACHE_SIZE_BYTES));
         assert_eq!(c.cache_ttl, None);
+    }
+
+    #[test]
+    fn remux_non_faststart_defaults_off_and_resolves_from_either_layer() {
+        let c = Config::resolve(&cli(Some("/books")), &FileConfig::default()).unwrap();
+        assert!(!c.remux_non_faststart, "default off");
+
+        let file = FileConfig {
+            remux_non_faststart: Some(true),
+            ..Default::default()
+        };
+        assert!(
+            Config::resolve(&cli(Some("/books")), &file)
+                .unwrap()
+                .remux_non_faststart,
+            "enabled from the file layer"
+        );
+
+        let mut cl = cli(Some("/books"));
+        cl.remux_non_faststart = true;
+        assert!(
+            Config::resolve(&cl, &FileConfig::default())
+                .unwrap()
+                .remux_non_faststart,
+            "enabled from the CLI flag"
+        );
     }
 
     #[test]
