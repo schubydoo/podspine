@@ -114,6 +114,13 @@ pub fn scan_book_as(
     if is_drm(input) {
         return Err(ScanError::UnsupportedDrm(input.to_path_buf()));
     }
+    // Persist an ABSOLUTE, symlink-resolved source path. In-place serving (and
+    // saver regeneration) resolves this later from the server's cwd, so a
+    // relative `--library` stored verbatim would 404 after a restart from a
+    // different directory (systemd/Docker). `is_file` above proved it exists, so
+    // canonicalize succeeds; the fallback only guards a race.
+    let input_canonical = input.canonicalize().unwrap_or_else(|_| input.to_path_buf());
+    let input = input_canonical.as_path();
 
     let id = id.to_string();
     let source_mtime = mtime_epoch(input)?;
@@ -324,16 +331,20 @@ struct Mp3Track {
 }
 
 /// Ingest a folder of per-chapter MP3s as one book under `id`: one episode per
-/// file, **no splitting and no re-encode** — each MP3 is byte-copied into
-/// `<data_dir>/books/<id>/NNN.mp3` (keeping all served audio under the data dir).
-/// Files are ordered by track number when every track is present and distinct,
-/// otherwise by filename with a warning. Idempotent on an unchanged folder.
+/// file, **no splitting, no re-encode, and no copy** — each track is served in
+/// place from the library (Sprint 6.2). Files are ordered by track number when
+/// every track is present and distinct, otherwise by filename with a warning.
+/// Idempotent on an unchanged folder.
 fn scan_mp3_folder(
     dir: &Path,
     id: &str,
     data_dir: &Path,
     index: &Index,
 ) -> Result<BookRow, ScanError> {
+    // Canonicalize the folder so every track path stored below is absolute and
+    // symlink-resolved — in-place serving must not depend on the server's cwd.
+    let dir_canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let dir = dir_canonical.as_path();
     let files = collect_mp3s(dir);
     if files.is_empty() {
         return Err(ScanError::EmptyFolder(dir.to_path_buf()));
@@ -995,13 +1006,14 @@ mod tests {
             (eps[1].duration_sec - 4.0).abs() < 0.6,
             "middle is track 2 (4s)"
         );
+        let book_c = book.canonicalize().unwrap();
         for (i, e) in eps.iter().enumerate() {
             assert_eq!(e.idx, i as i64);
             let p = PathBuf::from(&e.file_path);
             assert!(p.exists(), "track file on disk");
             assert!(
-                p.starts_with(&book),
-                "served in place from the library, not copied"
+                p.starts_with(&book_c),
+                "served in place from the library (canonical), not copied"
             );
             assert!(!p.starts_with(&data), "nothing served from the data dir");
             assert_eq!(
@@ -1017,17 +1029,12 @@ mod tests {
 
         // No per-track copies were written under <data>/books/<id>/.
         let book_out = data.join("books").join(&books[0].id);
-        let copies = std::fs::read_dir(&book_out)
-            .map(|rd| {
-                rd.flatten()
-                    .filter(|e| e.path().extension().is_some_and(|x| x == "mp3"))
-                    .count()
-            })
-            .unwrap_or(0);
-        assert_eq!(
-            copies, 0,
-            "MP3-folder tracks are not copied to the data dir"
-        );
+        for i in 1..=eps.len() {
+            assert!(
+                !book_out.join(format!("{i:03}.mp3")).exists(),
+                "MP3-folder track {i} is not copied to the data dir"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1274,9 +1281,12 @@ mod tests {
         let eps = index.episodes_for_book(&book.id).unwrap();
         assert_eq!(eps.len(), 1, "no chapters/cue -> single episode");
         assert!(eps[0].file_path.ends_with(".flac"));
-        // Chapterless single file → served in place from the library, not copied.
-        assert_eq!(eps[0].source_path, flac.to_string_lossy());
-        assert_eq!(eps[0].file_path, flac.to_string_lossy());
+        // Chapterless single file → served in place from the library (the stored
+        // path is canonical/absolute), not copied.
+        let flac_c = flac.canonicalize().unwrap();
+        assert_eq!(eps[0].source_path, flac_c.to_string_lossy());
+        assert_eq!(eps[0].file_path, flac_c.to_string_lossy());
+        assert!(Path::new(&eps[0].source_path).is_absolute());
         assert!(!Path::new(&eps[0].file_path).starts_with(&data));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1306,7 +1316,10 @@ mod tests {
         );
         // Served in place from the library (the original `.opus`), not remuxed
         // into a data-dir container.
-        assert_eq!(eps[0].source_path, opus.to_string_lossy());
+        assert_eq!(
+            eps[0].source_path,
+            opus.canonicalize().unwrap().to_string_lossy()
+        );
         assert!(!Path::new(&eps[0].file_path).starts_with(&data));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1524,10 +1537,13 @@ mod tests {
         let eps = index.episodes_for_book(&book.id).unwrap();
         assert_eq!(eps.len(), 1, "chapter-less -> single episode");
         assert!(Path::new(&eps[0].file_path).exists());
-        // Served in place from the library — the episode IS the source file, and
-        // nothing was copied under the data dir.
-        assert_eq!(eps[0].source_path, input.to_string_lossy());
-        assert_eq!(eps[0].file_path, input.to_string_lossy());
+        // Served in place from the library — the episode IS the source file
+        // (stored as a canonical/absolute path), and nothing was copied under the
+        // data dir.
+        let input_c = input.canonicalize().unwrap();
+        assert_eq!(eps[0].source_path, input_c.to_string_lossy());
+        assert_eq!(eps[0].file_path, input_c.to_string_lossy());
+        assert!(Path::new(&eps[0].source_path).is_absolute());
         assert!(!Path::new(&eps[0].file_path).starts_with(&data));
         assert_eq!(
             eps[0].byte_length as u64,

@@ -523,15 +523,34 @@ fn resolve_audio_target(
     // Serve-in-place (Sprint 6.2): a whole-file episode (MP3-folder track, or a
     // chapterless single file) is streamed directly from the read-only library —
     // never copied under the data dir. `source_path` is the persisted library
-    // file. Canonicalize it and assert it stays under the library root (rejecting
-    // any symlink/`..` escape) before it is opened; there is nothing to
-    // regenerate. This is the A01 "assert under the library root" rule (TAD §7).
+    // file. Three guards before it's served, all 404 on failure (no oracle):
+    //   1. canonicalize + assert under the library root (reject `..`/symlink
+    //      escape) — the A01 "assert under the library root" rule (TAD §7);
+    //   2. the recorded enclosure length must equal the on-disk source size —
+    //      the WHOLE-FILE invariant. A chaptered episode (a sub-range) that
+    //      wrongly carries a `source_path` from a bad migration / partial rescan
+    //      / manual edit has a chapter-sized `byte_length` ≠ the container size,
+    //      so it's rejected here instead of serving the full container's bytes
+    //      under the chapter's enclosure length.
+    // Returns before the data-dir/regeneration logic below, so a poisoned row can
+    // never fall through into it.
     if !ep.source_path.is_empty() {
         let src = FsPath::new(&ep.source_path)
             .canonicalize()
             .map_err(|_| AppError::NotFound)?;
         if !src.starts_with(&state.library_dir) {
             tracing::warn!(feed_id, number, "in-place audio escaped the library root");
+            return Err(AppError::NotFound);
+        }
+        let src_len = std::fs::metadata(&src)
+            .map(|m| m.len() as i64)
+            .map_err(|_| AppError::NotFound)?;
+        if src_len != ep.byte_length {
+            tracing::warn!(
+                feed_id,
+                number,
+                "in-place source size != recorded enclosure length; refusing to serve (corrupt row?)"
+            );
             return Err(AppError::NotFound);
         }
         return Ok(AudioTarget {

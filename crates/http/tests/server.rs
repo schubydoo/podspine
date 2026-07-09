@@ -374,7 +374,10 @@ async fn serves_whole_file_episode_in_place_from_the_library() {
     // copied nothing under the data dir.
     let eps = index.episodes_for_book(&book.id).unwrap();
     assert_eq!(eps.len(), 1);
-    assert_eq!(eps[0].source_path, input.to_string_lossy());
+    assert_eq!(
+        eps[0].source_path,
+        input.canonicalize().unwrap().to_string_lossy()
+    );
     let source_len = std::fs::metadata(&input).unwrap().len();
     assert_eq!(
         eps[0].byte_length as u64, source_len,
@@ -482,6 +485,69 @@ async fn in_place_source_outside_the_library_is_a_404() {
         resp.status(),
         StatusCode::NOT_FOUND,
         "in-place source outside the library root is rejected"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[tokio::test]
+async fn in_place_source_on_a_chaptered_episode_is_rejected() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+    let base = std::env::temp_dir().join("podspine-http-corrupt-inplace");
+    let _ = std::fs::remove_dir_all(&base);
+    let library = base.join("library");
+    let data = base.join("data");
+    std::fs::create_dir_all(&library).unwrap();
+
+    let index = Index::open_in_memory().unwrap();
+    // A chaptered container under the library, split into the data dir (full mode).
+    let input = synth_three_chapters(&library);
+    let book = scan_book(&input, &data, &index).unwrap();
+    let feed_id = book.feed_id.clone();
+    let mut ep = index.episodes_for_book(&book.id).unwrap()[0].clone();
+    assert!(
+        ep.source_path.is_empty(),
+        "a chaptered episode has no source_path"
+    );
+
+    // Corrupt the row: mark chapter 1 as in-place pointing at the WHOLE container
+    // (under the library, so the library-root check passes). Its recorded
+    // byte_length is the chapter's size, not the container's — so the whole-file
+    // size invariant must reject it rather than serve the full container's bytes.
+    ep.source_path = input.canonicalize().unwrap().to_string_lossy().into_owned();
+    assert_ne!(
+        ep.byte_length as u64,
+        std::fs::metadata(&input).unwrap().len(),
+        "precondition: chapter length differs from the container size"
+    );
+    index.upsert_episode(&ep).unwrap();
+
+    let state = AppState::new(
+        index,
+        "http://test".to_string(),
+        &data,
+        &library,
+        None,
+        false,
+        None,
+        None,
+    );
+    let app = router(state);
+    let resp = app
+        .oneshot(
+            Request::get(format!("/audio/{feed_id}/1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "a chaptered episode with a stray source_path must not serve the container"
     );
 
     let _ = std::fs::remove_dir_all(&base);
