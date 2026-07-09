@@ -814,9 +814,11 @@ invariants that keep those feeds correct and the server safe.</p>
 <p>Podspine is a single Rust binary built as a Cargo workspace — one crate per
 pipeline stage. It shells out to <code>ffmpeg</code>/<code>ffprobe</code> as separate processes (a GPL
 boundary; always invoked with an argument vector, never a shell string) and keeps
-its own state in a SQLite index plus a flat directory of split episode files.</p>
-<p>At startup it resolves configuration, scans the library (splitting each book into
-per-chapter files and recording them in the index), then serves feeds, audio, and a
+its own state in a SQLite index plus a flat directory of extracted chapter files
+and covers (whole-file episodes are served in place from the library, not copied).</p>
+<p>At startup it resolves configuration, scans the library (splitting chaptered books
+into per-chapter files, serving whole-file books in place, and recording both in
+the index), then serves feeds, audio, and a
 small browse UI over HTTP. A background watcher keeps the index reconciled with the
 library while it runs, so added, replaced, or removed books are picked up without a
 restart.</p>
@@ -889,24 +891,34 @@ serve) and a <code>podspine-cli</code> proof-of-concept for the single-file spli
   G --&gt; H[extract cover, if any]
   H --&gt; I[(index: book + episodes)]</code></pre>
 <ul>
-<li><strong>Single-file books</strong> (<code>.m4b</code>/<code>.m4a</code>, <code>.mp3</code>, <code>.ogg</code>/<code>.opus</code>/<code>.flac</code>) are split by
-  chapter via stream copy into a container matching the source codec
-  (<code>m4a</code>/<code>mp3</code>/<code>flac</code>/<code>ogg</code>/<code>opus</code>).</li>
+<li><strong>Chaptered single-file books</strong> (<code>.m4b</code>/<code>.m4a</code>, <code>.mp3</code>, <code>.ogg</code>/<code>.opus</code>/<code>.flac</code>
+  with chapters) are split by chapter via stream copy into a container matching
+  the source codec (<code>m4a</code>/<code>mp3</code>/<code>flac</code>/<code>ogg</code>/<code>opus</code>) — see the storage model below
+  for <code>full</code> vs <code>saver</code>.</li>
 <li><strong>MP3 folders</strong> (per-chapter tracks) are treated as one episode per file, ordered
-  by track number (falling back to filename order) and <strong>byte-copied</strong> into the
-  data dir — no re-split, no re-encode.</li>
+  by track number (falling back to filename order) and <strong>served in place</strong> from the
+  library — no copy, no re-split, no re-encode.</li>
 <li>A book with no chapters and no sidecar degrades to a single-episode feed with a
-  warning.</li>
+  warning; that whole file is also <strong>served in place</strong> (Sprint 6.2).</li>
 </ul>
 <h2 id="storage-model">Storage model<a class="headerlink" href="#storage-model" title="Permanent link">&para;</a></h2>
-<p>SQLite index + flat filesystem. Episode audio is <strong>materialized under
-<code>&lt;data_dir&gt;</code> — a copy separate from your source library</strong>; the server does not yet
-stream from the library in place, so <code>&lt;data_dir&gt;</code> grows on top of the originals.
-In <code>full</code> mode (default) chapters are pre-split at ingest and kept; in <code>saver</code>
-mode every chapter is still split once at ingest (to record its exact byte
-length) but then deleted, and regenerated on demand into a bounded cache — so
-<code>saver</code> cuts steady-state disk, not ingest time or I/O. Folder-of-MP3 tracks are
-copied in full in either mode. See
+<p>SQLite index + flat filesystem. The unit is the <strong>episode</strong>, and how it is stored
+depends on whether it is a whole source file or a sub-range of a container:</p>
+<ul>
+<li><strong>Whole-file episode</strong> — a folder-of-MP3 track, or a chapterless single file —
+  is <strong>served in place</strong> from the read-only library (Sprint 6.2). Its
+  <code>episode.source_path</code> records the library file; nothing is copied under
+  <code>&lt;data_dir&gt;</code>, and the audio handler streams it (with Range) after asserting the
+  path stays under the canonical library root.</li>
+<li><strong>Chaptered episode</strong> — a sub-range of a container — must be <strong>extracted</strong> under
+  <code>&lt;data_dir&gt;</code> (a raw byte range of an <code>.m4b</code> isn't a standalone file). In <code>full</code>
+  mode (default) every chapter is pre-split at ingest and kept; in <code>saver</code> mode
+  each is split once at ingest to record its exact byte length, then deleted and
+  regenerated on demand into a bounded cache — so <code>saver</code> cuts steady-state disk,
+  not ingest time or I/O.</li>
+</ul>
+<p>So <code>&lt;data_dir&gt;</code> grows on top of the originals only for chaptered books; whole-file
+books cost only their index row and any extracted cover. See
 <a href="../DEPLOYMENT/#storage-mode-full-vs-saver">DEPLOYMENT.md</a> for the disk-budget
 details.</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>&lt;data_dir&gt;/
@@ -992,8 +1004,8 @@ split the way they are.</p>
 - A generated feed is rejected by the self-check before it can be served if any of
   the above is violated.</p>
 <p><strong>Audio fidelity:</strong>
-- Copy-first: chapters are split by stream copy, no re-encode, so there's no quality
-  loss.</p>
+- Never re-encoded: chapters are extracted by stream copy and whole files are served
+  untouched, so there's no quality loss.</p>
 <p><strong>Security (see <a href="https://github.com/schubydoo/podspine/blob/main/SECURITY.md">SECURITY.md</a> for the threat model):</strong>
 - Book/episode ids are <strong>opaque index keys</strong>. Slugs are validated against an
   allow-list charset and rejected with 404; the resolved audio path is canonicalized

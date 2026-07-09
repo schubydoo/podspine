@@ -730,8 +730,8 @@ Just a feed URL.</p>
   and <code>itunes:episode</code> numbers, and refuses to serve a feed that fails its own
   self-check.</li>
 <li><strong>Zero-config.</strong> <code>docker run</code> with your library mounted just works.</li>
-<li><strong>Copy-first, no quality loss.</strong> Chapters are split by stream copy (no re-encode)
-  at ingest.</li>
+<li><strong>No re-encode, no quality loss.</strong> Podspine never transcodes: chapters are
+  extracted by stream copy, and whole files are served straight from your library.</li>
 <li><strong>Private by default.</strong> Each feed lives at an unguessable capability URL; the
   library is watched and feeds auto-refresh as you add books.</li>
 <li><strong>Your files stay yours.</strong> DRM-free input only — Podspine ships no DRM
@@ -754,9 +754,10 @@ book's QR code to open its one-tap <a href="importing/">subscribe page</a>.</p>
 hostname). It defaults to <code>http://localhost:8080</code>, which only works from the same
 machine — feed and audio URLs are built from it.</p>
 </div>
-<p><code>ffmpeg</code>/<code>ffprobe</code> are bundled in the image. <code>/data</code> holds the SQLite index and the
-split episode files, so keep it on a persistent volume. Prebuilt static binaries and
-<code>cargo run</code> are covered in <a href="DEPLOYMENT/">Deploying</a>.</p>
+<p><code>ffmpeg</code>/<code>ffprobe</code> are bundled in the image. <code>/data</code> holds the SQLite index and any
+extracted chapter files (whole-file episodes stream from your library), so keep it
+on a persistent volume. Prebuilt static binaries and <code>cargo run</code> are covered in
+<a href="DEPLOYMENT/">Deploying</a>.</p>
 <h2 id="where-to-next">Where to next<a class="headerlink" href="#where-to-next" title="Permanent link">&para;</a></h2>
 <div class="grid cards">
 <ul>

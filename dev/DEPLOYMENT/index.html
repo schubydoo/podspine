@@ -953,7 +953,7 @@ that precedence. The library path is the only required input.</p>
 <td><code>--data-dir</code></td>
 <td><code>PODSPINE_DATA_DIR</code></td>
 <td><code>./data</code></td>
-<td>SQLite index + split episode files.</td>
+<td>SQLite index + extracted chapter files + covers (whole-file episodes stream from the library).</td>
 </tr>
 <tr>
 <td><code>--bind</code></td>
@@ -1013,12 +1013,14 @@ public URL if behind a proxy) that clients actually reach.</p>
 </blockquote>
 <h3 id="storage-mode-full-vs-saver">Storage mode: <code>full</code> vs <code>saver</code><a class="headerlink" href="#storage-mode-full-vs-saver" title="Permanent link">&para;</a></h3>
 <blockquote>
-<p><strong>Expect extra disk use — today Podspine always <em>copies</em> audio into
-<code>--data-dir</code>.</strong> It does not yet stream episodes from your library in place, so
-the data dir grows <em>in addition to</em> the originals you already keep. Both modes
-below reduce or defer that copy for chaptered books; neither eliminates it, and
-folder-of-MP3 books are copied in full regardless. Serving whole-file tracks
-directly from the library (no copy) is planned but not yet shipped.</p>
+<p><strong>Disk use — only <em>chaptered</em> books materialize under <code>--data-dir</code>.</strong> A
+chaptered container (e.g. one <code>.m4b</code>) is split into per-chapter episodes stored
+under the data dir (<code>full</code>) or a bounded on-demand cache (<code>saver</code>), so the data
+dir grows <em>on top of</em> the originals you keep. <strong>Whole-file episodes are streamed
+in place:</strong> folder-of-MP3 tracks and chapterless single files play straight from
+the read-only library — nothing is copied for them, and <code>storage-mode</code> doesn't
+apply. So budget extra disk for chaptered libraries; whole-file books cost only
+their index row and any extracted cover.</p>
 </blockquote>
 <p>By default (<code>full</code>) Podspine pre-splits every chapter to disk at ingest, so a
 chaptered book uses roughly <strong>twice</strong> its source size — the original in your
@@ -1043,14 +1045,17 @@ cache cap (<code>PODSPINE_CACHE_SIZE</code>) rather than a second copy of every 
   window.</li>
 <li>Ingest takes the <strong>same</strong> time in either mode — <code>saver</code> saves disk, not
   ingest time.</li>
-<li><strong>Folder-of-MP3 books are always copied in full</strong>, in <code>saver</code> too: their
-  tracks are already whole files (not splits from a container), so there is
-  nothing to defer, and they are copied into <code>--data-dir</code> and never evicted.
-  <code>saver</code> only helps books that ship as a chaptered container (e.g. one <code>.m4b</code>).</li>
+<li><strong>Whole-file episodes are served in place — never copied, never evicted.</strong> A
+  folder-of-MP3 book's tracks, and a chapterless single file, are already whole
+  files (not sub-ranges of a container), so Podspine streams them directly from
+  the library and records only their source path. <code>storage-mode</code> therefore has no
+  effect on them; it governs <strong>only</strong> chaptered containers, which must be
+  extracted per chapter.</li>
 </ul>
 <p><code>saver</code> suits large <strong>chaptered</strong> libraries on small disks; keep <code>full</code> if disk
-is cheap and you want every play to start instantly. Either way, size
-<code>--data-dir</code> for meaningful growth until in-place serving lands.</p>
+is cheap and you want every play to start instantly. Either way you only need to
+size <code>--data-dir</code> for your chaptered books — whole-file books add essentially
+nothing beyond their index rows and covers.</p>
 <h2 id="exposing-podspine-safely">Exposing Podspine safely<a class="headerlink" href="#exposing-podspine-safely" title="Permanent link">&para;</a></h2>
 <p>Podspine has two kinds of routes, and they want different exposure:</p>
 <table>
@@ -1093,9 +1098,12 @@ externally. If a link leaks, hit <strong>Regenerate</strong> on the book page �
 <a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="w">  </span>ghcr.io/schubydoo/podspine:latest
 </code></pre></div>
 <ul>
-<li>Mount the library <strong>read-only</strong> (<code>:ro</code>) — Podspine only reads it.</li>
+<li>Mount the library <strong>read-only</strong> (<code>:ro</code>) — Podspine only reads it. This is also a
+  security control: whole-file episodes are streamed straight from the library, so
+  a read-only mount prevents a less-trusted process from swapping a file for a
+  symlink to escape the served trust boundary.</li>
 <li>Keep <code>/data</code> on a <strong>named volume</strong> (or a host path): it holds the SQLite index and
-  the split episode files, and should persist across restarts and upgrades.</li>
+  any extracted chapter files, and should persist across restarts and upgrades.</li>
 </ul>
 <h3 id="docker-compose">docker-compose<a class="headerlink" href="#docker-compose" title="Permanent link">&para;</a></h3>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="nt">services</span><span class="p">:</span>
