@@ -90,7 +90,7 @@ jobs:
         with:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - uses: taiki-e/install-action@5ebac0d9522d786674368e47e92963ba13f2c376 # v2
+      - uses: taiki-e/install-action@c7eb1735f09259a5035e8e5d44b1406b1cddc0fb # v2
         with:
           tool: cargo-llvm-cov
       - name: Set up ffmpeg
@@ -120,7 +120,7 @@ jobs:
       # tools from source — by far the slowest step in CI. cargo-audit/deny only read
       # Cargo.toml/lock, so no project toolchain is needed (the runner's cargo
       # dispatches the subcommands).
-      - uses: taiki-e/install-action@5ebac0d9522d786674368e47e92963ba13f2c376 # v2
+      - uses: taiki-e/install-action@c7eb1735f09259a5035e8e5d44b1406b1cddc0fb # v2
         with:
           tool: cargo-audit,cargo-deny
       - name: Audit
