@@ -96,6 +96,44 @@ chapter, **not** a pinned second copy. The default is **off** because in-place
 serving costs no disk; enable it if slow seeking on those books bothers you and
 you can spare the cache. (A faststart mp4, or any non-mp4, is left untouched.)
 
+## Per-book overrides (`.podspine.toml`)
+
+Any of the per-book-meaningful settings above can be overridden for **one book**
+with a small `.podspine.toml` sidecar — handy for troubleshooting a single
+misbehaving book without changing the whole server. Precedence: **sidecar → CLI /
+env → global config file → default.**
+
+**Where to put it** (works for every library layout):
+
+- **A single file** — name it after the file: `Author - Title.podspine.toml`
+  beside `Author - Title.m4b` (same as a `.cue` sidecar). Works whether the file
+  is at the top level or in its own folder.
+- **A multi-file (MP3-folder) book, or a lone file kept in its own folder** — drop
+  a `.podspine.toml` **inside that folder**.
+
+**Keys you can set:**
+
+| Key | Effect |
+|---|---|
+| `storage_mode` | `"full"`/`"saver"` for just this book (serve + eviction honor it). |
+| `force_embedded_chapters` | Ignore this book's `.cue`/`.ffmeta` sidecar. |
+| `remux_non_faststart` | Remux this book to faststart if it's a non-faststart mp4. |
+| `default_cover_url` | Feed cover fallback for this book. |
+| `title` / `author` | Override the feed title/author (fix metadata without renaming files). |
+| `disabled` | `true` removes this book from the index and every feed/page. |
+| `force_reingest` | `true` re-processes the book on every scan (drop it once you're done). |
+
+```toml
+# Author - Title.podspine.toml — force this one big book onto saver, fix its title
+storage_mode = "saver"
+title = "The Correct Title"
+```
+
+Server-wide keys (`bind`, `base_url`, `library`, `data_dir`, `cache_size`,
+`cache_ttl`, …) are **ignored with a log warning** if they appear in a per-book
+file — they only make sense server-wide. An unparseable sidecar is logged and
+skipped for that book; it never aborts the scan.
+
 ## Exposing Podspine safely
 
 Podspine has two kinds of routes, and they want different exposure:

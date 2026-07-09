@@ -47,7 +47,7 @@ use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 use podspine_feed::{FeedBook, FeedEpisode, render_checked};
-use podspine_index::Index;
+use podspine_index::{BookRow, Index};
 use podspine_splitter::{ChapterCut, remux_faststart, split_chapter};
 use podspine_ui::{BookCard, BookDetail, book_page, index_page, subscribe_page};
 
@@ -440,12 +440,14 @@ fn build_feed_xml(state: &AppState, feed_id: &str) -> Result<String, AppError> {
     };
 
     let base = &state.base_url;
-    // Per-book cover served at /cover/{feed_id} when extracted; otherwise the
-    // configured feed-level fallback (or no image at all). See Task 3.4.
+    // Per-book cover served at /cover/{feed_id} when extracted; otherwise a
+    // per-book `.podspine.toml` fallback (Sprint 6.4), then the server-wide one,
+    // then no image at all. See Task 3.4.
     let cover_url = book
         .cover_path
         .as_ref()
         .map(|_| format!("{base}/cover/{feed_id}"))
+        .or_else(|| book.default_cover_url.clone())
         .or_else(|| state.default_cover_url.clone());
     let feed_book = FeedBook {
         id: book.id,
@@ -477,6 +479,17 @@ fn build_feed_xml(state: &AppState, feed_id: &str) -> Result<String, AppError> {
 /// Resolve `(feed_id, episode number)` to a validated on-disk path.
 /// What `/audio` needs: the canonical target file (which may not exist yet in
 /// `saver` mode) and, in `saver` mode, everything to regenerate it on demand.
+/// Whether a book's effective storage mode is `saver`: its per-book
+/// `.podspine.toml` override (Sprint 6.4) if set, else the server default. An
+/// empty string is a pre-6.4 row that follows the server config until re-scanned.
+fn book_is_saver(book: &BookRow, global_saver: bool) -> bool {
+    match book.storage_mode.as_str() {
+        "saver" => true,
+        "full" => false,
+        _ => global_saver,
+    }
+}
+
 struct AudioTarget {
     path: PathBuf,
     regen: Option<Regen>,
@@ -634,25 +647,27 @@ fn resolve_audio_target(
             },
         })
     } else {
-        // A chaptered episode. Regen is possible only in `saver` mode when the
-        // book's source is a single file to re-split; the `is_file` guard is
-        // belt-and-suspenders (a directory source would make `ffmpeg <directory>`
-        // fail), so a missing file is a clean 404, not a 500.
-        (state.saver && FsPath::new(&book.source_path).is_file()).then(|| Regen {
-            source: PathBuf::from(&book.source_path),
-            out_dir,
-            out_ext,
-            // `end_sec` is reconstructed as start + duration. This is EXACT, not an
-            // approximation: the scanner stores `duration_sec = cut.end - cut.start`
-            // (the requested cut length, not a measured output duration), so this
-            // yields the same `[start, end)` the ingest split used — and ffmpeg's
-            // 6-decimal arg formatting absorbs any float round-trip. The stream
-            // copy is therefore byte-identical (asserted in the serve test).
-            op: RegenOp::Chapter(ChapterCut {
-                idx: idx as usize,
-                start_sec: ep.start_sec,
-                end_sec: ep.start_sec + ep.duration_sec,
-            }),
+        // A chaptered episode. Regen is possible only in `saver` mode (per-book,
+        // Sprint 6.4) when the book's source is a single file to re-split; the
+        // `is_file` guard is belt-and-suspenders (a directory source would make
+        // `ffmpeg <directory>` fail), so a missing file is a clean 404, not a 500.
+        (book_is_saver(&book, state.saver) && FsPath::new(&book.source_path).is_file()).then(|| {
+            Regen {
+                source: PathBuf::from(&book.source_path),
+                out_dir,
+                out_ext,
+                // `end_sec` is reconstructed as start + duration. This is EXACT, not an
+                // approximation: the scanner stores `duration_sec = cut.end - cut.start`
+                // (the requested cut length, not a measured output duration), so this
+                // yields the same `[start, end)` the ingest split used — and ffmpeg's
+                // 6-decimal arg formatting absorbs any float round-trip. The stream
+                // copy is therefore byte-identical (asserted in the serve test).
+                op: RegenOp::Chapter(ChapterCut {
+                    idx: idx as usize,
+                    start_sec: ep.start_sec,
+                    end_sec: ep.start_sec + ep.duration_sec,
+                }),
+            }
         })
     };
     Ok(AudioTarget { path, regen })
@@ -724,24 +739,32 @@ async fn enforce_cache(state: &AppState, keep: &FsPath) {
         return; // unbounded + no TTL: nothing to evict
     }
     let books = state.data_dir.join("books");
-    // Only single-file-source books are regenerable; their cached chapters are
-    // safe to evict (they re-split on demand). A non-regenerable book dir must be
-    // left alone — nothing would rebuild it: whole-file books are served in place
-    // (any dir here is just a cover, or a legacy pre-6.2 copy not yet reclaimed).
-    // So restrict eviction to the regenerable book dirs. Snapshot the sources
+    // Evict only from **effective-`saver`, single-file-source** books (per-book
+    // storage_mode, Sprint 6.4): their cached chapters re-split on demand, so
+    // deleting one is safe. A `full` book's chapters are kept — evicting them
+    // would 404 (no regen) — and a non-single-file book (MP3 folder) is served in
+    // place, so those dirs are left alone. (A `full` book's remux cache, if any,
+    // therefore persists — a minor, safe over-conservatism.) Snapshot the sources
     // without holding the lock across the `is_file` stats.
-    let sources: Vec<(String, String)> = {
+    let sources: Vec<(String, bool)> = {
         let Ok(index) = state.index.lock() else {
             return;
         };
         match index.list_books() {
-            Ok(bs) => bs.into_iter().map(|b| (b.id, b.source_path)).collect(),
+            Ok(bs) => bs
+                .into_iter()
+                .map(|b| {
+                    let regen =
+                        book_is_saver(&b, state.saver) && FsPath::new(&b.source_path).is_file();
+                    (b.id, regen)
+                })
+                .collect(),
             Err(_) => return,
         }
     };
     let regenerable: HashSet<PathBuf> = sources
         .into_iter()
-        .filter(|(_, src)| FsPath::new(src).is_file())
+        .filter(|(_, regen)| *regen)
         .map(|(id, _)| books.join(id))
         .collect();
     let keep = keep.to_path_buf();

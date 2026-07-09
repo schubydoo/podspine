@@ -14,6 +14,9 @@ use std::time::Duration;
 use clap::{Parser, ValueEnum};
 use serde::Deserialize;
 
+pub mod book_overrides;
+pub use book_overrides::BookOverrides;
+
 const DEFAULT_BIND: &str = "0.0.0.0:8080";
 const DEFAULT_DATA_DIR: &str = "./data";
 /// Default `saver`-mode cache cap when unset: 2 GiB.

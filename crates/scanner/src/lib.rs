@@ -31,6 +31,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+pub use podspine_config::BookOverrides;
+use podspine_config::{StorageMode, book_overrides};
 use podspine_feed::{episode_guid, pubdate_epoch};
 use podspine_index::{BookRow, EpisodeRow, Index, IndexError};
 use podspine_prober::{ProbeError, needs_faststart, probe};
@@ -84,7 +86,16 @@ pub enum ScanError {
 /// name. Convenience wrapper over [`scan_book_as`] for single-book callers.
 pub fn scan_book(input: &Path, data_dir: &Path, index: &Index) -> Result<BookRow, ScanError> {
     let id = slugify(&file_stem(input));
-    scan_book_as(input, &id, data_dir, index, false, false, false)
+    scan_book_as(
+        input,
+        &id,
+        data_dir,
+        index,
+        false,
+        false,
+        false,
+        &BookOverrides::default(),
+    )
 }
 
 /// Scan one audiobook `input` into `index` under the explicit `id` (also used as
@@ -100,6 +111,9 @@ pub fn scan_book(input: &Path, data_dir: &Path, index: &Index) -> Result<BookRow
 /// but the file is deleted immediately afterwards — the http layer regenerates
 /// it on demand. Peak extra disk is one chapter, not a full second copy of the
 /// book. `false` is the default (pre-split, files kept).
+// TODO(6.4+): the global flags + `overrides` are getting numerous; if a further
+// per-book knob lands, bundle the globals into a `ScanOptions` struct.
+#[allow(clippy::too_many_arguments)]
 pub fn scan_book_as(
     input: &Path,
     id: &str,
@@ -108,6 +122,7 @@ pub fn scan_book_as(
     force_embedded: bool,
     saver: bool,
     remux_non_faststart: bool,
+    overrides: &BookOverrides,
 ) -> Result<BookRow, ScanError> {
     if !input.is_file() {
         return Err(ScanError::NotAFile(input.to_path_buf()));
@@ -122,6 +137,17 @@ pub fn scan_book_as(
     // canonicalize succeeds; the fallback only guards a race.
     let input_canonical = input.canonicalize().unwrap_or_else(|_| input.to_path_buf());
     let input = input_canonical.as_path();
+
+    // Per-book `.podspine.toml` overrides refine the global flags for this book
+    // (Sprint 6.4); `disabled` is handled by the caller before we're reached.
+    let force_embedded = overrides.force_embedded_chapters.unwrap_or(force_embedded);
+    let remux_non_faststart = overrides.remux_non_faststart.unwrap_or(remux_non_faststart);
+    let saver = match overrides.storage_mode {
+        Some(StorageMode::Saver) => true,
+        Some(StorageMode::Full) => false,
+        None => saver,
+    };
+    let force_reingest = overrides.force_reingest == Some(true);
 
     let id = id.to_string();
     let source_mtime = mtime_epoch(input)?;
@@ -163,7 +189,14 @@ pub fn scan_book_as(
                 || (!e.source_path.is_empty() && e.file_path != e.source_path);
             regenerable || Path::new(&e.file_path).exists()
         });
-        if !eps.is_empty() && start_secs_recorded && faststart_consistent && files_present {
+        // `force_reingest` (a `.podspine.toml` troubleshooting knob) always skips
+        // the early return so the book is re-processed on every scan while set.
+        if !force_reingest
+            && !eps.is_empty()
+            && start_secs_recorded
+            && faststart_consistent
+            && files_present
+        {
             return Ok(existing);
         }
     }
@@ -306,12 +339,16 @@ pub fn scan_book_as(
         id: id.clone(),
         slug: id.clone(),
         feed_id: podspine_index::capability::generate(),
-        title: file_stem(input),
-        author: None,
+        // Per-book overrides (Sprint 6.4): title/author from the sidecar if set.
+        title: overrides.title.clone().unwrap_or_else(|| file_stem(input)),
+        author: overrides.author.clone(),
         cover_path,
         source_path: input.to_string_lossy().into_owned(),
         source_mtime,
         status: "ready".to_string(),
+        // Persist the effective mode so serve/evict honor it without the sidecar.
+        storage_mode: if saver { "saver" } else { "full" }.to_string(),
+        default_cover_url: overrides.default_cover_url.clone(),
     };
     index.upsert_book(&book)?;
 
@@ -390,6 +427,7 @@ fn scan_mp3_folder(
     id: &str,
     data_dir: &Path,
     index: &Index,
+    overrides: &BookOverrides,
 ) -> Result<BookRow, ScanError> {
     // Canonicalize the folder so every track path stored below is absolute and
     // symlink-resolved — in-place serving must not depend on the server's cwd.
@@ -414,7 +452,8 @@ fn scan_mp3_folder(
     // The `source_path` guard forces a one-time re-ingest of a pre-6.2 book
     // (tracks copied under <data_dir>, empty `source_path`) so it flips to
     // in-place serving and its copies get reclaimed.
-    if let Some(existing) = index.get_book(id)?
+    if overrides.force_reingest != Some(true)
+        && let Some(existing) = index.get_book(id)?
         && existing.source_mtime == source_mtime
     {
         let eps = index.episodes_for_book(id)?;
@@ -452,12 +491,17 @@ fn scan_mp3_folder(
         id: id.to_string(),
         slug: id.to_string(),
         feed_id: podspine_index::capability::generate(),
-        title: dir_name(dir),
-        author: None,
+        // Per-book overrides (Sprint 6.4). storage_mode/remux/force_embedded are
+        // no-ops for MP3 folders (tracks are always served in place), so only
+        // title/author/cover apply; persist storage_mode as `""` (follow global).
+        title: overrides.title.clone().unwrap_or_else(|| dir_name(dir)),
+        author: overrides.author.clone(),
         cover_path: None,
         source_path: dir.to_string_lossy().into_owned(),
         source_mtime,
         status: "ready".to_string(),
+        storage_mode: String::new(),
+        default_cover_url: overrides.default_cover_url.clone(),
     };
     index.upsert_book(&book)?;
 
@@ -576,6 +620,29 @@ impl BookSource {
 /// are deliberately absent and logged as skipped during discovery (PRD W5).
 const AUDIO_EXTENSIONS: &[&str] = &["m4b", "m4a", "mp3", "ogg", "oga", "opus", "flac"];
 
+/// Resolve + parse a book's `.podspine.toml` (Sprint 6.4). A missing sidecar
+/// yields the empty default; a bad sidecar or a server-global key that doesn't
+/// apply per book is logged and dropped — never fatal to the scan. `source` is
+/// canonicalized so the folder-vs-library-root check compares like-for-like.
+fn resolve_book_overrides(source: &Path, library_root: &Path) -> BookOverrides {
+    let source = source
+        .canonicalize()
+        .unwrap_or_else(|_| source.to_path_buf());
+    match book_overrides::load(&source, library_root) {
+        Ok(Some(o)) => {
+            for key in o.ignored_global_keys() {
+                tracing::warn!(source = %source.display(), key, "ignoring server-global key in .podspine.toml");
+            }
+            o
+        }
+        Ok(None) => BookOverrides::default(),
+        Err(msg) => {
+            tracing::warn!("{msg}; ignoring per-book overrides");
+            BookOverrides::default()
+        }
+    }
+}
+
 /// Scan a library root of many audiobooks into `index`, writing each book's
 /// episodes under `<data_dir>/books/<slug>/`. One independent book per top-level
 /// audio file or per-book subfolder. Slugs are collision-free and deterministic
@@ -589,6 +656,11 @@ pub fn scan_library(
     remux_non_faststart: bool,
 ) -> ScanSummary {
     let sources = discover(library);
+    // Canonical library root, for resolving per-book `.podspine.toml` sidecars
+    // (Sprint 6.4) — matched against each book's canonical source path.
+    let library_root = library
+        .canonicalize()
+        .unwrap_or_else(|_| library.to_path_buf());
 
     let mut seen = HashSet::new();
     let mut summary = ScanSummary::default();
@@ -596,6 +668,21 @@ pub fn scan_library(
         // Reserve a slug for every candidate in deterministic order so a book's
         // slug is stable across re-scans regardless of siblings' outcomes.
         let slug = unique_slug(&slugify(&source.base_name()), &mut seen);
+        let source_path = match &source {
+            BookSource::File(p) => p.as_path(),
+            BookSource::Mp3Folder(d) => d.as_path(),
+        };
+        let overrides = resolve_book_overrides(source_path, &library_root);
+        // `disabled` (a `.podspine.toml` troubleshooting knob): drop the book from
+        // every surface — prune it if it was previously indexed, and skip.
+        if overrides.disabled == Some(true) {
+            if matches!(index.get_book(&slug), Ok(Some(_))) {
+                let _ = index.delete_book(&slug);
+            }
+            tracing::info!(slug = %slug, "book disabled by .podspine.toml — skipped");
+            summary.skipped += 1;
+            continue;
+        }
         match source {
             BookSource::File(path) => {
                 match scan_book_as(
@@ -606,6 +693,7 @@ pub fn scan_library(
                     force_embedded,
                     saver,
                     remux_non_faststart,
+                    &overrides,
                 ) {
                     Ok(book) => {
                         summary.indexed += 1;
@@ -617,16 +705,18 @@ pub fn scan_library(
                     }
                 }
             }
-            BookSource::Mp3Folder(dir) => match scan_mp3_folder(&dir, &slug, data_dir, index) {
-                Ok(book) => {
-                    summary.indexed += 1;
-                    tracing::info!(slug = %book.slug, title = %book.title, "indexed MP3-folder book");
+            BookSource::Mp3Folder(dir) => {
+                match scan_mp3_folder(&dir, &slug, data_dir, index, &overrides) {
+                    Ok(book) => {
+                        summary.indexed += 1;
+                        tracing::info!(slug = %book.slug, title = %book.title, "indexed MP3-folder book");
+                    }
+                    Err(err) => {
+                        summary.skipped += 1;
+                        tracing::warn!(error = %err, path = %dir.display(), "skipped");
+                    }
                 }
-                Err(err) => {
-                    summary.skipped += 1;
-                    tracing::warn!(error = %err, path = %dir.display(), "skipped");
-                }
-            },
+            }
         }
     }
     tracing::info!(
@@ -1184,7 +1274,17 @@ mod tests {
         // force_embedded ignores the sidecar -> back to 3 embedded chapters.
         let data2 = dir.join("data2");
         let index2 = Index::open_in_memory().unwrap();
-        let book2 = scan_book_as(&input, "forced", &data2, &index2, true, false, false).unwrap();
+        let book2 = scan_book_as(
+            &input,
+            "forced",
+            &data2,
+            &index2,
+            true,
+            false,
+            false,
+            &podspine_config::BookOverrides::default(),
+        )
+        .unwrap();
         assert_eq!(
             index2.episodes_for_book(&book2.id).unwrap().len(),
             3,
@@ -1207,7 +1307,17 @@ mod tests {
         let data = dir.join("data");
         let index = Index::open_in_memory().unwrap();
 
-        let book = scan_book_as(&input, "saver-book", &data, &index, false, true, false).unwrap();
+        let book = scan_book_as(
+            &input,
+            "saver-book",
+            &data,
+            &index,
+            false,
+            true,
+            false,
+            &podspine_config::BookOverrides::default(),
+        )
+        .unwrap();
         let eps = index.episodes_for_book(&book.id).unwrap();
         assert_eq!(eps.len(), 3);
         for (i, e) in eps.iter().enumerate() {
@@ -1230,7 +1340,17 @@ mod tests {
 
         // Idempotent: re-scanning at the same mtime is a no-op despite the files
         // being absent (the index entry alone satisfies the check in saver mode).
-        let again = scan_book_as(&input, "saver-book", &data, &index, false, true, false).unwrap();
+        let again = scan_book_as(
+            &input,
+            "saver-book",
+            &data,
+            &index,
+            false,
+            true,
+            false,
+            &podspine_config::BookOverrides::default(),
+        )
+        .unwrap();
         assert_eq!(again.id, book.id);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1250,7 +1370,17 @@ mod tests {
         let index = Index::open_in_memory().unwrap();
 
         // A normal full-mode ingest first: files on disk, real offsets recorded.
-        let book = scan_book_as(&input, "mig", &data, &index, false, false, false).unwrap();
+        let book = scan_book_as(
+            &input,
+            "mig",
+            &data,
+            &index,
+            false,
+            false,
+            false,
+            &podspine_config::BookOverrides::default(),
+        )
+        .unwrap();
         let eps = index.episodes_for_book(&book.id).unwrap();
         assert!(
             eps.iter().any(|e| e.start_sec > 0.0),
@@ -1266,7 +1396,17 @@ mod tests {
 
         // Re-scan at the SAME mtime in saver mode. The zeroed non-first chapters
         // must force a one-time re-split, not an idempotent skip.
-        let book2 = scan_book_as(&input, "mig", &data, &index, false, true, false).unwrap();
+        let book2 = scan_book_as(
+            &input,
+            "mig",
+            &data,
+            &index,
+            false,
+            true,
+            false,
+            &podspine_config::BookOverrides::default(),
+        )
+        .unwrap();
         assert_eq!(book2.id, book.id);
         let eps2 = index.episodes_for_book(&book.id).unwrap();
         assert!(
@@ -1629,7 +1769,17 @@ mod tests {
         {
             let data = dir.join("data-off");
             let index = Index::open_in_memory().unwrap();
-            let book = scan_book_as(&input, "ft", &data, &index, false, false, false).unwrap();
+            let book = scan_book_as(
+                &input,
+                "ft",
+                &data,
+                &index,
+                false,
+                false,
+                false,
+                &podspine_config::BookOverrides::default(),
+            )
+            .unwrap();
             let eps = index.episodes_for_book(&book.id).unwrap();
             assert!(eps[0].needs_faststart, "non-faststart mp4 flagged");
             assert_eq!(
@@ -1647,7 +1797,17 @@ mod tests {
         {
             let data = dir.join("data-on");
             let index = Index::open_in_memory().unwrap();
-            let book = scan_book_as(&input, "ft", &data, &index, false, false, true).unwrap();
+            let book = scan_book_as(
+                &input,
+                "ft",
+                &data,
+                &index,
+                false,
+                false,
+                true,
+                &podspine_config::BookOverrides::default(),
+            )
+            .unwrap();
             let eps = index.episodes_for_book(&book.id).unwrap();
             assert!(eps[0].needs_faststart);
             assert_ne!(
@@ -1705,7 +1865,17 @@ mod tests {
         // Even with remux ON, a faststart mp4 is served in place (nothing to fix).
         let data = dir.join("data");
         let index = Index::open_in_memory().unwrap();
-        let book = scan_book_as(&input, "ok", &data, &index, false, false, true).unwrap();
+        let book = scan_book_as(
+            &input,
+            "ok",
+            &data,
+            &index,
+            false,
+            false,
+            true,
+            &podspine_config::BookOverrides::default(),
+        )
+        .unwrap();
         let eps = index.episodes_for_book(&book.id).unwrap();
         assert!(!eps[0].needs_faststart);
         assert_eq!(
@@ -1728,13 +1898,33 @@ mod tests {
         let index = Index::open_in_memory().unwrap();
 
         // remux OFF → in place.
-        scan_book_as(&input, "t", &data, &index, false, false, false).unwrap();
+        scan_book_as(
+            &input,
+            "t",
+            &data,
+            &index,
+            false,
+            false,
+            false,
+            &podspine_config::BookOverrides::default(),
+        )
+        .unwrap();
         let e1 = index.episodes_for_book("t").unwrap();
         assert_eq!(e1[0].source_path, e1[0].file_path, "remux off → in place");
 
         // Same mtime, flag flipped ON: the faststart toggle guard forces a
         // re-ingest instead of the idempotent early return.
-        scan_book_as(&input, "t", &data, &index, false, false, true).unwrap();
+        scan_book_as(
+            &input,
+            "t",
+            &data,
+            &index,
+            false,
+            false,
+            true,
+            &podspine_config::BookOverrides::default(),
+        )
+        .unwrap();
         let e2 = index.episodes_for_book("t").unwrap();
         assert_ne!(
             e2[0].source_path, e2[0].file_path,
@@ -1742,7 +1932,17 @@ mod tests {
         );
 
         // Flip back OFF: re-ingest again, back to in place.
-        scan_book_as(&input, "t", &data, &index, false, false, false).unwrap();
+        scan_book_as(
+            &input,
+            "t",
+            &data,
+            &index,
+            false,
+            false,
+            false,
+            &podspine_config::BookOverrides::default(),
+        )
+        .unwrap();
         let e3 = index.episodes_for_book("t").unwrap();
         assert_eq!(
             e3[0].source_path, e3[0].file_path,
@@ -1750,6 +1950,68 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn per_book_toml_overrides_apply_at_ingest() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not available");
+            return;
+        }
+        let root = scratch("perbook");
+        let input = synth(&root, false); // flat.m4a (top-level single-file book)
+        let side = input
+            .canonicalize()
+            .unwrap()
+            .with_extension("podspine.toml");
+        std::fs::write(
+            &side,
+            b"title = \"My Override\"\nauthor = \"Someone\"\nstorage_mode = \"saver\"\n",
+        )
+        .unwrap();
+        let data = root.join("data");
+        let index = Index::open_in_memory().unwrap();
+
+        // Server is `full`, but the sidecar forces `saver` for this one book.
+        scan_library(&root, &data, &index, false, false, false);
+        let books = index.list_books().unwrap();
+        assert_eq!(books.len(), 1);
+        assert_eq!(books[0].title, "My Override");
+        assert_eq!(books[0].author.as_deref(), Some("Someone"));
+        assert_eq!(
+            books[0].storage_mode, "saver",
+            "per-book storage_mode is persisted for serve/evict"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn per_book_disabled_skips_and_prunes() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not available");
+            return;
+        }
+        let root = scratch("perbook-disabled");
+        let input = synth(&root, false);
+        let data = root.join("data");
+        let index = Index::open_in_memory().unwrap();
+
+        scan_library(&root, &data, &index, false, false, false);
+        assert_eq!(index.list_books().unwrap().len(), 1, "indexed first");
+
+        // A disabling sidecar removes it from the index on the next scan.
+        let side = input
+            .canonicalize()
+            .unwrap()
+            .with_extension("podspine.toml");
+        std::fs::write(&side, b"disabled = true").unwrap();
+        scan_library(&root, &data, &index, false, false, false);
+        assert_eq!(
+            index.list_books().unwrap().len(),
+            0,
+            "disabled book is pruned"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

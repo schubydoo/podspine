@@ -119,6 +119,10 @@ Podspine flags it at ingest, and `PODSPINE_REMUX_NON_FASTSTART=true` will remux 
 to faststart on demand (cache-managed, no re-encode) — see
 **[faststart](docs/DEPLOYMENT.md#faststart-for-whole-file-mp4)**.
 
+**One book acting up?** Drop a `.podspine.toml` next to it (or in its folder) to
+override settings — `storage_mode`, `title`/`author`, `disabled`, and more — for
+just that book. See **[per-book overrides](docs/DEPLOYMENT.md#per-book-overrides-podspinetoml)**.
+
 Each book's feed lives at an unguessable **capability URL** — `/feed/{feed_id}.xml`,
 with `/audio/{feed_id}/{n}` (episode audio, HTTP Range) and `/cover/{feed_id}`. The
 browse UI (`/`, `/book/{slug}`) enumerates your library, so keep it on the LAN or

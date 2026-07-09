@@ -10,6 +10,7 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+podspine-config = { path = "../config" }
 podspine-prober = { path = "../prober" }
 podspine-chapters = { path = "../chapters" }
 podspine-splitter = { path = "../splitter" }
