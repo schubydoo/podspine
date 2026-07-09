@@ -26,7 +26,8 @@ pub enum StorageMode {
     /// Pre-split every chapter to disk at ingest (fast serves, ~2× storage).
     #[default]
     Full,
-    /// Split chapters on demand and cache recently played ones (minimal disk,
+    /// Split every chapter at ingest to record its byte length, then delete it
+    /// and regenerate on demand into a bounded cache (minimal steady-state disk,
     /// a small first-play delay per uncached chapter).
     Saver,
 }
@@ -59,8 +60,9 @@ pub struct Cli {
     #[arg(long, env = "PODSPINE_FORCE_EMBEDDED_CHAPTERS")]
     pub force_embedded_chapters: bool,
     /// Chapter storage strategy: `full` pre-splits every chapter to disk (fast,
-    /// ~2× storage); `saver` splits on demand and caches recently played
-    /// chapters (minimal disk, a small first-play delay).
+    /// ~2× storage); `saver` still splits at ingest but keeps chapters in a
+    /// bounded on-demand cache (minimal steady-state disk, a small first-play
+    /// delay). Either mode copies audio into the data dir.
     #[arg(long, env = "PODSPINE_STORAGE_MODE")]
     pub storage_mode: Option<StorageMode>,
     /// Max disk for the on-demand chapter cache in `saver` mode (e.g. `2GB`,
@@ -117,9 +119,10 @@ pub struct Config {
     /// Ignore `.cue`/`.ffmeta` sidecars and always use embedded chapters.
     pub force_embedded_chapters: bool,
     /// How chapters are produced/stored: `full` (pre-split every chapter to
-    /// disk) or `saver` (split on demand + cache). Applies library-wide; either
-    /// mode still materializes audio under `data_dir` — Podspine does not yet
-    /// stream from the source library in place.
+    /// disk) or `saver` (split at ingest, then cache regenerations on demand).
+    /// Applies library-wide; either mode still materializes audio under
+    /// `data_dir` — Podspine does not yet stream from the source library in
+    /// place.
     pub storage_mode: StorageMode,
     /// Cache size cap in bytes for `saver` mode (`None` = unbounded).
     pub cache_size_bytes: Option<u64>,

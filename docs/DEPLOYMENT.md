@@ -23,7 +23,7 @@ that precedence. The library path is the only required input.
 | `--base-url` | `PODSPINE_BASE_URL` | `http://localhost:<port>` | External URL used to build feed/audio links. |
 | `--default-cover-url` | `PODSPINE_DEFAULT_COVER_URL` | none | Feed-level fallback cover for books with no embedded art. |
 | `--force-embedded-chapters` | `PODSPINE_FORCE_EMBEDDED_CHAPTERS` | off | Ignore `.cue`/`.ffmeta` sidecars. |
-| `--storage-mode` | `PODSPINE_STORAGE_MODE` | `full` | `full` pre-splits every chapter to disk; `saver` splits on demand. See below. |
+| `--storage-mode` | `PODSPINE_STORAGE_MODE` | `full` | `full` keeps every chapter split on disk; `saver` still splits once at ingest but caches on demand. See below. |
 | `--cache-size` | `PODSPINE_CACHE_SIZE` | `2GB` | `saver` only: cache cap (`2GB`, `500MB`; `0`/`off` = unbounded). |
 | `--cache-ttl` | `PODSPINE_CACHE_TTL` | off | `saver` only: evict chapters unplayed this long (`30d`, `12h`; `off` = size-only). |
 | `--config` | `PODSPINE_CONFIG` | none | Path to a TOML config file. |
