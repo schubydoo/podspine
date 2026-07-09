@@ -18,7 +18,7 @@ that precedence. The library path is the only required input.
 | Flag | Env var | Default | Purpose |
 |---|---|---|---|
 | `--library` | `PODSPINE_LIBRARY` | — (required) | Folder of audiobooks to scan. |
-| `--data-dir` | `PODSPINE_DATA_DIR` | `./data` | SQLite index + split episode files. |
+| `--data-dir` | `PODSPINE_DATA_DIR` | `./data` | SQLite index + extracted chapter files + covers (whole-file episodes stream from the library). |
 | `--bind` | `PODSPINE_BIND` | `0.0.0.0:8080` | Address to listen on. |
 | `--base-url` | `PODSPINE_BASE_URL` | `http://localhost:<port>` | External URL used to build feed/audio links. |
 | `--default-cover-url` | `PODSPINE_DEFAULT_COVER_URL` | none | Feed-level fallback cover for books with no embedded art. |
@@ -115,7 +115,7 @@ docker run -d --name podspine \
   a read-only mount prevents a less-trusted process from swapping a file for a
   symlink to escape the served trust boundary.
 - Keep `/data` on a **named volume** (or a host path): it holds the SQLite index and
-  the split episode files, and should persist across restarts and upgrades.
+  any extracted chapter files, and should persist across restarts and upgrades.
 
 ### docker-compose
 

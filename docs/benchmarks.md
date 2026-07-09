@@ -83,11 +83,13 @@ synthetic 300s / 8-chapter book. **Your hardware will differ**; re-run locally.
 All four targets clear with wide margins — feed render and audio TTFB sit ~100×
 under budget, and idle memory is ~6× under. The only figure worth watching is
 **P1**: pre-split ingest is I/O-bound (`ffmpeg -c copy` per chapter), so on slow
-storage or a many-chapter book it will rise. Because the extrapolation folds in
-fixed startup cost it is pessimistic, but if a real 10h book on your disk lands
-near the 2-minute ceiling, that is the signal that on-the-fly byte-range
-splitting (serving chapters from computed offsets, no duplicate split files) is
-worth building — otherwise it is premature.
+storage or a many-chapter book it will rise. This applies only to **chaptered**
+books — whole-file episodes (MP3-folder tracks, chapterless singles) are served in
+place from the library and skip the split entirely (Sprint 6.2). Because the
+extrapolation folds in fixed startup cost it is pessimistic, but if a real 10h
+chaptered book on your disk lands near the 2-minute ceiling, that is the signal
+that avoiding the pre-split for chaptered books too (on-the-fly byte-range chapter
+serving, no duplicate split files) is worth the complexity — otherwise premature.
 
 The optional `/metrics` endpoint (Prometheus counters/histograms) is intentionally
 not part of this harness; it adds a runtime dependency and an opt-in config flag,

@@ -61,7 +61,7 @@ pub enum ScanError {
     /// An MP3 folder held no ingestable (probeable) audio.
     #[error("no ingestable audio in folder: {0}")]
     EmptyFolder(PathBuf),
-    /// A filesystem operation (copy, mkdir, stat) failed during MP3-folder ingest.
+    /// A filesystem operation (stat, mkdir, or split-file delete) failed during ingest.
     #[error("i/o error on {path}: {source}")]
     Io {
         /// The path involved.

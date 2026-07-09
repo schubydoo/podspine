@@ -20,7 +20,8 @@
 //! allow-list charset ([`valid_slug`]) and the capability id against
 //! [`valid_feed_id`], so `..`/separators/absolute markers 404 before touching
 //! the DB or filesystem; as defense-in-depth the resolved audio path is still
-//! canonicalized and asserted to live under the data dir; a
+//! canonicalized and asserted to live under a trusted root — the data dir, or the
+//! library root for whole-file episodes served in place (Sprint 6.2); a
 //! `ConcurrencyLimitLayer` bounds in-flight requests alongside the timeout and
 //! body-limit layers. Errors never leak filesystem paths or ffmpeg stderr (that
 //! detail is logged, collapsed to a bare status for the client). See TAD §4/§7.
@@ -488,13 +489,18 @@ struct Regen {
     cut: ChapterCut,
 }
 
-/// Resolve `/audio/{feed_id}/{number}` to its on-disk target.
+/// Resolve `/audio/{feed_id}/{number}` to its on-disk target. Two path-safe
+/// shapes, depending on whether the episode is a whole file or a chapter:
 ///
-/// The path is reconstructed from the canonical `data_dir` plus **opaque DB
-/// keys** (`book.id`, chapter index) and a validated audio extension — never
-/// built from request input — so it stays under the data dir by construction
-/// (no traversal). Existence is NOT required: in `saver` mode the file is
-/// regenerated on demand, so the resolver returns the target plus a [`Regen`].
+/// - **In place (whole-file episode):** when the episode carries a `source_path`,
+///   it's a whole file streamed from the library — canonicalized, asserted under
+///   the library root, and size-checked against the recorded length (Sprint 6.2).
+/// - **Extracted (chaptered episode):** the path is reconstructed from the
+///   canonical `data_dir` plus **opaque DB keys** (`book.id`, chapter index) and a
+///   validated audio extension — never built from request input — so it stays
+///   under the data dir by construction (no traversal). Existence is NOT required:
+///   in `saver` mode the file is regenerated on demand, so the resolver returns
+///   the target plus a [`Regen`].
 fn resolve_audio_target(
     state: &AppState,
     feed_id: &str,
@@ -585,10 +591,12 @@ fn resolve_audio_target(
     }
     let path = out_dir.join(format!("{:03}.{out_ext}", idx + 1));
 
-    // Only single-file books are regenerable. An MP3-folder book copies each
-    // track verbatim (its `source_path` is a *directory*), so there's nothing to
-    // re-split — a missing file must be a clean 404, never a doomed
-    // `ffmpeg <directory>` (500). Eviction likewise leaves those tracks alone.
+    // Only chaptered single-file books reach here: whole-file episodes (MP3-folder
+    // tracks, chapterless singles) carry a `source_path` and were served in place
+    // and returned above, so they never regenerate. Regen is possible only in
+    // saver mode when the book's source is a single file to re-split; the
+    // `is_file` guard stays as belt-and-suspenders (a directory source would make
+    // `ffmpeg <directory>` fail), so a missing file is a clean 404, not a 500.
     let regen = (state.saver && FsPath::new(&book.source_path).is_file()).then(|| Regen {
         source: PathBuf::from(&book.source_path),
         out_dir,
@@ -665,10 +673,11 @@ async fn enforce_cache(state: &AppState, keep: &FsPath) {
     }
     let books = state.data_dir.join("books");
     // Only single-file-source books are regenerable; their cached chapters are
-    // safe to evict. MP3-folder tracks (directory source) are copied verbatim —
-    // deleting one would lose it until the next rescan — so restrict eviction to
-    // the regenerable book dirs. Snapshot the sources without holding the lock
-    // across the `is_file` stats.
+    // safe to evict (they re-split on demand). A non-regenerable book dir must be
+    // left alone — nothing would rebuild it: whole-file books are served in place
+    // (any dir here is just a cover, or a legacy pre-6.2 copy not yet reclaimed).
+    // So restrict eviction to the regenerable book dirs. Snapshot the sources
+    // without holding the lock across the `is_file` stats.
     let sources: Vec<(String, String)> = {
         let Ok(index) = state.index.lock() else {
             return;
@@ -690,8 +699,9 @@ async fn enforce_cache(state: &AppState, keep: &FsPath) {
 /// Collect cached chapter files (numeric stems under `books/*/`) from
 /// **regenerable** books only, drop TTL-expired ones, then delete oldest-first
 /// until under `cap`. mtime is the LRU key: regenerating a chapter refreshes it.
-/// Non-regenerable book dirs (e.g. MP3-folder tracks) are skipped entirely so a
-/// verbatim copy is never destroyed. Best-effort; per-file I/O errors are ignored.
+/// Non-regenerable book dirs (a directory-source book, or a legacy pre-6.2 copy)
+/// are skipped entirely so nothing that can't be rebuilt is destroyed. Best-effort;
+/// per-file I/O errors are ignored.
 fn evict(
     books_dir: &FsPath,
     cap: Option<u64>,
@@ -1013,16 +1023,17 @@ mod tests {
 
     #[test]
     fn evict_never_touches_non_regenerable_books() {
-        // A regenerable (single-file-source) book and an MP3-folder book whose
-        // tracks are copied verbatim. Only the regenerable one may be evicted;
-        // the MP3-folder tracks must survive even a tiny cap (Greptile P1).
+        // A regenerable (single-file-source) book and a non-regenerable book dir
+        // (a directory source — e.g. an MP3 folder, or a legacy pre-6.2 copy).
+        // Only the regenerable one may be evicted; the non-regenerable files must
+        // survive even a tiny cap (Greptile P1) — nothing would rebuild them.
         let dir = std::env::temp_dir().join("podspine-evict-mp3safe");
         let _ = std::fs::remove_dir_all(&dir);
         let books = dir.join("books");
         let split = books.join("splitbook"); // regenerable
         touch(&split.join("001.m4a"), 100);
         touch(&split.join("002.m4a"), 100);
-        let folder = books.join("mp3book"); // NOT regenerable (verbatim copies)
+        let folder = books.join("mp3book"); // NOT regenerable (directory source / legacy copy)
         touch(&folder.join("001.mp3"), 100);
         touch(&folder.join("002.mp3"), 100);
         let keep = split.join("002.m4a");

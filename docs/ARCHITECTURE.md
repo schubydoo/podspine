@@ -8,10 +8,12 @@ invariants that keep those feeds correct and the server safe.
 Podspine is a single Rust binary built as a Cargo workspace — one crate per
 pipeline stage. It shells out to `ffmpeg`/`ffprobe` as separate processes (a GPL
 boundary; always invoked with an argument vector, never a shell string) and keeps
-its own state in a SQLite index plus a flat directory of split episode files.
+its own state in a SQLite index plus a flat directory of extracted chapter files
+and covers (whole-file episodes are served in place from the library, not copied).
 
-At startup it resolves configuration, scans the library (splitting each book into
-per-chapter files and recording them in the index), then serves feeds, audio, and a
+At startup it resolves configuration, scans the library (splitting chaptered books
+into per-chapter files, serving whole-file books in place, and recording both in
+the index), then serves feeds, audio, and a
 small browse UI over HTTP. A background watcher keeps the index reconciled with the
 library while it runs, so added, replaced, or removed books are picked up without a
 restart.
@@ -144,8 +146,8 @@ split the way they are.
   the above is violated.
 
 **Audio fidelity:**
-- Copy-first: chapters are split by stream copy, no re-encode, so there's no quality
-  loss.
+- Never re-encoded: chapters are extracted by stream copy and whole files are served
+  untouched, so there's no quality loss.
 
 **Security (see [SECURITY.md](https://github.com/schubydoo/podspine/blob/main/SECURITY.md) for the threat model):**
 - Book/episode ids are **opaque index keys**. Slugs are validated against an
