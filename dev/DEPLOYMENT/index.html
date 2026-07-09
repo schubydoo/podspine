@@ -433,6 +433,17 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#faststart-for-whole-file-mp4" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Faststart for whole-file mp4
+      
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -789,6 +800,17 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#faststart-for-whole-file-mp4" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Faststart for whole-file mp4
+      
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -998,6 +1020,12 @@ that precedence. The library path is the only required input.</p>
 <td><code>saver</code> only: evict chapters unplayed this long (<code>30d</code>, <code>12h</code>; <code>off</code> = size-only).</td>
 </tr>
 <tr>
+<td><code>--remux-non-faststart</code></td>
+<td><code>PODSPINE_REMUX_NON_FASTSTART</code></td>
+<td>off</td>
+<td>Remux a non-faststart whole-file mp4 to faststart on demand (cache-managed). See below.</td>
+</tr>
+<tr>
 <td><code>--config</code></td>
 <td><code>PODSPINE_CONFIG</code></td>
 <td>none</td>
@@ -1056,6 +1084,18 @@ cache cap (<code>PODSPINE_CACHE_SIZE</code>) rather than a second copy of every 
 is cheap and you want every play to start instantly. Either way you only need to
 size <code>--data-dir</code> for your chaptered books — whole-file books add essentially
 nothing beyond their index rows and covers.</p>
+<h3 id="faststart-for-whole-file-mp4">Faststart for whole-file mp4<a class="headerlink" href="#faststart-for-whole-file-mp4" title="Permanent link">&para;</a></h3>
+<p>A whole-file <code>.m4a</code>/<code>.m4b</code> served in place plays fine but can <strong>seek slowly</strong> if
+its <code>moov</code> atom (the index) sits after the audio ("non-faststart"). Podspine
+detects this at ingest (a quick header read, no ffmpeg) and logs a one-line
+callout naming the book. MP3/OGG/FLAC and chaptered books are never affected (a
+chaptered episode is already written moov-first).</p>
+<p>Set <code>PODSPINE_REMUX_NON_FASTSTART=true</code> to fix it automatically: such a book is
+<strong>remuxed to faststart on demand</strong> — a stream-copy (no re-encode) served from the
+<code>saver</code> cache, evicted and regenerated under <code>PODSPINE_CACHE_SIZE</code> like any cached
+chapter, <strong>not</strong> a pinned second copy. The default is <strong>off</strong> because in-place
+serving costs no disk; enable it if slow seeking on those books bothers you and
+you can spare the cache. (A faststart mp4, or any non-mp4, is left untouched.)</p>
 <h2 id="exposing-podspine-safely">Exposing Podspine safely<a class="headerlink" href="#exposing-podspine-safely" title="Permanent link">&para;</a></h2>
 <p>Podspine has two kinds of routes, and they want different exposure:</p>
 <table>
