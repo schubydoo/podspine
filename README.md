@@ -102,10 +102,14 @@ The library path is the only required input; everything else has a default and c
 be set via CLI flag, environment variable, or a TOML file (`--config`), in that
 precedence. See the **[full option reference](docs/DEPLOYMENT.md#configuration)**.
 
-**Tight on disk?** Set `PODSPINE_STORAGE_MODE=saver` to split chapters on demand
-and cache them instead of pre-splitting every book to disk — roughly halves
-storage for a small first-play delay per chapter. See
-**[storage mode](docs/DEPLOYMENT.md#storage-mode-full-vs-saver)**.
+**Heads-up on disk use.** Podspine copies audio into its data dir — it does **not**
+yet stream from your library in place, so plan for extra space *on top of* your
+originals. `full` mode (the default) writes a per-chapter split of every book, so a
+chaptered library roughly **doubles** in total size. `saver` mode
+(`PODSPINE_STORAGE_MODE=saver`) instead splits chapters on demand into a bounded
+cache, cutting that overhead for chaptered books at the cost of a small first-play
+delay — but folder-of-MP3 books are copied whole in **either** mode. Full details
+and the numbers: **[storage mode](docs/DEPLOYMENT.md#storage-mode-full-vs-saver)**.
 
 Each book's feed lives at an unguessable **capability URL** — `/feed/{feed_id}.xml`,
 with `/audio/{feed_id}/{n}` (episode audio, HTTP Range) and `/cover/{feed_id}`. The

@@ -116,8 +116,10 @@ pub struct Config {
     pub default_cover_url: Option<String>,
     /// Ignore `.cue`/`.ffmeta` sidecars and always use embedded chapters.
     pub force_embedded_chapters: bool,
-    /// How chapters are produced/stored: `full` (pre-split) or `saver`
-    /// (on-demand + cache). A per-book `.podspine.toml` may override this.
+    /// How chapters are produced/stored: `full` (pre-split every chapter to
+    /// disk) or `saver` (split on demand + cache). Applies library-wide; either
+    /// mode still materializes audio under `data_dir` — Podspine does not yet
+    /// stream from the source library in place.
     pub storage_mode: StorageMode,
     /// Cache size cap in bytes for `saver` mode (`None` = unbounded).
     pub cache_size_bytes: Option<u64>,

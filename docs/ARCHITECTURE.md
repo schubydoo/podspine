@@ -72,7 +72,14 @@ flowchart TD
 
 ## Storage model
 
-SQLite index + flat filesystem. Split episodes are pre-materialized at ingest (v1):
+SQLite index + flat filesystem. Episode audio is **materialized under
+`<data_dir>` — a copy separate from your source library**; the server does not yet
+stream from the library in place, so `<data_dir>` grows on top of the originals.
+In `full` mode (default) chapters are pre-split at ingest; in `saver` mode chapter
+splits are produced on demand and cached (bounded), while folder-of-MP3 tracks are
+copied in full in either mode. See
+[DEPLOYMENT.md](DEPLOYMENT.md#storage-mode-full-vs-saver) for the disk-budget
+details.
 
 ```
 <data_dir>/
