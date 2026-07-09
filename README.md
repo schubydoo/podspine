@@ -102,16 +102,17 @@ The library path is the only required input; everything else has a default and c
 be set via CLI flag, environment variable, or a TOML file (`--config`), in that
 precedence. See the **[full option reference](docs/DEPLOYMENT.md#configuration)**.
 
-**Heads-up on disk use.** Podspine copies audio into its data dir — it does **not**
-yet stream from your library in place, so plan for extra space *on top of* your
-originals. `full` mode (the default) writes a per-chapter split of every book, so a
-chaptered library roughly **doubles** in total size. `saver` mode
-(`PODSPINE_STORAGE_MODE=saver`) keeps only a bounded cache instead — it still
-splits each chapter once at ingest (to record its real byte length), then deletes
-the file and regenerates it on first play — cutting *steady-state* disk for
-chaptered books, not ingest time, at the cost of a small first-play delay.
-Folder-of-MP3 books are copied whole in **either** mode. Full details
-and the numbers: **[storage mode](docs/DEPLOYMENT.md#storage-mode-full-vs-saver)**.
+**Heads-up on disk use.** Whole-file episodes — folder-of-MP3 tracks and
+chapterless single files — are **streamed in place from your library, no copy**.
+Only a **chaptered** book (one container Podspine splits into per-chapter
+episodes) materializes audio under its data dir: `full` mode (the default) keeps a
+per-chapter split of every such book, so a chaptered library roughly **doubles**
+in total size; `saver` mode (`PODSPINE_STORAGE_MODE=saver`) keeps only a bounded
+cache instead — it still splits each chapter once at ingest (to record its real
+byte length), then deletes and regenerates on first play, cutting *steady-state*
+disk (not ingest time) for a small first-play delay. So budget extra space for
+chaptered libraries; whole-file libraries cost only their index and covers. Full
+details: **[storage mode](docs/DEPLOYMENT.md#storage-mode-full-vs-saver)**.
 
 Each book's feed lives at an unguessable **capability URL** — `/feed/{feed_id}.xml`,
 with `/audio/{feed_id}/{n}` (episode audio, HTTP Range) and `/cover/{feed_id}`. The

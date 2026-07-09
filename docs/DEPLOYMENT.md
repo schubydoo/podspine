@@ -35,12 +35,14 @@ that precedence. The library path is the only required input.
 
 ### Storage mode: `full` vs `saver`
 
-> **Expect extra disk use — today Podspine always *copies* audio into
-> `--data-dir`.** It does not yet stream episodes from your library in place, so
-> the data dir grows *in addition to* the originals you already keep. Both modes
-> below reduce or defer that copy for chaptered books; neither eliminates it, and
-> folder-of-MP3 books are copied in full regardless. Serving whole-file tracks
-> directly from the library (no copy) is planned but not yet shipped.
+> **Disk use — only *chaptered* books materialize under `--data-dir`.** A
+> chaptered container (e.g. one `.m4b`) is split into per-chapter episodes stored
+> under the data dir (`full`) or a bounded on-demand cache (`saver`), so the data
+> dir grows *on top of* the originals you keep. **Whole-file episodes are streamed
+> in place:** folder-of-MP3 tracks and chapterless single files play straight from
+> the read-only library — nothing is copied for them, and `storage-mode` doesn't
+> apply. So budget extra disk for chaptered libraries; whole-file books cost only
+> their index row and any extracted cover.
 
 By default (`full`) Podspine pre-splits every chapter to disk at ingest, so a
 chaptered book uses roughly **twice** its source size — the original in your
@@ -66,14 +68,17 @@ cache cap (`PODSPINE_CACHE_SIZE`) rather than a second copy of every book.
   window.
 - Ingest takes the **same** time in either mode — `saver` saves disk, not
   ingest time.
-- **Folder-of-MP3 books are always copied in full**, in `saver` too: their
-  tracks are already whole files (not splits from a container), so there is
-  nothing to defer, and they are copied into `--data-dir` and never evicted.
-  `saver` only helps books that ship as a chaptered container (e.g. one `.m4b`).
+- **Whole-file episodes are served in place — never copied, never evicted.** A
+  folder-of-MP3 book's tracks, and a chapterless single file, are already whole
+  files (not sub-ranges of a container), so Podspine streams them directly from
+  the library and records only their source path. `storage-mode` therefore has no
+  effect on them; it governs **only** chaptered containers, which must be
+  extracted per chapter.
 
 `saver` suits large **chaptered** libraries on small disks; keep `full` if disk
-is cheap and you want every play to start instantly. Either way, size
-`--data-dir` for meaningful growth until in-place serving lands.
+is cheap and you want every play to start instantly. Either way you only need to
+size `--data-dir` for your chaptered books — whole-file books add essentially
+nothing beyond their index rows and covers.
 
 ## Exposing Podspine safely
 
@@ -105,7 +110,10 @@ docker run -d --name podspine \
   ghcr.io/schubydoo/podspine:latest
 ```
 
-- Mount the library **read-only** (`:ro`) — Podspine only reads it.
+- Mount the library **read-only** (`:ro`) — Podspine only reads it. This is also a
+  security control: whole-file episodes are streamed straight from the library, so
+  a read-only mount prevents a less-trusted process from swapping a file for a
+  symlink to escape the served trust boundary.
 - Keep `/data` on a **named volume** (or a host path): it holds the SQLite index and
   the split episode files, and should persist across restarts and upgrades.
 

@@ -107,8 +107,12 @@ pub struct AppState {
     pub index: Arc<Mutex<Index>>,
     /// External base URL for feed/enclosure links (no trailing slash).
     pub base_url: String,
-    /// Canonical data dir — resolved audio paths must stay under it.
+    /// Canonical data dir — extracted (chaptered) audio must stay under it.
     pub data_dir: PathBuf,
+    /// Canonical library root — whole-file episodes are streamed in place from
+    /// here (Sprint 6.2), so a resolved in-place path must stay under it. This is
+    /// the read-only source tree; the audio handler never writes to it.
+    pub library_dir: PathBuf,
     /// Feed-level fallback cover URL for books with no embedded art.
     pub default_cover_url: Option<String>,
     /// `saver` storage mode: episode files aren't pre-split — the audio handler
@@ -124,13 +128,16 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Build state, canonicalizing the data dir for the path-safety check. The
+    /// Build state, canonicalizing the data dir **and** the library root for the
+    /// path-safety checks (served files must stay under one of them). The
     /// `saver`/cache args come from [`podspine_config::Config`] (pre-split
     /// defaults: `saver=false`).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         index: Index,
         base_url: String,
         data_dir: &FsPath,
+        library_dir: &FsPath,
         default_cover_url: Option<String>,
         saver: bool,
         cache_size_bytes: Option<u64>,
@@ -139,10 +146,14 @@ impl AppState {
         let data_dir = data_dir
             .canonicalize()
             .unwrap_or_else(|_| data_dir.to_path_buf());
+        let library_dir = library_dir
+            .canonicalize()
+            .unwrap_or_else(|_| library_dir.to_path_buf());
         Self {
             index: Arc::new(Mutex::new(index)),
             base_url,
             data_dir,
+            library_dir,
             default_cover_url,
             saver,
             cache_size_bytes,
@@ -388,12 +399,17 @@ async fn audio(
         }
     }
     // Final defense-in-depth: the file now exists, so canonicalize it (resolving
-    // any symlink) and confirm it still lives under the data dir before opening.
-    // The resolver already checked the parent dir; this additionally catches a
-    // chapter file that is itself a symlink pointing outside the data dir.
+    // any symlink) and confirm it still lives under a trusted root before opening
+    // — the data dir (extracted chapters) OR the library root (whole-file
+    // episodes served in place). The resolver already checked the relevant root;
+    // this additionally catches a file that is itself a symlink pointing outside.
     let path = target.path.canonicalize().map_err(|_| AppError::NotFound)?;
-    if !path.starts_with(&state.data_dir) {
-        tracing::warn!(feed_id, number, "resolved audio file escaped the data dir");
+    if !path.starts_with(&state.data_dir) && !path.starts_with(&state.library_dir) {
+        tracing::warn!(
+            feed_id,
+            number,
+            "resolved audio file escaped its trusted root"
+        );
         return Err(AppError::NotFound);
     }
     let mime = mime_for(&path.to_string_lossy());
@@ -503,6 +519,26 @@ fn resolve_audio_target(
             .ok_or(AppError::NotFound)?;
         (book, ep)
     };
+
+    // Serve-in-place (Sprint 6.2): a whole-file episode (MP3-folder track, or a
+    // chapterless single file) is streamed directly from the read-only library —
+    // never copied under the data dir. `source_path` is the persisted library
+    // file. Canonicalize it and assert it stays under the library root (rejecting
+    // any symlink/`..` escape) before it is opened; there is nothing to
+    // regenerate. This is the A01 "assert under the library root" rule (TAD §7).
+    if !ep.source_path.is_empty() {
+        let src = FsPath::new(&ep.source_path)
+            .canonicalize()
+            .map_err(|_| AppError::NotFound)?;
+        if !src.starts_with(&state.library_dir) {
+            tracing::warn!(feed_id, number, "in-place audio escaped the library root");
+            return Err(AppError::NotFound);
+        }
+        return Ok(AudioTarget {
+            path: src,
+            regen: None,
+        });
+    }
 
     // The container extension is the audio ext the scanner recorded; reject
     // anything non-alphanumeric so it can never introduce a path separator.

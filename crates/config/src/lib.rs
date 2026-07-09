@@ -19,7 +19,9 @@ const DEFAULT_DATA_DIR: &str = "./data";
 /// Default `saver`-mode cache cap when unset: 2 GiB.
 const DEFAULT_CACHE_SIZE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-/// How per-chapter episode files are produced and stored.
+/// How a **chaptered** book's per-chapter episodes are produced and stored.
+/// Whole-file episodes (MP3-folder tracks, chapterless single files) ignore this
+/// — they are streamed in place from the library, never extracted (Sprint 6.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StorageMode {
@@ -59,10 +61,11 @@ pub struct Cli {
     /// Force embedded chapters, ignoring any `.cue`/`.ffmeta` sidecar.
     #[arg(long, env = "PODSPINE_FORCE_EMBEDDED_CHAPTERS")]
     pub force_embedded_chapters: bool,
-    /// Chapter storage strategy: `full` pre-splits every chapter to disk (fast,
-    /// ~2× storage); `saver` still splits at ingest but keeps chapters in a
-    /// bounded on-demand cache (minimal steady-state disk, a small first-play
-    /// delay). Either mode copies audio into the data dir.
+    /// Chapter storage strategy for **chaptered** books: `full` pre-splits every
+    /// chapter to disk (fast, ~2× storage); `saver` still splits at ingest but
+    /// keeps chapters in a bounded on-demand cache (minimal steady-state disk, a
+    /// small first-play delay). No effect on whole-file episodes (MP3 folders,
+    /// chapterless singles), which are served in place from the library.
     #[arg(long, env = "PODSPINE_STORAGE_MODE")]
     pub storage_mode: Option<StorageMode>,
     /// Max disk for the on-demand chapter cache in `saver` mode (e.g. `2GB`,
@@ -118,11 +121,11 @@ pub struct Config {
     pub default_cover_url: Option<String>,
     /// Ignore `.cue`/`.ffmeta` sidecars and always use embedded chapters.
     pub force_embedded_chapters: bool,
-    /// How chapters are produced/stored: `full` (pre-split every chapter to
-    /// disk) or `saver` (split at ingest, then cache regenerations on demand).
-    /// Applies library-wide; either mode still materializes audio under
-    /// `data_dir` — Podspine does not yet stream from the source library in
-    /// place.
+    /// How **chaptered** books are produced/stored: `full` (pre-split every
+    /// chapter to disk) or `saver` (split at ingest, then cache regenerations on
+    /// demand). Applies library-wide to chaptered books, which materialize under
+    /// `data_dir`. Whole-file episodes (MP3-folder tracks, chapterless single
+    /// files) are unaffected — they stream in place from the library (Sprint 6.2).
     pub storage_mode: StorageMode,
     /// Cache size cap in bytes for `saver` mode (`None` = unbounded).
     pub cache_size_bytes: Option<u64>,

@@ -121,6 +121,7 @@ async fn serves_cover_when_present() {
         index,
         "http://test".to_string(),
         &data,
+        &dir,
         None,
         false,
         None,
@@ -177,6 +178,7 @@ async fn saver_mode_regenerates_a_chapter_on_demand() {
         index,
         "http://test".to_string(),
         &data,
+        &dir,
         None,
         true,
         None,
@@ -244,6 +246,7 @@ async fn saver_cache_evicts_over_the_size_cap() {
         index,
         "http://test".to_string(),
         &data,
+        &dir,
         None,
         true,
         Some(1),
@@ -306,6 +309,7 @@ async fn full_mode_missing_file_is_a_404_not_a_regeneration() {
         index,
         "http://test".to_string(),
         &data,
+        &dir,
         None,
         false,
         None,
@@ -323,6 +327,164 @@ async fn full_mode_missing_file_is_a_404_not_a_regeneration() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Synthesize a chapterless AAC single file → served in place (Sprint 6.2).
+fn synth_flat(dir: &Path) -> PathBuf {
+    let input = dir.join("flat.m4a");
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=330:duration=8",
+            "-c:a",
+            "aac",
+        ])
+        .arg(&input)
+        .status()
+        .expect("spawn ffmpeg");
+    assert!(status.success(), "ffmpeg synth failed");
+    input
+}
+
+#[tokio::test]
+async fn serves_whole_file_episode_in_place_from_the_library() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+    let base = std::env::temp_dir().join("podspine-http-inplace");
+    let _ = std::fs::remove_dir_all(&base);
+    // Library and data are SEPARATE trees, so "served from the library" is
+    // provable (the file is not, and could not be, under the data dir).
+    let library = base.join("library");
+    let data = base.join("data");
+    std::fs::create_dir_all(&library).unwrap();
+
+    let index = Index::open_in_memory().unwrap();
+    let input = synth_flat(&library);
+    let book = scan_book(&input, &data, &index).unwrap();
+    let feed_id = book.feed_id.clone();
+
+    // Ingest recorded the episode as in-place (source under the library), and
+    // copied nothing under the data dir.
+    let eps = index.episodes_for_book(&book.id).unwrap();
+    assert_eq!(eps.len(), 1);
+    assert_eq!(eps[0].source_path, input.to_string_lossy());
+    let source_len = std::fs::metadata(&input).unwrap().len();
+    assert_eq!(
+        eps[0].byte_length as u64, source_len,
+        "enclosure length = real source size"
+    );
+    assert!(
+        !data.join("books").join(&book.id).join("001.m4a").exists(),
+        "nothing copied under the data dir"
+    );
+
+    let state = AppState::new(
+        index,
+        "http://test".to_string(),
+        &data,
+        &library,
+        None,
+        false,
+        None,
+        None,
+    );
+    let app = router(state);
+
+    // Full GET streams the whole library file back, byte-for-byte.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/audio/{feed_id}/1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_bytes(resp).await;
+    assert_eq!(body.len() as u64, source_len, "served the whole file");
+    assert_eq!(
+        body,
+        std::fs::read(&input).unwrap(),
+        "served the library bytes verbatim (no remux)"
+    );
+
+    // Range against the in-place file yields a 206 partial.
+    let resp = app
+        .oneshot(
+            Request::get(format!("/audio/{feed_id}/1"))
+                .header(header::RANGE, "bytes=0-9")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(body_bytes(resp).await.len(), 10, "range served 10 bytes");
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[tokio::test]
+async fn in_place_source_outside_the_library_is_a_404() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+    let base = std::env::temp_dir().join("podspine-http-inplace-escape");
+    let _ = std::fs::remove_dir_all(&base);
+    let library = base.join("library");
+    let data = base.join("data");
+    std::fs::create_dir_all(&library).unwrap();
+
+    let index = Index::open_in_memory().unwrap();
+    let input = synth_flat(&library);
+    let book = scan_book(&input, &data, &index).unwrap();
+    let feed_id = book.feed_id.clone();
+
+    // Poison the row: point the episode's in-place source at a real file OUTSIDE
+    // the library root. Canonicalize succeeds, but the library-root guard must
+    // still reject it — a poisoned/traversing source path never escapes.
+    let outside = base.join("outside.m4a");
+    std::fs::copy(&input, &outside).unwrap();
+    let mut ep = index.episodes_for_book(&book.id).unwrap()[0].clone();
+    ep.source_path = outside.to_string_lossy().into_owned();
+    ep.file_path = outside.to_string_lossy().into_owned();
+    index.upsert_episode(&ep).unwrap();
+
+    let state = AppState::new(
+        index,
+        "http://test".to_string(),
+        &data,
+        &library,
+        None,
+        false,
+        None,
+        None,
+    );
+    let app = router(state);
+    let resp = app
+        .oneshot(
+            Request::get(format!("/audio/{feed_id}/1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "in-place source outside the library root is rejected"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 #[tokio::test]
@@ -346,6 +508,7 @@ async fn regenerate_rotates_the_capability() {
         index,
         "http://test".to_string(),
         &data,
+        &dir,
         None,
         false,
         None,
@@ -448,6 +611,7 @@ async fn serves_feed_and_range_audio() {
         index,
         "http://test".to_string(),
         &data,
+        &dir,
         Some("http://test/default-cover.png".to_string()),
         false,
         None,

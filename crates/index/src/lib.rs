@@ -60,7 +60,8 @@ CREATE TABLE IF NOT EXISTS episode (
     byte_length   INTEGER NOT NULL,
     duration_sec  REAL NOT NULL,
     start_sec     REAL NOT NULL,
-    pubdate_epoch INTEGER NOT NULL
+    pubdate_epoch INTEGER NOT NULL,
+    source_path   TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS episode_book_idx ON episode(book_id, idx);
 ";
@@ -100,8 +101,15 @@ pub struct EpisodeRow {
     pub idx: i64,
     /// Episode title.
     pub title: String,
-    /// Path to the split audio file.
+    /// Path to the served audio file. For an extracted (chaptered) episode this
+    /// is the split under `<data_dir>`; for a whole-file episode served in place
+    /// it is the original file in the read-only library (same as `source_path`).
     pub file_path: String,
+    /// When non-empty, the episode IS a whole source file streamed in place from
+    /// the library (MP3-folder track, or a chapterless single file) — nothing is
+    /// copied under `<data_dir>`. Empty = an extracted sub-range served from
+    /// `<data_dir>` (`full`/`saver`). See TAD §5.3.
+    pub source_path: String,
     /// Real output size in bytes.
     pub byte_length: i64,
     /// Duration in seconds.
@@ -169,6 +177,20 @@ impl Index {
                 [],
             )?;
         }
+        // `source_path` (serve-in-place, Sprint 6.2). Existing rows default to
+        // `''` (extracted/copied under `<data_dir>`, as before); a re-scan flips
+        // whole-file books to in-place serving and reclaims their copies.
+        let has_source_path: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('episode') WHERE name = 'source_path'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_source_path == 0 {
+            conn.execute(
+                "ALTER TABLE episode ADD COLUMN source_path TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -206,13 +228,13 @@ impl Index {
     pub fn upsert_episode(&self, e: &EpisodeRow) -> Result<(), IndexError> {
         self.conn.execute(
             "INSERT INTO episode
-               (guid, book_id, idx, title, file_path, byte_length, duration_sec, start_sec, pubdate_epoch)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+               (guid, book_id, idx, title, file_path, byte_length, duration_sec, start_sec, pubdate_epoch, source_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(guid) DO UPDATE SET
                book_id=excluded.book_id, idx=excluded.idx, title=excluded.title,
                file_path=excluded.file_path, byte_length=excluded.byte_length,
                duration_sec=excluded.duration_sec, start_sec=excluded.start_sec,
-               pubdate_epoch=excluded.pubdate_epoch",
+               pubdate_epoch=excluded.pubdate_epoch, source_path=excluded.source_path",
             params![
                 e.guid,
                 e.book_id,
@@ -223,6 +245,7 @@ impl Index {
                 e.duration_sec,
                 e.start_sec,
                 e.pubdate_epoch,
+                e.source_path,
             ],
         )?;
         Ok(())
@@ -267,7 +290,7 @@ impl Index {
     /// Episodes for a book, ordered by chapter index (chapter 1 first).
     pub fn episodes_for_book(&self, book_id: &str) -> Result<Vec<EpisodeRow>, IndexError> {
         let mut stmt = self.conn.prepare(
-            "SELECT guid, book_id, idx, title, file_path, byte_length, duration_sec, start_sec, pubdate_epoch
+            "SELECT guid, book_id, idx, title, file_path, byte_length, duration_sec, start_sec, pubdate_epoch, source_path
              FROM episode WHERE book_id = ?1 ORDER BY idx",
         )?;
         let rows = stmt.query_map([book_id], episode_from_row)?;
@@ -314,7 +337,7 @@ impl Index {
         Ok(self
             .conn
             .query_row(
-                "SELECT guid, book_id, idx, title, file_path, byte_length, duration_sec, start_sec, pubdate_epoch
+                "SELECT guid, book_id, idx, title, file_path, byte_length, duration_sec, start_sec, pubdate_epoch, source_path
                  FROM episode WHERE guid = ?1",
                 [guid],
                 episode_from_row,
@@ -348,6 +371,7 @@ fn episode_from_row(row: &Row) -> rusqlite::Result<EpisodeRow> {
         duration_sec: row.get(6)?,
         start_sec: row.get(7)?,
         pubdate_epoch: row.get(8)?,
+        source_path: row.get(9)?,
     })
 }
 
@@ -376,6 +400,7 @@ mod tests {
             idx,
             title: format!("Chapter {}", idx + 1),
             file_path: format!("/data/books/{book_id}/{:03}.m4a", idx + 1),
+            source_path: String::new(),
             byte_length: 1000 + idx,
             duration_sec: 60.0 * (idx as f64 + 1.0),
             start_sec: 60.0 * (idx as f64),
@@ -519,6 +544,10 @@ mod tests {
             "migrated rows default to start_sec 0"
         );
         assert_eq!(eps[0].byte_length, 1234);
+        assert_eq!(
+            eps[0].source_path, "",
+            "migrated rows default to empty source_path (extracted, not in-place)"
+        );
         assert_eq!(
             idx.get_book_by_feed_id("cap-b1").unwrap().unwrap().id,
             "b1",

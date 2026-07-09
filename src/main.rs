@@ -49,6 +49,7 @@ async fn main() -> Result<()> {
         index,
         config.base_url.clone(),
         &config.data_dir,
+        &config.library,
         config.default_cover_url.clone(),
         saver,
         config.cache_size_bytes,
