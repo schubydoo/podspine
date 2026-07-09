@@ -31,8 +31,11 @@ multi-tenant service. Key considerations:
   shares the UI boundary and is additionally same-origin/CSRF-guarded. See
   [DEPLOYMENT.md](docs/DEPLOYMENT.md#exposing-podspine-safely).
 - **The library and data directory are trusted inputs.** Podspine reads the
-  library you point it at and writes split episodes + a SQLite index into the
-  data directory. Point it only at content you control.
+  library you point it at — at scan time, and directly when streaming whole-file
+  episodes in place — and writes extracted chapter files + a SQLite index into the
+  data directory. Point it only at content you control; mounting the library
+  **read-only** is never a limitation (Podspine never writes there) and keeps it a
+  stable serving trust boundary.
 - **DRM-free input only.** DRM-protected files (Audible `.aax`/`.aaxc`/`.aa`,
   OverDrive `.odm`) are skipped with a logged notice; Podspine ships **no** DRM
   circumvention.
@@ -43,7 +46,8 @@ The headline risks we actively guard against, and welcome reports on:
 
 - **Path traversal** in resolving a book/episode id to a file — ids are opaque
   index keys validated against an allow-list and resolved server-side; the
-  resolved path is canonicalized and must stay under the data directory (404 on
+  resolved path is canonicalized and must stay under a trusted root — the data
+  directory, or the library root for whole-file episodes served in place (404 on
   reject).
 - **Command injection** into the ffmpeg/ffprobe argv from untrusted metadata
   (chapter titles, filenames, tags) — arguments are always passed as a vector.

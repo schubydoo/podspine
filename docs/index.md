@@ -17,8 +17,8 @@ Just a feed URL.
   and `itunes:episode` numbers, and refuses to serve a feed that fails its own
   self-check.
 - **Zero-config.** `docker run` with your library mounted just works.
-- **Copy-first, no quality loss.** Chapters are split by stream copy (no re-encode)
-  at ingest.
+- **No re-encode, no quality loss.** Podspine never transcodes: chapters are
+  extracted by stream copy, and whole files are served straight from your library.
 - **Private by default.** Each feed lives at an unguessable capability URL; the
   library is watched and feeds auto-refresh as you add books.
 - **Your files stay yours.** DRM-free input only — Podspine ships no DRM
@@ -45,9 +45,10 @@ book's QR code to open its one-tap [subscribe page](importing.md).
     hostname). It defaults to `http://localhost:8080`, which only works from the same
     machine — feed and audio URLs are built from it.
 
-`ffmpeg`/`ffprobe` are bundled in the image. `/data` holds the SQLite index and the
-split episode files, so keep it on a persistent volume. Prebuilt static binaries and
-`cargo run` are covered in [Deploying](DEPLOYMENT.md).
+`ffmpeg`/`ffprobe` are bundled in the image. `/data` holds the SQLite index and any
+extracted chapter files (whole-file episodes stream from your library), so keep it
+on a persistent volume. Prebuilt static binaries and `cargo run` are covered in
+[Deploying](DEPLOYMENT.md).
 
 ## Where to next
 

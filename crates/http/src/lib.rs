@@ -20,7 +20,8 @@
 //! allow-list charset ([`valid_slug`]) and the capability id against
 //! [`valid_feed_id`], so `..`/separators/absolute markers 404 before touching
 //! the DB or filesystem; as defense-in-depth the resolved audio path is still
-//! canonicalized and asserted to live under the data dir; a
+//! canonicalized and asserted to live under a trusted root — the data dir, or the
+//! library root for whole-file episodes served in place (Sprint 6.2); a
 //! `ConcurrencyLimitLayer` bounds in-flight requests alongside the timeout and
 //! body-limit layers. Errors never leak filesystem paths or ffmpeg stderr (that
 //! detail is logged, collapsed to a bare status for the client). See TAD §4/§7.
@@ -107,8 +108,12 @@ pub struct AppState {
     pub index: Arc<Mutex<Index>>,
     /// External base URL for feed/enclosure links (no trailing slash).
     pub base_url: String,
-    /// Canonical data dir — resolved audio paths must stay under it.
+    /// Canonical data dir — extracted (chaptered) audio must stay under it.
     pub data_dir: PathBuf,
+    /// Canonical library root — whole-file episodes are streamed in place from
+    /// here (Sprint 6.2), so a resolved in-place path must stay under it. This is
+    /// the read-only source tree; the audio handler never writes to it.
+    pub library_dir: PathBuf,
     /// Feed-level fallback cover URL for books with no embedded art.
     pub default_cover_url: Option<String>,
     /// `saver` storage mode: episode files aren't pre-split — the audio handler
@@ -124,13 +129,16 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Build state, canonicalizing the data dir for the path-safety check. The
+    /// Build state, canonicalizing the data dir **and** the library root for the
+    /// path-safety checks (served files must stay under one of them). The
     /// `saver`/cache args come from [`podspine_config::Config`] (pre-split
     /// defaults: `saver=false`).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         index: Index,
         base_url: String,
         data_dir: &FsPath,
+        library_dir: &FsPath,
         default_cover_url: Option<String>,
         saver: bool,
         cache_size_bytes: Option<u64>,
@@ -139,10 +147,14 @@ impl AppState {
         let data_dir = data_dir
             .canonicalize()
             .unwrap_or_else(|_| data_dir.to_path_buf());
+        let library_dir = library_dir
+            .canonicalize()
+            .unwrap_or_else(|_| library_dir.to_path_buf());
         Self {
             index: Arc::new(Mutex::new(index)),
             base_url,
             data_dir,
+            library_dir,
             default_cover_url,
             saver,
             cache_size_bytes,
@@ -388,12 +400,17 @@ async fn audio(
         }
     }
     // Final defense-in-depth: the file now exists, so canonicalize it (resolving
-    // any symlink) and confirm it still lives under the data dir before opening.
-    // The resolver already checked the parent dir; this additionally catches a
-    // chapter file that is itself a symlink pointing outside the data dir.
+    // any symlink) and confirm it still lives under a trusted root before opening
+    // — the data dir (extracted chapters) OR the library root (whole-file
+    // episodes served in place). The resolver already checked the relevant root;
+    // this additionally catches a file that is itself a symlink pointing outside.
     let path = target.path.canonicalize().map_err(|_| AppError::NotFound)?;
-    if !path.starts_with(&state.data_dir) {
-        tracing::warn!(feed_id, number, "resolved audio file escaped the data dir");
+    if !path.starts_with(&state.data_dir) && !path.starts_with(&state.library_dir) {
+        tracing::warn!(
+            feed_id,
+            number,
+            "resolved audio file escaped its trusted root"
+        );
         return Err(AppError::NotFound);
     }
     let mime = mime_for(&path.to_string_lossy());
@@ -472,13 +489,18 @@ struct Regen {
     cut: ChapterCut,
 }
 
-/// Resolve `/audio/{feed_id}/{number}` to its on-disk target.
+/// Resolve `/audio/{feed_id}/{number}` to its on-disk target. Two path-safe
+/// shapes, depending on whether the episode is a whole file or a chapter:
 ///
-/// The path is reconstructed from the canonical `data_dir` plus **opaque DB
-/// keys** (`book.id`, chapter index) and a validated audio extension — never
-/// built from request input — so it stays under the data dir by construction
-/// (no traversal). Existence is NOT required: in `saver` mode the file is
-/// regenerated on demand, so the resolver returns the target plus a [`Regen`].
+/// - **In place (whole-file episode):** when the episode carries a `source_path`,
+///   it's a whole file streamed from the library — canonicalized, asserted under
+///   the library root, and size-checked against the recorded length (Sprint 6.2).
+/// - **Extracted (chaptered episode):** the path is reconstructed from the
+///   canonical `data_dir` plus **opaque DB keys** (`book.id`, chapter index) and a
+///   validated audio extension — never built from request input — so it stays
+///   under the data dir by construction (no traversal). Existence is NOT required:
+///   in `saver` mode the file is regenerated on demand, so the resolver returns
+///   the target plus a [`Regen`].
 fn resolve_audio_target(
     state: &AppState,
     feed_id: &str,
@@ -503,6 +525,45 @@ fn resolve_audio_target(
             .ok_or(AppError::NotFound)?;
         (book, ep)
     };
+
+    // Serve-in-place (Sprint 6.2): a whole-file episode (MP3-folder track, or a
+    // chapterless single file) is streamed directly from the read-only library —
+    // never copied under the data dir. `source_path` is the persisted library
+    // file. Three guards before it's served, all 404 on failure (no oracle):
+    //   1. canonicalize + assert under the library root (reject `..`/symlink
+    //      escape) — the A01 "assert under the library root" rule (TAD §7);
+    //   2. the recorded enclosure length must equal the on-disk source size —
+    //      the WHOLE-FILE invariant. A chaptered episode (a sub-range) that
+    //      wrongly carries a `source_path` from a bad migration / partial rescan
+    //      / manual edit has a chapter-sized `byte_length` ≠ the container size,
+    //      so it's rejected here instead of serving the full container's bytes
+    //      under the chapter's enclosure length.
+    // Returns before the data-dir/regeneration logic below, so a poisoned row can
+    // never fall through into it.
+    if !ep.source_path.is_empty() {
+        let src = FsPath::new(&ep.source_path)
+            .canonicalize()
+            .map_err(|_| AppError::NotFound)?;
+        if !src.starts_with(&state.library_dir) {
+            tracing::warn!(feed_id, number, "in-place audio escaped the library root");
+            return Err(AppError::NotFound);
+        }
+        let src_len = std::fs::metadata(&src)
+            .map(|m| m.len() as i64)
+            .map_err(|_| AppError::NotFound)?;
+        if src_len != ep.byte_length {
+            tracing::warn!(
+                feed_id,
+                number,
+                "in-place source size != recorded enclosure length; refusing to serve (corrupt row?)"
+            );
+            return Err(AppError::NotFound);
+        }
+        return Ok(AudioTarget {
+            path: src,
+            regen: None,
+        });
+    }
 
     // The container extension is the audio ext the scanner recorded; reject
     // anything non-alphanumeric so it can never introduce a path separator.
@@ -530,10 +591,12 @@ fn resolve_audio_target(
     }
     let path = out_dir.join(format!("{:03}.{out_ext}", idx + 1));
 
-    // Only single-file books are regenerable. An MP3-folder book copies each
-    // track verbatim (its `source_path` is a *directory*), so there's nothing to
-    // re-split — a missing file must be a clean 404, never a doomed
-    // `ffmpeg <directory>` (500). Eviction likewise leaves those tracks alone.
+    // Only chaptered single-file books reach here: whole-file episodes (MP3-folder
+    // tracks, chapterless singles) carry a `source_path` and were served in place
+    // and returned above, so they never regenerate. Regen is possible only in
+    // saver mode when the book's source is a single file to re-split; the
+    // `is_file` guard stays as belt-and-suspenders (a directory source would make
+    // `ffmpeg <directory>` fail), so a missing file is a clean 404, not a 500.
     let regen = (state.saver && FsPath::new(&book.source_path).is_file()).then(|| Regen {
         source: PathBuf::from(&book.source_path),
         out_dir,
@@ -610,10 +673,11 @@ async fn enforce_cache(state: &AppState, keep: &FsPath) {
     }
     let books = state.data_dir.join("books");
     // Only single-file-source books are regenerable; their cached chapters are
-    // safe to evict. MP3-folder tracks (directory source) are copied verbatim —
-    // deleting one would lose it until the next rescan — so restrict eviction to
-    // the regenerable book dirs. Snapshot the sources without holding the lock
-    // across the `is_file` stats.
+    // safe to evict (they re-split on demand). A non-regenerable book dir must be
+    // left alone — nothing would rebuild it: whole-file books are served in place
+    // (any dir here is just a cover, or a legacy pre-6.2 copy not yet reclaimed).
+    // So restrict eviction to the regenerable book dirs. Snapshot the sources
+    // without holding the lock across the `is_file` stats.
     let sources: Vec<(String, String)> = {
         let Ok(index) = state.index.lock() else {
             return;
@@ -635,8 +699,9 @@ async fn enforce_cache(state: &AppState, keep: &FsPath) {
 /// Collect cached chapter files (numeric stems under `books/*/`) from
 /// **regenerable** books only, drop TTL-expired ones, then delete oldest-first
 /// until under `cap`. mtime is the LRU key: regenerating a chapter refreshes it.
-/// Non-regenerable book dirs (e.g. MP3-folder tracks) are skipped entirely so a
-/// verbatim copy is never destroyed. Best-effort; per-file I/O errors are ignored.
+/// Non-regenerable book dirs (a directory-source book, or a legacy pre-6.2 copy)
+/// are skipped entirely so nothing that can't be rebuilt is destroyed. Best-effort;
+/// per-file I/O errors are ignored.
 fn evict(
     books_dir: &FsPath,
     cap: Option<u64>,
@@ -958,16 +1023,17 @@ mod tests {
 
     #[test]
     fn evict_never_touches_non_regenerable_books() {
-        // A regenerable (single-file-source) book and an MP3-folder book whose
-        // tracks are copied verbatim. Only the regenerable one may be evicted;
-        // the MP3-folder tracks must survive even a tiny cap (Greptile P1).
+        // A regenerable (single-file-source) book and a non-regenerable book dir
+        // (a directory source — e.g. an MP3 folder, or a legacy pre-6.2 copy).
+        // Only the regenerable one may be evicted; the non-regenerable files must
+        // survive even a tiny cap (Greptile P1) — nothing would rebuild them.
         let dir = std::env::temp_dir().join("podspine-evict-mp3safe");
         let _ = std::fs::remove_dir_all(&dir);
         let books = dir.join("books");
         let split = books.join("splitbook"); // regenerable
         touch(&split.join("001.m4a"), 100);
         touch(&split.join("002.m4a"), 100);
-        let folder = books.join("mp3book"); // NOT regenerable (verbatim copies)
+        let folder = books.join("mp3book"); // NOT regenerable (directory source / legacy copy)
         touch(&folder.join("001.mp3"), 100);
         touch(&folder.join("002.mp3"), 100);
         let keep = split.join("002.m4a");

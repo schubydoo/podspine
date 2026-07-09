@@ -15,12 +15,17 @@
 //! book. It distinguishes single-file books (`.m4b`/`.m4a`, or a lone `.mp3`),
 //! split by chapters, from multi-track **MP3 folders** (Task 3.3) — a folder of
 //! per-chapter MP3s ingested as one episode per file with **no splitting and no
-//! re-encode** (byte-copied into the data dir, ordered by track number and
-//! falling back to filename order). It assigns collision-free slugs
-//! deterministically and never lets one bad book abort the whole scan. Tier-2
-//! inputs (Ogg Vorbis/Opus/FLAC) are stream-copied into a matching container
-//! (Task 3.9); DRM inputs (AAX/AAXC/`.aa`/`.odm`) are skipped with a logged
-//! notice (PRD W5).
+//! re-encode** (ordered by track number, falling back to filename order). It
+//! assigns collision-free slugs deterministically and never lets one bad book
+//! abort the whole scan. Tier-2 inputs (Ogg Vorbis/Opus/FLAC) are stream-copied
+//! into a matching container (Task 3.9); DRM inputs (AAX/AAXC/`.aa`/`.odm`) are
+//! skipped with a logged notice (PRD W5).
+//!
+//! **Whole-file episodes are served in place (Sprint 6.2):** when an episode IS
+//! a whole source file — every MP3-folder track, or a chapterless single file —
+//! it is streamed directly from the read-only library and its `source_path` is
+//! recorded; nothing is copied under `<data_dir>`. Only chaptered books, whose
+//! episodes are sub-ranges of a container, are extracted (`full`/`saver`).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -29,7 +34,9 @@ use std::time::UNIX_EPOCH;
 use podspine_feed::{episode_guid, pubdate_epoch};
 use podspine_index::{BookRow, EpisodeRow, Index, IndexError};
 use podspine_prober::{ProbeError, probe};
-use podspine_splitter::{ChapterCut, SplitError, extract_cover, split_book, split_chapter};
+use podspine_splitter::{
+    ChapterCut, SplitEpisode, SplitError, extract_cover, split_book, split_chapter,
+};
 
 /// Extensions we refuse to ingest (DRM). Matched case-insensitively.
 const DRM_EXTENSIONS: &[&str] = &["aax", "aaxc", "aa", "odm"];
@@ -54,7 +61,7 @@ pub enum ScanError {
     /// An MP3 folder held no ingestable (probeable) audio.
     #[error("no ingestable audio in folder: {0}")]
     EmptyFolder(PathBuf),
-    /// A filesystem operation (copy, mkdir, stat) failed during MP3-folder ingest.
+    /// A filesystem operation (stat, mkdir, or split-file delete) failed during ingest.
     #[error("i/o error on {path}: {source}")]
     Io {
         /// The path involved.
@@ -107,6 +114,13 @@ pub fn scan_book_as(
     if is_drm(input) {
         return Err(ScanError::UnsupportedDrm(input.to_path_buf()));
     }
+    // Persist an ABSOLUTE, symlink-resolved source path. In-place serving (and
+    // saver regeneration) resolves this later from the server's cwd, so a
+    // relative `--library` stored verbatim would 404 after a restart from a
+    // different directory (systemd/Docker). `is_file` above proved it exists, so
+    // canonicalize succeeds; the fallback only guards a race.
+    let input_canonical = input.canonicalize().unwrap_or_else(|_| input.to_path_buf());
+    let input = input_canonical.as_path();
 
     let id = id.to_string();
     let source_mtime = mtime_epoch(input)?;
@@ -148,8 +162,12 @@ pub fn scan_book_as(
         tracing::info!(id = %id, source = ?resolved.source, "using sidecar chapters");
     }
 
+    // A chapterless file is ONE whole-file episode → streamed in place from the
+    // library (no split, no copy under <data_dir>). A chaptered book is extracted
+    // per chapter (full/saver). See TAD §5.3.
+    let serve_in_place = resolved.chapters.is_empty();
     // Chapters -> (cut, title). Chapter-less -> a single episode over the file.
-    let specs: Vec<(ChapterCut, String)> = if resolved.chapters.is_empty() {
+    let specs: Vec<(ChapterCut, String)> = if serve_in_place {
         tracing::warn!(
             id = %id,
             "no chapters (embedded or sidecar) — emitting a single-episode feed"
@@ -184,7 +202,24 @@ pub fn scan_book_as(
     let cuts: Vec<ChapterCut> = specs.iter().map(|(cut, _)| cut.clone()).collect();
     // Stream-copy into a container matching the source codec (Task 3.9).
     let out_ext = output_ext(probed.audio_codec.as_deref());
-    let episodes = if saver {
+    let episodes = if serve_in_place {
+        // Whole source file: stream it in place from the read-only library. No
+        // ffmpeg, no copy under <data_dir>; the enclosure length is the real
+        // source size. Reclaim any per-episode copy a pre-6.2 ingest left behind.
+        remove_stale_episode_copies(&book_out);
+        let byte_length = std::fs::metadata(input)
+            .map_err(|source| ScanError::Io {
+                path: input.to_path_buf(),
+                source,
+            })?
+            .len();
+        vec![SplitEpisode {
+            idx: 0,
+            path: input.to_path_buf(),
+            byte_length,
+            duration_sec: probed.duration_sec,
+        }]
+    } else if saver {
         // Split each chapter to record its real byte size, then delete it — the
         // http layer regenerates on demand (deterministic stream-copy, so the
         // regenerated bytes match the recorded length). Peak disk = one chapter.
@@ -241,6 +276,13 @@ pub fn scan_book_as(
             idx: ep.idx as i64,
             title: title.clone(),
             file_path: ep.path.to_string_lossy().into_owned(),
+            // Non-empty only for a whole-file episode served in place; empty for
+            // an extracted chapter served from <data_dir>.
+            source_path: if serve_in_place {
+                input.to_string_lossy().into_owned()
+            } else {
+                String::new()
+            },
             byte_length: ep.byte_length as i64,
             duration_sec: ep.duration_sec,
             start_sec: cut.start_sec,
@@ -249,6 +291,30 @@ pub fn scan_book_as(
     }
 
     Ok(book)
+}
+
+/// Remove per-episode audio copies a previous (pre-6.2) ingest wrote under
+/// `<data_dir>/books/<id>/` now that this book's episodes stream in place from
+/// the library. Only numbered episode files (`NNN.<ext>`) are removed; an
+/// extracted `cover.*` is left in place. Best-effort — a missing dir or a failed
+/// unlink is logged, never fatal (the book still serves from the library).
+fn remove_stale_episode_copies(book_out: &Path) {
+    let Ok(entries) = std::fs::read_dir(book_out) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let numbered = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.len() == 3 && s.bytes().all(|b| b.is_ascii_digit()));
+        if numbered
+            && path.is_file()
+            && let Err(err) = std::fs::remove_file(&path)
+        {
+            tracing::warn!(error = %err, path = %path.display(), "failed to remove stale episode copy");
+        }
+    }
 }
 
 /// One per-chapter MP3 track discovered in a folder, with the metadata needed to
@@ -265,16 +331,20 @@ struct Mp3Track {
 }
 
 /// Ingest a folder of per-chapter MP3s as one book under `id`: one episode per
-/// file, **no splitting and no re-encode** — each MP3 is byte-copied into
-/// `<data_dir>/books/<id>/NNN.mp3` (keeping all served audio under the data dir).
-/// Files are ordered by track number when every track is present and distinct,
-/// otherwise by filename with a warning. Idempotent on an unchanged folder.
+/// file, **no splitting, no re-encode, and no copy** — each track is served in
+/// place from the library (Sprint 6.2). Files are ordered by track number when
+/// every track is present and distinct, otherwise by filename with a warning.
+/// Idempotent on an unchanged folder.
 fn scan_mp3_folder(
     dir: &Path,
     id: &str,
     data_dir: &Path,
     index: &Index,
 ) -> Result<BookRow, ScanError> {
+    // Canonicalize the folder so every track path stored below is absolute and
+    // symlink-resolved — in-place serving must not depend on the server's cwd.
+    let dir_canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let dir = dir_canonical.as_path();
     let files = collect_mp3s(dir);
     if files.is_empty() {
         return Err(ScanError::EmptyFolder(dir.to_path_buf()));
@@ -290,12 +360,19 @@ fn scan_mp3_folder(
         .unwrap_or(0);
     let book_out = data_dir.join("books").join(id);
 
-    // Idempotency: unchanged and fully present -> no re-probe / re-copy.
+    // Idempotency: unchanged and already served in place -> no re-probe.
+    // The `source_path` guard forces a one-time re-ingest of a pre-6.2 book
+    // (tracks copied under <data_dir>, empty `source_path`) so it flips to
+    // in-place serving and its copies get reclaimed.
     if let Some(existing) = index.get_book(id)?
         && existing.source_mtime == source_mtime
     {
         let eps = index.episodes_for_book(id)?;
-        if !eps.is_empty() && eps.iter().all(|e| Path::new(&e.file_path).exists()) {
+        if !eps.is_empty()
+            && eps
+                .iter()
+                .all(|e| !e.source_path.is_empty() && Path::new(&e.source_path).exists())
+        {
             return Ok(existing);
         }
     }
@@ -335,19 +412,13 @@ fn scan_mp3_folder(
     index.upsert_book(&book)?;
 
     let n = tracks.len();
-    std::fs::create_dir_all(&book_out).map_err(|source| ScanError::Io {
-        path: book_out.clone(),
-        source,
-    })?;
+    // Each track is a whole file → served in place from the library, no copy.
+    // Reclaim any verbatim copies a pre-6.2 ingest wrote under <data_dir>.
+    remove_stale_episode_copies(&book_out);
     for (idx, t) in tracks.iter().enumerate() {
-        let dest = book_out.join(format!("{:03}.mp3", idx + 1));
-        std::fs::copy(&t.path, &dest).map_err(|source| ScanError::Io {
-            path: dest.clone(),
-            source,
-        })?;
-        let byte_length = std::fs::metadata(&dest)
+        let byte_length = std::fs::metadata(&t.path)
             .map_err(|source| ScanError::Io {
-                path: dest.clone(),
+                path: t.path.clone(),
                 source,
             })?
             .len();
@@ -356,11 +427,12 @@ fn scan_mp3_folder(
             book_id: id.to_string(),
             idx: idx as i64,
             title: t.title.clone(),
-            file_path: dest.to_string_lossy().into_owned(),
+            file_path: t.path.to_string_lossy().into_owned(),
+            // A folder track IS a whole source file — stream it in place.
+            source_path: t.path.to_string_lossy().into_owned(),
             byte_length: byte_length as i64,
             duration_sec: t.duration_sec,
-            // Folder-of-MP3s tracks are whole files copied verbatim (no split),
-            // so each episode starts at 0 and stays `full` mode for now.
+            // Whole files (not sub-ranges of a container), so each starts at 0.
             start_sec: 0.0,
             pubdate_epoch: pubdate_epoch(source_mtime, idx, n),
         })?;
@@ -902,7 +974,7 @@ mod tests {
     }
 
     #[test]
-    fn mp3_folder_ingests_in_track_order_by_copy() {
+    fn mp3_folder_serves_tracks_in_place_in_track_order() {
         if !ffmpeg_available() {
             eprintln!("skipping: ffmpeg not available");
             return;
@@ -934,16 +1006,34 @@ mod tests {
             (eps[1].duration_sec - 4.0).abs() < 0.6,
             "middle is track 2 (4s)"
         );
+        let book_c = book.canonicalize().unwrap();
         for (i, e) in eps.iter().enumerate() {
             assert_eq!(e.idx, i as i64);
             let p = PathBuf::from(&e.file_path);
-            assert!(p.exists(), "copied file on disk");
-            assert!(p.starts_with(&data), "served copy lives under data dir");
+            assert!(p.exists(), "track file on disk");
+            assert!(
+                p.starts_with(&book_c),
+                "served in place from the library (canonical), not copied"
+            );
+            assert!(!p.starts_with(&data), "nothing served from the data dir");
+            assert_eq!(
+                e.source_path, e.file_path,
+                "source_path marks the in-place track"
+            );
             assert!(e.file_path.ends_with(".mp3"));
             assert!(e.byte_length > 0);
         }
         for w in eps.windows(2) {
             assert!(w[0].pubdate_epoch < w[1].pubdate_epoch, "pubDates increase");
+        }
+
+        // No per-track copies were written under <data>/books/<id>/.
+        let book_out = data.join("books").join(&books[0].id);
+        for i in 1..=eps.len() {
+            assert!(
+                !book_out.join(format!("{i:03}.mp3")).exists(),
+                "MP3-folder track {i} is not copied to the data dir"
+            );
         }
 
         let _ = std::fs::remove_dir_all(&root);
@@ -1191,11 +1281,18 @@ mod tests {
         let eps = index.episodes_for_book(&book.id).unwrap();
         assert_eq!(eps.len(), 1, "no chapters/cue -> single episode");
         assert!(eps[0].file_path.ends_with(".flac"));
+        // Chapterless single file → served in place from the library (the stored
+        // path is canonical/absolute), not copied.
+        let flac_c = flac.canonicalize().unwrap();
+        assert_eq!(eps[0].source_path, flac_c.to_string_lossy());
+        assert_eq!(eps[0].file_path, flac_c.to_string_lossy());
+        assert!(Path::new(&eps[0].source_path).is_absolute());
+        assert!(!Path::new(&eps[0].file_path).starts_with(&data));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn opus_single_file_ingests_to_opus_container() {
+    fn opus_single_file_served_in_place() {
         if !ffmpeg_available() {
             eprintln!("skipping: ffmpeg not available");
             return;
@@ -1217,6 +1314,13 @@ mod tests {
             "got {}",
             eps[0].file_path
         );
+        // Served in place from the library (the original `.opus`), not remuxed
+        // into a data-dir container.
+        assert_eq!(
+            eps[0].source_path,
+            opus.canonicalize().unwrap().to_string_lossy()
+        );
+        assert!(!Path::new(&eps[0].file_path).starts_with(&data));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1433,6 +1537,79 @@ mod tests {
         let eps = index.episodes_for_book(&book.id).unwrap();
         assert_eq!(eps.len(), 1, "chapter-less -> single episode");
         assert!(Path::new(&eps[0].file_path).exists());
+        // Served in place from the library — the episode IS the source file
+        // (stored as a canonical/absolute path), and nothing was copied under the
+        // data dir.
+        let input_c = input.canonicalize().unwrap();
+        assert_eq!(eps[0].source_path, input_c.to_string_lossy());
+        assert_eq!(eps[0].file_path, input_c.to_string_lossy());
+        assert!(Path::new(&eps[0].source_path).is_absolute());
+        assert!(!Path::new(&eps[0].file_path).starts_with(&data));
+        assert_eq!(
+            eps[0].byte_length as u64,
+            std::fs::metadata(&input).unwrap().len(),
+            "enclosure length = real source size"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mp3_folder_rescan_is_idempotent_and_stays_in_place() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not available");
+            return;
+        }
+        let root = scratch("mp3-idem");
+        let book = root.join("Idem Book");
+        let a = synth_mp3(&book, "01.mp3", Some(1), 2);
+        let b = synth_mp3(&book, "02.mp3", Some(2), 2);
+        if a.is_none() || b.is_none() {
+            eprintln!("skipping: ffmpeg has no libmp3lame encoder");
+            return;
+        }
+        let data = root.join("data");
+        let index = Index::open_in_memory().unwrap();
+
+        scan_library(&root, &data, &index, false, false);
+        let id = index.list_books().unwrap()[0].id.clone();
+        let first = index.episodes_for_book(&id).unwrap();
+        assert!(first.iter().all(|e| !e.source_path.is_empty()));
+
+        // Re-scan the unchanged folder: the `source_path` idempotency guard takes
+        // the early return — episodes are unchanged and still served in place.
+        scan_library(&root, &data, &index, false, false);
+        let second = index.episodes_for_book(&id).unwrap();
+        assert_eq!(first.len(), second.len());
+        for (x, y) in first.iter().zip(&second) {
+            assert_eq!(x.guid, y.guid, "guid stable across re-scan");
+            assert_eq!(x.source_path, y.source_path, "still served in place");
+            assert_eq!(x.file_path, y.file_path);
+        }
+        // Still nothing copied under the data dir.
+        assert!(!data.join("books").join(&id).join("001.mp3").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn remove_stale_episode_copies_reclaims_numbered_files_but_keeps_cover() {
+        let dir = scratch("stale-copies");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Numbered files are per-episode copies from a pre-6.2 ingest.
+        std::fs::write(dir.join("001.mp3"), b"x").unwrap();
+        std::fs::write(dir.join("002.m4a"), b"y").unwrap();
+        // The extracted cover and any non-numbered file must survive.
+        std::fs::write(dir.join("cover.jpg"), b"img").unwrap();
+
+        remove_stale_episode_copies(&dir);
+
+        assert!(!dir.join("001.mp3").exists(), "stale copy removed");
+        assert!(!dir.join("002.m4a").exists(), "stale copy removed");
+        assert!(dir.join("cover.jpg").exists(), "cover preserved");
+
+        // A missing dir is a no-op, not a panic.
+        remove_stale_episode_copies(&dir.join("nope"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1457,7 +1634,16 @@ mod tests {
             eprintln!("skipping: ffmpeg not available");
             return;
         }
-        let (root, data, index) = two_book_library("prune-removes");
+        // Chaptered books (not whole-file) so each materializes a per-chapter
+        // split dir under <data> — that's the "split output" prune must remove.
+        let root = scratch("prune-removes-lib");
+        let data = scratch("prune-removes-data");
+        let a = synth(&root, true);
+        std::fs::rename(&a, root.join("alpha.m4a")).unwrap();
+        let b = synth(&root, true);
+        std::fs::rename(&b, root.join("beta.m4a")).unwrap();
+        let index = Index::open_in_memory().unwrap();
+
         scan_library(&root, &data, &index, false, false);
         assert_eq!(index.list_books().unwrap().len(), 2);
         let beta_out = data.join("books").join("beta");
