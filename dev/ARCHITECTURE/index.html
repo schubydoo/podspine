@@ -899,7 +899,16 @@ serve) and a <code>podspine-cli</code> proof-of-concept for the single-file spli
   warning.</li>
 </ul>
 <h2 id="storage-model">Storage model<a class="headerlink" href="#storage-model" title="Permanent link">&para;</a></h2>
-<p>SQLite index + flat filesystem. Split episodes are pre-materialized at ingest (v1):</p>
+<p>SQLite index + flat filesystem. Episode audio is <strong>materialized under
+<code>&lt;data_dir&gt;</code> — a copy separate from your source library</strong>; the server does not yet
+stream from the library in place, so <code>&lt;data_dir&gt;</code> grows on top of the originals.
+In <code>full</code> mode (default) chapters are pre-split at ingest and kept; in <code>saver</code>
+mode every chapter is still split once at ingest (to record its exact byte
+length) but then deleted, and regenerated on demand into a bounded cache — so
+<code>saver</code> cuts steady-state disk, not ingest time or I/O. Folder-of-MP3 tracks are
+copied in full in either mode. See
+<a href="../DEPLOYMENT/#storage-mode-full-vs-saver">DEPLOYMENT.md</a> for the disk-budget
+details.</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>&lt;data_dir&gt;/
 <a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>├── podspine.db              # SQLite index (book, episode, feed_token)
 <a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>└── books/
