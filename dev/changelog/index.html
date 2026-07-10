@@ -544,6 +544,34 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
+  <a href="#130-2026-07-10" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1.3.0 (2026-07-10)
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="1.3.0 (2026-07-10)">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#features" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Features
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#120-2026-07-07" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -556,7 +584,7 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#features" class="md-nav__link">
+  <a href="#features_1" class="md-nav__link">
     <span class="md-ellipsis">
       
         Features
@@ -584,7 +612,7 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#features_1" class="md-nav__link">
+  <a href="#features_2" class="md-nav__link">
     <span class="md-ellipsis">
       
         Features
@@ -755,6 +783,34 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
+  <a href="#130-2026-07-10" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1.3.0 (2026-07-10)
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="1.3.0 (2026-07-10)">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#features" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Features
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#120-2026-07-07" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -767,7 +823,7 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#features" class="md-nav__link">
+  <a href="#features_1" class="md-nav__link">
     <span class="md-ellipsis">
       
         Features
@@ -795,7 +851,7 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#features_1" class="md-nav__link">
+  <a href="#features_2" class="md-nav__link">
     <span class="md-ellipsis">
       
         Features
@@ -899,13 +955,21 @@
 
 <!-- Rendered from the canonical CHANGELOG.md at the repo root (knope-managed). -->
 <h1 id="changelog">Changelog<a class="headerlink" href="#changelog" title="Permanent link">&para;</a></h1>
-<h2 id="120-2026-07-07">1.2.0 (2026-07-07)<a class="headerlink" href="#120-2026-07-07" title="Permanent link">&para;</a></h2>
+<h2 id="130-2026-07-10">1.3.0 (2026-07-10)<a class="headerlink" href="#130-2026-07-10" title="Permanent link">&para;</a></h2>
 <h3 id="features">Features<a class="headerlink" href="#features" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Detect non-faststart whole-file mp4 (<code>moov</code> after <code>mdat</code>) at ingest and log a one-line callout; add opt-in <code>PODSPINE_REMUX_NON_FASTSTART</code> to remux such books to faststart on demand — a cache-managed stream-copy (no re-encode) served from the <code>saver</code> cache and regenerated/evicted like a cached chapter, never a pinned duplicate — so podcast clients seek quickly. MP3/OGG/FLAC, already-faststart mp4, and chaptered books are unaffected. (<a href="https://github.com/schubydoo/podspine/pull/61">#61</a>)</li>
+<li>Add per-book <code>.podspine.toml</code> overrides: a sidecar beside a single-file book (<code>Author - Title.podspine.toml</code>) or inside a folder book overrides settings for just that book — <code>storage_mode</code>, <code>force_embedded_chapters</code>, <code>remux_non_faststart</code>, <code>default_cover_url</code>, plus troubleshooting knobs <code>disabled</code>, <code>title</code>, <code>author</code>, and <code>force_reingest</code> — with precedence sidecar → CLI/env → global config → default. Server-wide keys placed in a per-book file are ignored with a warning. (<a href="https://github.com/schubydoo/podspine/pull/62">#62</a>)</li>
+<li>Serve whole-file episodes — folder-of-MP3 tracks and chapterless single files — in place, streaming them directly from the read-only library instead of copying them under the data dir; this removes the silent duplication those books used to cost (an existing library reclaims the copies on its next re-scan). Chaptered books are unchanged (<code>full</code>/<code>saver</code>). (<a href="https://github.com/schubydoo/podspine/pull/59">#59</a>)</li>
+<li>Add an opt-in <code>saver</code> storage mode (<code>PODSPINE_STORAGE_MODE=saver</code>) that keeps chapters in a bounded on-demand cache (<code>PODSPINE_CACHE_SIZE</code>/<code>PODSPINE_CACHE_TTL</code>) instead of keeping every chapter split on disk — cutting the data-dir footprint for chaptered books (whole-file books such as folder-of-MP3 tracks stream in place regardless of storage mode) for a small first-play delay per chapter. Ingest still splits each chapter once to record its real byte length, so <code>saver</code> saves disk, not ingest time. (<a href="https://github.com/schubydoo/podspine/pull/53">#53</a>)</li>
+</ul>
+<h2 id="120-2026-07-07">1.2.0 (2026-07-07)<a class="headerlink" href="#120-2026-07-07" title="Permanent link">&para;</a></h2>
+<h3 id="features_1">Features<a class="headerlink" href="#features_1" title="Permanent link">&para;</a></h3>
 <ul>
 <li>Add a <code>--version</code>/<code>-V</code> flag so <code>podspine --version</code> reports the version (used by the install scripts and package-manager smoke tests). (<a href="https://github.com/schubydoo/podspine/pull/36">#36</a>)</li>
 </ul>
 <h2 id="110-2026-07-05">1.1.0 (2026-07-05)<a class="headerlink" href="#110-2026-07-05" title="Permanent link">&para;</a></h2>
-<h3 id="features_1">Features<a class="headerlink" href="#features_1" title="Permanent link">&para;</a></h3>
+<h3 id="features_2">Features<a class="headerlink" href="#features_2" title="Permanent link">&para;</a></h3>
 <ul>
 <li>Add an "Add to a podcast app" subscribe page: the book-page QR now opens <code>/subscribe/{feed_id}</code> with one-tap "Open in…" deep links for Apple Podcasts, Overcast, Pocket Casts, Castro, AntennaPod, and Podcast Addict (per-app QRs behind an expander) instead of raw feed XML the iOS Camera couldn't open. (<a href="https://github.com/schubydoo/podspine/pull/22">#22</a>)</li>
 </ul>
