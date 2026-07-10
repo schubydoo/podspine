@@ -912,6 +912,30 @@ mod tests {
     }
 
     #[test]
+    fn book_is_saver_follows_per_book_then_global() {
+        let mk = |mode: &str| BookRow {
+            id: "b".into(),
+            slug: "b".into(),
+            feed_id: "cap".into(),
+            title: "T".into(),
+            author: None,
+            cover_path: None,
+            source_path: "/x".into(),
+            source_mtime: 0,
+            status: "ready".into(),
+            storage_mode: mode.into(),
+            default_cover_url: None,
+            force_embedded: false,
+        };
+        // An explicit per-book mode wins regardless of the server default.
+        assert!(book_is_saver(&mk("saver"), false));
+        assert!(!book_is_saver(&mk("full"), true));
+        // An empty mode (a pre-6.4 row) follows the server default.
+        assert!(book_is_saver(&mk(""), true));
+        assert!(!book_is_saver(&mk(""), false));
+    }
+
+    #[test]
     fn valid_slug_allow_list() {
         // Accepts exactly what slugify produces.
         assert!(valid_slug("dune"));

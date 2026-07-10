@@ -85,6 +85,7 @@ component_management:
       name: prober & chapters
       paths:
         - crates/prober/src/lib.rs
+        - crates/prober/src/faststart.rs
         - crates/chapters/src/lib.rs
     - component_id: splitter
       name: splitter (ffmpeg)
@@ -111,6 +112,7 @@ component_management:
       name: config
       paths:
         - crates/config/src/lib.rs
+        - crates/config/src/book_overrides.rs
     - component_id: server_cli
       name: server & cli
       paths:
