@@ -745,6 +745,30 @@ mod tests {
     }
 
     #[test]
+    fn split_chapter_maps_a_nonzero_ffmpeg_exit_to_an_error() {
+        if !have_ffmpeg() {
+            eprintln!("skipping: ffmpeg not available");
+            return;
+        }
+        // `split_chapter` (the saver/regen entry point) on a non-audio input:
+        // ffmpeg exits non-zero → the error arm, carrying the chapter index.
+        let dir = std::env::temp_dir().join("podspine-splitchap-fail");
+        let _ = std::fs::remove_dir_all(&dir);
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let bad = dir.join("notaudio.m4a");
+        std::fs::write(&bad, b"definitely not an audio stream").unwrap();
+        let ch = ChapterCut {
+            idx: 2,
+            start_sec: 0.0,
+            end_sec: 5.0,
+        };
+        let err = split_chapter(&bad, &out, &ch, "m4a").expect_err("bad input must fail");
+        assert!(matches!(err, SplitError::Ffmpeg { idx: 2, .. }), "{err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn remux_faststart_produces_a_deterministic_faststart_file() {
         if !have_ffmpeg() {
             eprintln!("skipping: ffmpeg not available");
@@ -810,6 +834,52 @@ mod tests {
     }
 
     #[test]
+    fn remux_maps_a_nonzero_ffmpeg_exit_to_a_split_error() {
+        if !have_ffmpeg() {
+            eprintln!("skipping: ffmpeg not available");
+            return;
+        }
+        // A non-audio input makes ffmpeg exit non-zero → the remux error arm.
+        let dir = std::env::temp_dir().join("podspine-remux-fail");
+        let _ = std::fs::remove_dir_all(&dir);
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let bad = dir.join("notaudio.m4a");
+        std::fs::write(&bad, b"definitely not an audio stream").unwrap();
+        let err = remux_faststart(&bad, &out, 0, "m4a", 3.0).expect_err("bad input must fail");
+        assert!(matches!(err, SplitError::Ffmpeg { idx: 0, .. }), "{err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn semaphore_blocks_a_second_acquirer_until_release() {
+        use std::sync::Arc;
+        // One permit: a second acquirer must wait on the condvar (the wait path)
+        // until the first permit drops.
+        let sem = Arc::new(Semaphore {
+            permits: Mutex::new(1),
+            cv: Condvar::new(),
+        });
+        let p1 = sem.acquire();
+        assert_eq!(*sem.permits.lock().unwrap(), 0);
+        let sem2 = Arc::clone(&sem);
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done2 = Arc::clone(&done);
+        let handle = std::thread::spawn(move || {
+            let _p2 = sem2.acquire(); // blocks on cv.wait until p1 is released
+            done2.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !done.load(std::sync::atomic::Ordering::SeqCst),
+            "second acquirer is still blocked while the permit is held"
+        );
+        drop(p1); // release → wakes the waiter
+        handle.join().unwrap();
+        assert!(done.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
     fn extract_cover_maps_a_nonzero_ffmpeg_exit_to_a_cover_error() {
         if !have_ffmpeg() {
             eprintln!("skipping: ffmpeg not available");
@@ -824,6 +894,41 @@ mod tests {
         let err =
             extract_cover(&bad, &dir.join("out"), "jpg").expect_err("no cover stream must fail");
         assert!(matches!(err, CoverError::Ffmpeg { .. }), "{err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_cover_reports_create_dir_when_out_dir_is_a_file() {
+        // out_dir is an existing regular file -> create_dir_all fails BEFORE any
+        // ffmpeg spawn -> CoverError::CreateDir. ffmpeg-free, so it runs everywhere.
+        let dir = std::env::temp_dir().join("podspine-cover-createdir");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_as_dir = dir.join("iam-a-file");
+        std::fs::write(&file_as_dir, b"x").unwrap();
+        let err = extract_cover(Path::new("irrelevant.m4b"), &file_as_dir, "jpg")
+            .expect_err("out_dir being a file must fail");
+        assert!(matches!(err, CoverError::CreateDir { .. }), "{err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn split_book_reports_create_dir_when_out_dir_is_a_file() {
+        // Same guard on the chaptered path: out_dir is a file -> SplitError::CreateDir
+        // before any chapter is cut (ffmpeg-free).
+        let dir = std::env::temp_dir().join("podspine-split-createdir");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_as_dir = dir.join("iam-a-file");
+        std::fs::write(&file_as_dir, b"x").unwrap();
+        let ch = ChapterCut {
+            idx: 0,
+            start_sec: 0.0,
+            end_sec: 10.0,
+        };
+        let err = split_book(Path::new("irrelevant.m4b"), &file_as_dir, &[ch], "m4a")
+            .expect_err("out_dir being a file must fail");
+        assert!(matches!(err, SplitError::CreateDir { .. }), "{err:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

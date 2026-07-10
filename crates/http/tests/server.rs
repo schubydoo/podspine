@@ -740,6 +740,141 @@ async fn per_book_saver_serves_even_when_server_is_full() {
 }
 
 #[tokio::test]
+async fn regenerate_rejects_an_invalid_slug() {
+    // No ffmpeg: the slug is rejected before any DB/filesystem work.
+    let dir = std::env::temp_dir().join("podspine-http-regen-badslug");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let data = dir.join("data");
+    let index = Index::open_in_memory().unwrap();
+    let state = AppState::new(
+        index,
+        "http://test".to_string(),
+        &data,
+        &dir,
+        None,
+        false,
+        None,
+        None,
+    );
+    let app = router(state);
+    // Same-origin (no cross-site header) but an invalid slug (uppercase) → 404.
+    let resp = app
+        .oneshot(
+            Request::post("/book/BadSlug/regenerate")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn cover_path_outside_the_data_dir_is_a_404() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+    let dir = std::env::temp_dir().join("podspine-http-cover-escape");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let data = dir.join("data");
+    let index = Index::open_in_memory().unwrap();
+    let input = synth_with_cover(&dir);
+    let mut book = scan_book(&input, &data, &index).unwrap();
+    assert!(book.cover_path.is_some());
+    // Point the cover at a real file OUTSIDE the data dir; the cover handler must
+    // reject it even though it exists (covers must live under the data dir).
+    let outside = dir.join("evil.jpg");
+    std::fs::write(&outside, b"img").unwrap();
+    book.cover_path = Some(outside.to_string_lossy().into_owned());
+    index.upsert_book(&book).unwrap();
+    let feed_id = book.feed_id.clone();
+
+    let state = AppState::new(
+        index,
+        "http://test".to_string(),
+        &data,
+        &dir,
+        None,
+        false,
+        None,
+        None,
+    );
+    let app = router(state);
+    let resp = app
+        .oneshot(
+            Request::get(format!("/cover/{feed_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn remux_source_outside_the_library_is_a_404() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+    let base = std::env::temp_dir().join("podspine-http-remux-escape");
+    let _ = std::fs::remove_dir_all(&base);
+    let library = base.join("library");
+    let data = base.join("data");
+    std::fs::create_dir_all(&library).unwrap();
+    let index = Index::open_in_memory().unwrap();
+    // A non-faststart file, ingested with remux ON → a remux-cache episode
+    // (file_path != source_path, needs_faststart); the cache file was deleted.
+    let input = synth_flat(&library);
+    let book = scan_book_as(
+        &input,
+        "rmx",
+        &data,
+        &index,
+        false,
+        false,
+        true,
+        &BookOverrides::default(),
+    )
+    .unwrap();
+    let feed_id = book.feed_id.clone();
+    let mut ep = index.episodes_for_book(&book.id).unwrap()[0].clone();
+    assert_ne!(ep.source_path, ep.file_path, "precondition: remuxed");
+    // Point the remux source OUTSIDE the library; the regen branch must reject it.
+    let outside = base.join("outside.m4a");
+    std::fs::copy(&input, &outside).unwrap();
+    ep.source_path = outside.to_string_lossy().into_owned();
+    index.upsert_episode(&ep).unwrap();
+
+    let state = AppState::new(
+        index,
+        "http://test".to_string(),
+        &data,
+        &library,
+        None,
+        false,
+        None,
+        None,
+    );
+    let app = router(state);
+    let resp = app
+        .oneshot(
+            Request::get(format!("/audio/{feed_id}/1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[tokio::test]
 async fn regenerate_rotates_the_capability() {
     if !ffmpeg_available() {
         eprintln!("skipping: ffmpeg not available");

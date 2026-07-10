@@ -2125,6 +2125,153 @@ mod tests {
     }
 
     #[test]
+    fn per_book_full_override_beats_global_saver() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not available");
+            return;
+        }
+        let root = scratch("perbook-full");
+        let input = synth(&root, true); // chaptered, so storage_mode matters
+        let side = input
+            .canonicalize()
+            .unwrap()
+            .with_extension("podspine.toml");
+        std::fs::write(&side, b"storage_mode = \"full\"").unwrap();
+        let data = root.join("data");
+        let index = Index::open_in_memory().unwrap();
+
+        // Global saver, but the sidecar forces `full` for this book.
+        scan_library(&root, &data, &index, false, true, false);
+        let b = index.list_books().unwrap().remove(0);
+        assert_eq!(
+            b.storage_mode, "full",
+            "sidecar full overrides global saver"
+        );
+        let eps = index.episodes_for_book(&b.id).unwrap();
+        assert!(
+            Path::new(&eps[0].file_path).exists(),
+            "full mode keeps the split on disk"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sidecar_global_key_is_ignored_and_a_typo_is_non_fatal() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not available");
+            return;
+        }
+        // A server-global key in a sidecar is ignored (warned); the per-book key
+        // still applies.
+        let root = scratch("perbook-global");
+        let input = synth(&root, false);
+        let side = input
+            .canonicalize()
+            .unwrap()
+            .with_extension("podspine.toml");
+        std::fs::write(&side, b"bind = \"0.0.0.0:9\"\ntitle = \"Kept\"\n").unwrap();
+        let data = root.join("data");
+        let index = Index::open_in_memory().unwrap();
+        assert_eq!(
+            scan_library(&root, &data, &index, false, false, false).indexed,
+            1
+        );
+        assert_eq!(index.list_books().unwrap().remove(0).title, "Kept");
+        let _ = std::fs::remove_dir_all(&root);
+
+        // A typo (unknown key) is a per-book warning, not fatal — still indexes.
+        let root2 = scratch("perbook-typo");
+        let input2 = synth(&root2, false);
+        std::fs::write(
+            input2
+                .canonicalize()
+                .unwrap()
+                .with_extension("podspine.toml"),
+            b"stroage_mode = \"saver\"",
+        )
+        .unwrap();
+        let data2 = root2.join("data");
+        let index2 = Index::open_in_memory().unwrap();
+        assert_eq!(
+            scan_library(&root2, &data2, &index2, false, false, false).indexed,
+            1
+        );
+        assert_eq!(index2.list_books().unwrap().remove(0).storage_mode, "full");
+        let _ = std::fs::remove_dir_all(&root2);
+    }
+
+    #[test]
+    fn mp3_folder_with_no_probeable_tracks_is_skipped() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not available");
+            return;
+        }
+        let root = scratch("mp3-unprobeable");
+        let book = root.join("Broken");
+        std::fs::create_dir_all(&book).unwrap();
+        // Several `.mp3` files that aren't real audio → a folder book whose tracks
+        // all fail to probe → EmptyFolder → skipped, not fatal.
+        std::fs::write(book.join("01.mp3"), b"not audio at all").unwrap();
+        std::fs::write(book.join("02.mp3"), b"also not audio").unwrap();
+        let data = root.join("data");
+        let index = Index::open_in_memory().unwrap();
+        let summary = scan_library(&root, &data, &index, false, false, false);
+        assert_eq!(index.list_books().unwrap().len(), 0);
+        assert_eq!(summary.skipped, 1, "unprobeable MP3 folder skipped");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_watcher_indexes_a_book_added_after_startup() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not available");
+            return;
+        }
+        let root = scratch("watcher-lib");
+        let data = scratch("watcher-data");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let db_path = data.join("podspine.db");
+        // Create the schema so the watcher and this test share the WAL db.
+        drop(Index::open(&db_path).unwrap());
+
+        spawn_library_watcher(
+            root.clone(),
+            data.clone(),
+            db_path.clone(),
+            false,
+            false,
+            false,
+        );
+        // Let the watcher establish its filesystem watch before we add a file.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        // Add a book — the watcher should notice, reconcile, and index it.
+        let _input = synth(&root, false);
+
+        // Poll (debounce + reconcile + ffmpeg split take a moment); generous cap.
+        let mut indexed = false;
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if let Ok(idx) = Index::open(&db_path)
+                && idx.list_books().map(|b| !b.is_empty()).unwrap_or(false)
+            {
+                indexed = true;
+                break;
+            }
+        }
+        assert!(indexed, "the watcher indexed the book added after startup");
+
+        // Deliberately do NOT tear down `root`/`data` here. `spawn_library_watcher`
+        // is a detached, process-lifetime daemon with no shutdown hook (by design),
+        // so deleting its watched dir + WAL db out from under the live thread would
+        // make it churn on removed paths and could race later tests. `scratch()`
+        // already wipes these unique paths at the START of the next run, so nothing
+        // leaks across runs; the parked thread sees no further events and dies with
+        // the process.
+    }
+
+    #[test]
     fn chapterless_file_becomes_a_single_episode() {
         if !ffmpeg_available() {
             eprintln!("skipping: ffmpeg not available");

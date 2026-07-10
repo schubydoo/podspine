@@ -644,6 +644,68 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_a_missing_or_non_dir_library() {
+        // Own subdir — must NOT share a fixed path with any sibling test, or the
+        // parallel runner races the remove_dir_all/create_dir_all below against
+        // `validate_accepts_a_real_dir_and_creates_data_dir` (uses `-validate`).
+        let tmp = std::env::temp_dir().join("podspine-cfg-validate-reject");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // --library points at a real FILE (not a directory) → LibraryNotDir.
+        let as_file = tmp.join("not-a-dir");
+        std::fs::write(&as_file, b"x").unwrap();
+        let c = Config::resolve(
+            &cli(Some(as_file.to_str().unwrap())),
+            &FileConfig::default(),
+        )
+        .unwrap();
+        assert!(matches!(c.validate(), Err(ConfigError::LibraryNotDir(_))));
+
+        // A missing --library → LibraryNotFound.
+        let missing = tmp.join("nope");
+        let c2 = Config::resolve(
+            &cli(Some(missing.to_str().unwrap())),
+            &FileConfig::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            c2.validate(),
+            Err(ConfigError::LibraryNotFound(_))
+        ));
+
+        // A valid dir library validates OK and creates the data dir (kept under
+        // tmp so the test never writes `./data` into the repo).
+        let mut cl = cli(Some(tmp.to_str().unwrap()));
+        cl.data_dir = Some(tmp.join("data"));
+        let ok = Config::resolve(&cl, &FileConfig::default()).unwrap();
+        assert!(ok.validate().is_ok());
+        assert!(ok.data_dir.is_dir(), "data dir created by validate");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn validate_reports_data_dir_when_the_path_is_unwritable() {
+        // library is a real dir (passes exists/is_dir), but data_dir sits UNDER a
+        // regular file, so create_dir_all fails -> ConfigError::DataDir.
+        let tmp = std::env::temp_dir().join("podspine-cfg-datadir");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let blocker = tmp.join("iam-a-file");
+        std::fs::write(&blocker, b"x").unwrap();
+        let mut cl = cli(Some(tmp.to_str().unwrap()));
+        cl.data_dir = Some(blocker.join("data")); // parent is a file -> create fails
+        let c = Config::resolve(&cl, &FileConfig::default()).unwrap();
+        assert!(
+            matches!(c.validate(), Err(ConfigError::DataDir { .. })),
+            "{:?}",
+            c.validate()
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn storage_knobs_resolve_from_cli_over_file() {
         let file = FileConfig {
             storage_mode: Some(StorageMode::Full),

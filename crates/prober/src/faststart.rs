@@ -164,6 +164,28 @@ mod tests {
     }
 
     #[test]
+    fn a_box_smaller_than_its_8_byte_header_is_malformed() {
+        // A size field below the 8-byte box header (here 4) is malformed → give up
+        // (return false), never loop or misread.
+        let p = write("tinybox", &[vec![0, 0, 0, 4, b'f', b't', b'y', b'p']]);
+        assert!(!needs_faststart(&p));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_box_size_overflowing_the_offset_terminates() {
+        // A valid `ftyp`, then a 64-bit largesize box whose size overflows
+        // `pos + size` → `checked_add` returns None → clean break (no panic/loop).
+        let mut bytes = mp4_box(b"ftyp", b"isom");
+        bytes.extend_from_slice(&1u32.to_be_bytes()); // size32 = 1 (largesize follows)
+        bytes.extend_from_slice(b"free");
+        bytes.extend_from_slice(&u64::MAX.to_be_bytes());
+        let p = write("overflow-add", &[bytes]);
+        assert!(!needs_faststart(&p));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
     fn a_crafted_64bit_largesize_box_does_not_overflow() {
         // First box: size32 == 1 (a 64-bit largesize follows the type), type
         // "free", largesize near u64::MAX. Advancing `pos` by it must not overflow
