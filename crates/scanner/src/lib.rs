@@ -205,7 +205,11 @@ pub fn scan_book_as(
         let metadata_consistent = existing.title == eff_title
             && existing.author == eff_author
             && existing.storage_mode == eff_storage_mode
-            && existing.default_cover_url == eff_cover;
+            && existing.default_cover_url == eff_cover
+            // `force_embedded_chapters` changes the chapter SOURCE (embedded vs a
+            // `.cue`/`.ffmeta` sidecar) without touching the fields above, so a
+            // toggle must also re-ingest (Greptile 6.4 P1).
+            && existing.force_embedded == force_embedded;
         // `force_reingest` (a troubleshooting knob) always skips the early return
         // so the book is re-processed on every scan while set.
         if !force_reingest
@@ -368,6 +372,7 @@ pub fn scan_book_as(
         // Persist the effective mode so serve/evict honor it without the sidecar.
         storage_mode: eff_storage_mode,
         default_cover_url: eff_cover,
+        force_embedded,
     };
     index.upsert_book(&book)?;
 
@@ -533,6 +538,8 @@ fn scan_mp3_folder(
         status: "ready".to_string(),
         storage_mode: String::new(),
         default_cover_url: eff_cover,
+        // No chapters in an MP3 folder, so force_embedded never applies.
+        force_embedded: false,
     };
     index.upsert_book(&book)?;
 
@@ -2051,6 +2058,38 @@ mod tests {
         assert_eq!(
             guid_before, guid_after,
             "guid stable across a metadata-only edit"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn toggling_only_force_embedded_reingests() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not available");
+            return;
+        }
+        let root = scratch("perbook-fe");
+        let input = synth(&root, false);
+        let data = root.join("data");
+        let index = Index::open_in_memory().unwrap();
+
+        scan_library(&root, &data, &index, false, false, false);
+        let id = index.list_books().unwrap().remove(0).id;
+        assert!(!index.get_book(&id).unwrap().unwrap().force_embedded);
+
+        // Change ONLY `force_embedded_chapters` (no title/storage/cover change): it
+        // alters the chapter source but not the other persisted fields, so the
+        // metadata guard must still re-ingest (Greptile P1).
+        let side = input
+            .canonicalize()
+            .unwrap()
+            .with_extension("podspine.toml");
+        std::fs::write(&side, b"force_embedded_chapters = true").unwrap();
+        scan_library(&root, &data, &index, false, false, false);
+        assert!(
+            index.get_book(&id).unwrap().unwrap().force_embedded,
+            "a force_embedded-only toggle re-ingested"
         );
 
         let _ = std::fs::remove_dir_all(&root);

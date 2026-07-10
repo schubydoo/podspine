@@ -561,9 +561,30 @@ mod tests {
     }
 
     #[test]
-    fn preflight_finds_ffmpeg() {
-        // CI and dev both have ffmpeg on PATH.
-        preflight().expect("ffmpeg/ffprobe present");
+    fn preflight_matches_ffmpeg_availability() {
+        // ffmpeg/ffprobe aren't on every runner (e.g. the informational Windows
+        // leg, or a bare dev box), so don't hard-require them — assert instead that
+        // preflight's result MATCHES whether they're actually invocable.
+        let have = ["ffmpeg", "ffprobe"].iter().all(|t| {
+            std::process::Command::new(t)
+                .arg("-version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        });
+        match preflight() {
+            Ok(()) => assert!(
+                have,
+                "preflight passed but ffmpeg/ffprobe are not both present"
+            ),
+            Err(ConfigError::ToolMissing(_)) => {
+                assert!(
+                    !have,
+                    "preflight reported a tool missing but both are present"
+                )
+            }
+            Err(e) => panic!("unexpected preflight error: {e:?}"),
+        }
     }
 
     #[test]
