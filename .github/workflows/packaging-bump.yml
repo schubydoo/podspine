@@ -105,19 +105,22 @@ jobs:
           tmp="$(mktemp -d)"
           # release.yml publishes the release before its 5-platform matrix finishes
           # uploading assets, so `release: published` can fire before checksums.txt
-          # exists. Wait for it (up to ~5 min) instead of racing to a hard failure.
-          for i in $(seq 1 20); do
-            # `|| asset_index=null` so a transient gh/API failure keeps waiting
-            # rather than yielding "" (which would pass the != "null" test and
-            # break early, right back into the race this loop exists to avoid).
-            asset_index="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
-                    --json assets --jq '[.assets[].name]|index("checksums.txt")')" \
-                    || asset_index="null"
-            if [ "$asset_index" != "null" ]; then
+          # exists. Wait for it (up to ~20 min) instead of racing to a hard failure.
+          #
+          # `any(...)` yields a literal `true`/`false` and never an empty string, so a
+          # "not present yet" result can't be misread as "present". The previous
+          # `index(...) != "null"` check broke on attempt 1 because `gh --jq` prints
+          # "" (not "null") for a JSON null, which passed the `!= "null"` test.
+          # `|| have=retry` additionally keeps waiting through a transient gh/API error.
+          for i in $(seq 1 40); do
+            have="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+                    --json assets --jq 'any(.assets[].name; . == "checksums.txt")')" \
+                    || have=retry
+            if [ "$have" = "true" ]; then
               break
             fi
-            echo "checksums.txt not on $TAG yet (attempt $i/20) — waiting 15s..."
-            sleep 15
+            echo "checksums.txt not on $TAG yet (attempt $i/40, state=$have) — waiting 30s..."
+            sleep 30
           done
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern checksums.txt --dir "$tmp"
           python3 scripts/bump_packaging.py "$VERSION" "$GITHUB_REPOSITORY" "$tmp/checksums.txt"
