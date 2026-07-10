@@ -13,7 +13,7 @@
   install them separately and keep them on PATH (this script warns if missing).
 
   Environment overrides:
-    PODSPINE_VERSION       pin a version (e.g. 1.1.0); default: latest release
+    PODSPINE_VERSION       pin a specific release tag (e.g. X.Y.Z); default: latest release
     PODSPINE_INSTALL_DIR   install directory; default: %LOCALAPPDATA%\Programs\podspine
 #>
 
