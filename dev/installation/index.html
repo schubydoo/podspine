@@ -928,7 +928,7 @@ release <code>checksums.txt</code>, and installs to <code>~/.local/bin</code>:</
 <tr>
 <td><code>PODSPINE_VERSION</code></td>
 <td>latest release</td>
-<td>Pin a version, e.g. <code>1.2.0</code></td>
+<td>Pin a specific release tag, e.g. <code>X.Y.Z</code></td>
 </tr>
 <tr>
 <td><code>PODSPINE_INSTALL_DIR</code></td>
@@ -937,9 +937,9 @@ release <code>checksums.txt</code>, and installs to <code>~/.local/bin</code>:</
 </tr>
 </tbody>
 </table>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="c1"># Pin a version and install system-wide:</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="c1"># Pin a specific version (replace X.Y.Z) and install system-wide:</span>
 <a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>curl<span class="w"> </span>-fsSL<span class="w"> </span>https://raw.githubusercontent.com/schubydoo/podspine/main/install.sh<span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="w">  </span><span class="p">|</span><span class="w"> </span><span class="nv">PODSPINE_VERSION</span><span class="o">=</span><span class="m">1</span>.2.0<span class="w"> </span><span class="nv">PODSPINE_INSTALL_DIR</span><span class="o">=</span>/usr/local/bin<span class="w"> </span>bash
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="w">  </span><span class="p">|</span><span class="w"> </span><span class="nv">PODSPINE_VERSION</span><span class="o">=</span>X.Y.Z<span class="w"> </span><span class="nv">PODSPINE_INSTALL_DIR</span><span class="o">=</span>/usr/local/bin<span class="w"> </span>bash
 </code></pre></div>
 <p><strong>Uninstall</strong> (removes the binary only — never your library or data dir):</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>curl<span class="w"> </span>-fsSL<span class="w"> </span>https://raw.githubusercontent.com/schubydoo/podspine/main/uninstall.sh<span class="w"> </span><span class="p">|</span><span class="w"> </span>bash
