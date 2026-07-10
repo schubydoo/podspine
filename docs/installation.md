@@ -41,13 +41,13 @@ Overrides (environment variables):
 
 | Var | Default | Purpose |
 |---|---|---|
-| `PODSPINE_VERSION` | latest release | Pin a version, e.g. `1.2.0` |
+| `PODSPINE_VERSION` | latest release | Pin a specific release tag, e.g. `X.Y.Z` |
 | `PODSPINE_INSTALL_DIR` | `~/.local/bin` | Install location (uses `sudo` only if it isn't writable) |
 
 ```bash
-# Pin a version and install system-wide:
+# Pin a specific version (replace X.Y.Z) and install system-wide:
 curl -fsSL https://raw.githubusercontent.com/schubydoo/podspine/main/install.sh \
-  | PODSPINE_VERSION=1.2.0 PODSPINE_INSTALL_DIR=/usr/local/bin bash
+  | PODSPINE_VERSION=X.Y.Z PODSPINE_INSTALL_DIR=/usr/local/bin bash
 ```
 
 **Uninstall** (removes the binary only — never your library or data dir):
