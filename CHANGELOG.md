@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.3.0 (2026-07-10)
+
+### Features
+
+- Detect non-faststart whole-file mp4 (`moov` after `mdat`) at ingest and log a one-line callout; add opt-in `PODSPINE_REMUX_NON_FASTSTART` to remux such books to faststart on demand — a cache-managed stream-copy (no re-encode) served from the `saver` cache and regenerated/evicted like a cached chapter, never a pinned duplicate — so podcast clients seek quickly. MP3/OGG/FLAC, already-faststart mp4, and chaptered books are unaffected. ([#61](https://github.com/schubydoo/podspine/pull/61))
+- Add per-book `.podspine.toml` overrides: a sidecar beside a single-file book (`Author - Title.podspine.toml`) or inside a folder book overrides settings for just that book — `storage_mode`, `force_embedded_chapters`, `remux_non_faststart`, `default_cover_url`, plus troubleshooting knobs `disabled`, `title`, `author`, and `force_reingest` — with precedence sidecar → CLI/env → global config → default. Server-wide keys placed in a per-book file are ignored with a warning. ([#62](https://github.com/schubydoo/podspine/pull/62))
+- Serve whole-file episodes — folder-of-MP3 tracks and chapterless single files — in place, streaming them directly from the read-only library instead of copying them under the data dir; this removes the silent duplication those books used to cost (an existing library reclaims the copies on its next re-scan). Chaptered books are unchanged (`full`/`saver`). ([#59](https://github.com/schubydoo/podspine/pull/59))
+- Add an opt-in `saver` storage mode (`PODSPINE_STORAGE_MODE=saver`) that keeps chapters in a bounded on-demand cache (`PODSPINE_CACHE_SIZE`/`PODSPINE_CACHE_TTL`) instead of keeping every chapter split on disk — cutting the data-dir footprint for chaptered books (whole-file books such as folder-of-MP3 tracks stream in place regardless of storage mode) for a small first-play delay per chapter. Ingest still splits each chapter once to record its real byte length, so `saver` saves disk, not ingest time. ([#53](https://github.com/schubydoo/podspine/pull/53))
+
 ## 1.2.0 (2026-07-07)
 
 ### Features
