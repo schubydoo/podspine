@@ -49,7 +49,10 @@ CREATE TABLE IF NOT EXISTS book (
     cover_path   TEXT,
     source_path  TEXT NOT NULL,
     source_mtime INTEGER NOT NULL,
-    status       TEXT NOT NULL
+    status       TEXT NOT NULL,
+    storage_mode TEXT NOT NULL DEFAULT '',
+    default_cover_url TEXT,
+    force_embedded INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS episode (
     guid          TEXT PRIMARY KEY,
@@ -89,6 +92,18 @@ pub struct BookRow {
     pub source_mtime: i64,
     /// Processing status (e.g. `ready`).
     pub status: String,
+    /// Effective per-book storage mode as a string (`"full"`/`"saver"`), or `""`
+    /// to follow the global config (a pre-6.4 row, until re-scanned). Persisted so
+    /// the serve/evict layers honor a per-book `.podspine.toml` override without
+    /// the sidecar (Sprint 6.4).
+    pub storage_mode: String,
+    /// Per-book feed cover fallback (a `.podspine.toml` override), tried before
+    /// the server-wide `default_cover_url`.
+    pub default_cover_url: Option<String>,
+    /// Effective `force_embedded_chapters` at last ingest (a `.podspine.toml`
+    /// override). Persisted only so a scan can detect a toggle and re-ingest;
+    /// not read at serve time.
+    pub force_embedded: bool,
 }
 
 /// One episode (a split chapter). Numeric fields are stored as SQLite integers.
@@ -211,6 +226,42 @@ impl Index {
                 [],
             )?;
         }
+        // `book.storage_mode` + `book.default_cover_url` (per-book overrides,
+        // Sprint 6.4). Existing rows default to `''`/NULL, meaning "follow the
+        // global config"; a re-scan records the effective per-book value.
+        let has_book_storage_mode: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('book') WHERE name = 'storage_mode'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_book_storage_mode == 0 {
+            conn.execute(
+                "ALTER TABLE book ADD COLUMN storage_mode TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        let has_book_cover_url: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('book') WHERE name = 'default_cover_url'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_book_cover_url == 0 {
+            conn.execute("ALTER TABLE book ADD COLUMN default_cover_url TEXT", [])?;
+        }
+        // `book.force_embedded` (per-book overrides, 6.4). Recorded so a scan can
+        // detect a `.podspine.toml` `force_embedded_chapters` toggle (which changes
+        // the chapter source without changing the audio mtime) and re-ingest.
+        let has_force_embedded: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('book') WHERE name = 'force_embedded'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_force_embedded == 0 {
+            conn.execute(
+                "ALTER TABLE book ADD COLUMN force_embedded INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -223,12 +274,14 @@ impl Index {
     pub fn upsert_book(&self, b: &BookRow) -> Result<(), IndexError> {
         self.conn.execute(
             "INSERT INTO book
-               (id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+               (id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status, storage_mode, default_cover_url, force_embedded)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(id) DO UPDATE SET
                slug=excluded.slug, title=excluded.title, author=excluded.author,
                cover_path=excluded.cover_path, source_path=excluded.source_path,
-               source_mtime=excluded.source_mtime, status=excluded.status",
+               source_mtime=excluded.source_mtime, status=excluded.status,
+               storage_mode=excluded.storage_mode, default_cover_url=excluded.default_cover_url,
+               force_embedded=excluded.force_embedded",
             params![
                 b.id,
                 b.slug,
@@ -239,6 +292,9 @@ impl Index {
                 b.source_path,
                 b.source_mtime,
                 b.status,
+                b.storage_mode,
+                b.default_cover_url,
+                b.force_embedded,
             ],
         )?;
         Ok(())
@@ -278,7 +334,7 @@ impl Index {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status
+                "SELECT id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status, storage_mode, default_cover_url, force_embedded
                  FROM book WHERE id = ?1",
                 [id],
                 book_from_row,
@@ -291,7 +347,7 @@ impl Index {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status
+                "SELECT id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status, storage_mode, default_cover_url, force_embedded
                  FROM book WHERE slug = ?1",
                 [slug],
                 book_from_row,
@@ -302,7 +358,7 @@ impl Index {
     /// All books, ordered by title.
     pub fn list_books(&self) -> Result<Vec<BookRow>, IndexError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status
+            "SELECT id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status, storage_mode, default_cover_url, force_embedded
              FROM book ORDER BY title",
         )?;
         let rows = stmt.query_map([], book_from_row)?;
@@ -326,7 +382,7 @@ impl Index {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status
+                "SELECT id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status, storage_mode, default_cover_url, force_embedded
                  FROM book WHERE feed_id = ?1",
                 [feed_id],
                 book_from_row,
@@ -379,6 +435,9 @@ fn book_from_row(row: &Row) -> rusqlite::Result<BookRow> {
         source_path: row.get(6)?,
         source_mtime: row.get(7)?,
         status: row.get(8)?,
+        storage_mode: row.get(9)?,
+        default_cover_url: row.get(10)?,
+        force_embedded: row.get(11)?,
     })
 }
 
@@ -413,6 +472,9 @@ mod tests {
             source_path: format!("/library/{id}.m4b"),
             source_mtime: 1_700_000_000,
             status: "ready".to_string(),
+            storage_mode: String::new(),
+            default_cover_url: None,
+            force_embedded: false,
         }
     }
 

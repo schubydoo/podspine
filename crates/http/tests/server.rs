@@ -11,7 +11,7 @@ use tower::ServiceExt;
 
 use podspine_http::{AppState, router};
 use podspine_index::Index;
-use podspine_scanner::{scan_book, scan_book_as};
+use podspine_scanner::{BookOverrides, scan_book, scan_book_as, scan_library};
 
 fn ffmpeg_available() -> bool {
     Command::new("ffmpeg")
@@ -162,7 +162,17 @@ async fn saver_mode_regenerates_a_chapter_on_demand() {
     let index = Index::open_in_memory().unwrap();
     let input = synth_three_chapters(&dir);
     // Ingest in `saver` mode: sizes recorded, split files deleted.
-    let book = scan_book_as(&input, "saverbook", &data, &index, false, true, false).unwrap();
+    let book = scan_book_as(
+        &input,
+        "saverbook",
+        &data,
+        &index,
+        false,
+        true,
+        false,
+        &BookOverrides::default(),
+    )
+    .unwrap();
     let feed_id = book.feed_id.clone();
 
     let eps = index.episodes_for_book(&book.id).unwrap();
@@ -237,7 +247,17 @@ async fn saver_cache_evicts_over_the_size_cap() {
 
     let index = Index::open_in_memory().unwrap();
     let input = synth_three_chapters(&dir);
-    let book = scan_book_as(&input, "evictbook", &data, &index, false, true, false).unwrap();
+    let book = scan_book_as(
+        &input,
+        "evictbook",
+        &data,
+        &index,
+        false,
+        true,
+        false,
+        &BookOverrides::default(),
+    )
+    .unwrap();
     let feed_id = book.feed_id.clone();
     let book_out = data.join("books").join(&book.id);
 
@@ -571,7 +591,17 @@ async fn serves_a_remuxed_faststart_copy_on_demand() {
     let index = Index::open_in_memory().unwrap();
     // A non-faststart m4a (moov at end) under the library. Ingest with remux ON.
     let input = synth_flat(&library);
-    let book = scan_book_as(&input, "remuxbook", &data, &index, false, false, true).unwrap();
+    let book = scan_book_as(
+        &input,
+        "remuxbook",
+        &data,
+        &index,
+        false,
+        false,
+        true,
+        &BookOverrides::default(),
+    )
+    .unwrap();
     let feed_id = book.feed_id.clone();
 
     // Recorded as a faststart cache episode: file_path (cache) != source_path, and
@@ -642,6 +672,69 @@ async fn serves_a_remuxed_faststart_copy_on_demand() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
     assert_eq!(body_bytes(resp).await.len(), 10, "range served 10 bytes");
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[tokio::test]
+async fn per_book_saver_serves_even_when_server_is_full() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+    let base = std::env::temp_dir().join("podspine-http-perbook-saver");
+    let _ = std::fs::remove_dir_all(&base);
+    let library = base.join("library");
+    let data = base.join("data");
+    std::fs::create_dir_all(&library).unwrap();
+    let input = synth_three_chapters(&library);
+    // Per-book override: `saver`, even though the server below runs `full`.
+    let side = input
+        .canonicalize()
+        .unwrap()
+        .with_extension("podspine.toml");
+    std::fs::write(&side, b"storage_mode = \"saver\"").unwrap();
+
+    let index = Index::open_in_memory().unwrap();
+    // Global full (saver = false); the sidecar forces this one book to saver.
+    scan_library(&library, &data, &index, false, false, false);
+    let books = index.list_books().unwrap();
+    assert_eq!(books.len(), 1);
+    assert_eq!(books[0].storage_mode, "saver", "per-book saver persisted");
+    let feed_id = books[0].feed_id.clone();
+    let eps = index.episodes_for_book(&books[0].id).unwrap();
+    assert!(
+        !std::path::Path::new(&eps[0].file_path).exists(),
+        "saver ingest deleted the split"
+    );
+
+    // The server is FULL, but the per-book saver mode must still regenerate the
+    // chapter on demand rather than 404.
+    let state = AppState::new(
+        index,
+        "http://test".to_string(),
+        &data,
+        &library,
+        None,
+        false,
+        None,
+        None,
+    );
+    let app = router(state);
+    let resp = app
+        .oneshot(
+            Request::get(format!("/audio/{feed_id}/1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "per-book saver regenerated despite the global full mode"
+    );
+    assert_eq!(body_bytes(resp).await.len() as i64, eps[0].byte_length);
 
     let _ = std::fs::remove_dir_all(&base);
 }
