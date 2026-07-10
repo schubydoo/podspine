@@ -149,6 +149,14 @@ pub fn scan_book_as(
     };
     let force_reingest = overrides.force_reingest == Some(true);
 
+    // Effective per-book metadata (override → default). Computed up here so the
+    // idempotency check can spot a `.podspine.toml` edit (which doesn't change the
+    // audio mtime) and re-ingest, and so the BookRow build below reuses it.
+    let eff_title = overrides.title.clone().unwrap_or_else(|| file_stem(input));
+    let eff_author = overrides.author.clone();
+    let eff_storage_mode = if saver { "saver" } else { "full" }.to_string();
+    let eff_cover = overrides.default_cover_url.clone();
+
     let id = id.to_string();
     let source_mtime = mtime_epoch(input)?;
     let book_out = data_dir.join("books").join(&id);
@@ -189,9 +197,19 @@ pub fn scan_book_as(
                 || (!e.source_path.is_empty() && e.file_path != e.source_path);
             regenerable || Path::new(&e.file_path).exists()
         });
-        // `force_reingest` (a `.podspine.toml` troubleshooting knob) always skips
-        // the early return so the book is re-processed on every scan while set.
+        // A `.podspine.toml` edit doesn't change the audio mtime, so also re-ingest
+        // when the persisted metadata no longer matches the current overrides
+        // (Greptile 6.4 P1) — otherwise a changed title/author/storage_mode/cover
+        // would stay stale in the index. `source_mtime` is unchanged, so episode
+        // guids stay stable (no spurious client re-downloads).
+        let metadata_consistent = existing.title == eff_title
+            && existing.author == eff_author
+            && existing.storage_mode == eff_storage_mode
+            && existing.default_cover_url == eff_cover;
+        // `force_reingest` (a troubleshooting knob) always skips the early return
+        // so the book is re-processed on every scan while set.
         if !force_reingest
+            && metadata_consistent
             && !eps.is_empty()
             && start_secs_recorded
             && faststart_consistent
@@ -339,16 +357,17 @@ pub fn scan_book_as(
         id: id.clone(),
         slug: id.clone(),
         feed_id: podspine_index::capability::generate(),
-        // Per-book overrides (Sprint 6.4): title/author from the sidecar if set.
-        title: overrides.title.clone().unwrap_or_else(|| file_stem(input)),
-        author: overrides.author.clone(),
+        // Per-book overrides (Sprint 6.4), computed above and re-checked by the
+        // idempotency guard so a sidecar edit re-persists them.
+        title: eff_title,
+        author: eff_author,
         cover_path,
         source_path: input.to_string_lossy().into_owned(),
         source_mtime,
         status: "ready".to_string(),
         // Persist the effective mode so serve/evict honor it without the sidecar.
-        storage_mode: if saver { "saver" } else { "full" }.to_string(),
-        default_cover_url: overrides.default_cover_url.clone(),
+        storage_mode: eff_storage_mode,
+        default_cover_url: eff_cover,
     };
     index.upsert_book(&book)?;
 
@@ -448,13 +467,24 @@ fn scan_mp3_folder(
         .unwrap_or(0);
     let book_out = data_dir.join("books").join(id);
 
+    // Effective per-book metadata (override → default). `storage_mode`/`remux`/
+    // `force_embedded` are no-ops for MP3 folders, so only title/author/cover
+    // apply. Computed here to detect a `.podspine.toml` edit and reused below.
+    let eff_title = overrides.title.clone().unwrap_or_else(|| dir_name(dir));
+    let eff_author = overrides.author.clone();
+    let eff_cover = overrides.default_cover_url.clone();
+
     // Idempotency: unchanged and already served in place -> no re-probe.
     // The `source_path` guard forces a one-time re-ingest of a pre-6.2 book
     // (tracks copied under <data_dir>, empty `source_path`) so it flips to
-    // in-place serving and its copies get reclaimed.
+    // in-place serving and its copies get reclaimed. The metadata checks re-ingest
+    // on a `.podspine.toml` edit that didn't change the folder mtime (Greptile P1).
     if overrides.force_reingest != Some(true)
         && let Some(existing) = index.get_book(id)?
         && existing.source_mtime == source_mtime
+        && existing.title == eff_title
+        && existing.author == eff_author
+        && existing.default_cover_url == eff_cover
     {
         let eps = index.episodes_for_book(id)?;
         if !eps.is_empty()
@@ -491,17 +521,18 @@ fn scan_mp3_folder(
         id: id.to_string(),
         slug: id.to_string(),
         feed_id: podspine_index::capability::generate(),
-        // Per-book overrides (Sprint 6.4). storage_mode/remux/force_embedded are
-        // no-ops for MP3 folders (tracks are always served in place), so only
-        // title/author/cover apply; persist storage_mode as `""` (follow global).
-        title: overrides.title.clone().unwrap_or_else(|| dir_name(dir)),
-        author: overrides.author.clone(),
+        // Per-book overrides (Sprint 6.4), computed above and re-checked by the
+        // idempotency guard so a sidecar edit re-persists them. storage_mode/remux/
+        // force_embedded are no-ops for MP3 folders (tracks are served in place),
+        // so persist storage_mode as `""` (follow global).
+        title: eff_title,
+        author: eff_author,
         cover_path: None,
         source_path: dir.to_string_lossy().into_owned(),
         source_mtime,
         status: "ready".to_string(),
         storage_mode: String::new(),
-        default_cover_url: overrides.default_cover_url.clone(),
+        default_cover_url: eff_cover,
     };
     index.upsert_book(&book)?;
 
@@ -1982,6 +2013,46 @@ mod tests {
             books[0].storage_mode, "saver",
             "per-book storage_mode is persisted for serve/evict"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn editing_sidecar_reingests_without_touching_audio() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not available");
+            return;
+        }
+        let root = scratch("perbook-edit");
+        let input = synth(&root, false);
+        let data = root.join("data");
+        let index = Index::open_in_memory().unwrap();
+
+        // First scan: no sidecar → default title, `full`.
+        scan_library(&root, &data, &index, false, false, false);
+        let before = index.list_books().unwrap().remove(0);
+        assert_eq!(before.storage_mode, "full");
+        let guid_before = index.episodes_for_book(&before.id).unwrap()[0].guid.clone();
+
+        // Edit the sidecar — the AUDIO file is untouched (same mtime). The edit
+        // must still take effect on the next scan (Greptile 6.4 P1).
+        let side = input
+            .canonicalize()
+            .unwrap()
+            .with_extension("podspine.toml");
+        std::fs::write(&side, b"title = \"Edited\"\nstorage_mode = \"saver\"\n").unwrap();
+        scan_library(&root, &data, &index, false, false, false);
+
+        let after = index.get_book(&before.id).unwrap().unwrap();
+        assert_eq!(after.title, "Edited", "sidecar title applied on re-scan");
+        assert_eq!(after.storage_mode, "saver", "sidecar storage_mode applied");
+        // source_mtime is unchanged, so the episode guid is stable — a metadata
+        // edit doesn't make podcast clients re-download.
+        let guid_after = index.episodes_for_book(&before.id).unwrap()[0].guid.clone();
+        assert_eq!(
+            guid_before, guid_after,
+            "guid stable across a metadata-only edit"
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
