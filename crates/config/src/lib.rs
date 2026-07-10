@@ -645,7 +645,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_a_missing_or_non_dir_library() {
-        let tmp = std::env::temp_dir().join("podspine-cfg-validate");
+        // Own subdir — must NOT share a fixed path with any sibling test, or the
+        // parallel runner races the remove_dir_all/create_dir_all below against
+        // `validate_accepts_a_real_dir_and_creates_data_dir` (uses `-validate`).
+        let tmp = std::env::temp_dir().join("podspine-cfg-validate-reject");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
 
@@ -679,6 +682,26 @@ mod tests {
         assert!(ok.validate().is_ok());
         assert!(ok.data_dir.is_dir(), "data dir created by validate");
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn validate_reports_data_dir_when_the_path_is_unwritable() {
+        // library is a real dir (passes exists/is_dir), but data_dir sits UNDER a
+        // regular file, so create_dir_all fails -> ConfigError::DataDir.
+        let tmp = std::env::temp_dir().join("podspine-cfg-datadir");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let blocker = tmp.join("iam-a-file");
+        std::fs::write(&blocker, b"x").unwrap();
+        let mut cl = cli(Some(tmp.to_str().unwrap()));
+        cl.data_dir = Some(blocker.join("data")); // parent is a file -> create fails
+        let c = Config::resolve(&cl, &FileConfig::default()).unwrap();
+        assert!(
+            matches!(c.validate(), Err(ConfigError::DataDir { .. })),
+            "{:?}",
+            c.validate()
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

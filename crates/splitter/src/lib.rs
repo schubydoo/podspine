@@ -896,4 +896,39 @@ mod tests {
         assert!(matches!(err, CoverError::Ffmpeg { .. }), "{err:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn extract_cover_reports_create_dir_when_out_dir_is_a_file() {
+        // out_dir is an existing regular file -> create_dir_all fails BEFORE any
+        // ffmpeg spawn -> CoverError::CreateDir. ffmpeg-free, so it runs everywhere.
+        let dir = std::env::temp_dir().join("podspine-cover-createdir");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_as_dir = dir.join("iam-a-file");
+        std::fs::write(&file_as_dir, b"x").unwrap();
+        let err = extract_cover(Path::new("irrelevant.m4b"), &file_as_dir, "jpg")
+            .expect_err("out_dir being a file must fail");
+        assert!(matches!(err, CoverError::CreateDir { .. }), "{err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn split_book_reports_create_dir_when_out_dir_is_a_file() {
+        // Same guard on the chaptered path: out_dir is a file -> SplitError::CreateDir
+        // before any chapter is cut (ffmpeg-free).
+        let dir = std::env::temp_dir().join("podspine-split-createdir");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_as_dir = dir.join("iam-a-file");
+        std::fs::write(&file_as_dir, b"x").unwrap();
+        let ch = ChapterCut {
+            idx: 0,
+            start_sec: 0.0,
+            end_sec: 10.0,
+        };
+        let err = split_book(Path::new("irrelevant.m4b"), &file_as_dir, &[ch], "m4a")
+            .expect_err("out_dir being a file must fail");
+        assert!(matches!(err, SplitError::CreateDir { .. }), "{err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

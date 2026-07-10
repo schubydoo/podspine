@@ -2262,8 +2262,13 @@ mod tests {
         }
         assert!(indexed, "the watcher indexed the book added after startup");
 
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&data);
+        // Deliberately do NOT tear down `root`/`data` here. `spawn_library_watcher`
+        // is a detached, process-lifetime daemon with no shutdown hook (by design),
+        // so deleting its watched dir + WAL db out from under the live thread would
+        // make it churn on removed paths and could race later tests. `scratch()`
+        // already wipes these unique paths at the START of the next run, so nothing
+        // leaks across runs; the parked thread sees no further events and dies with
+        // the process.
     }
 
     #[test]
