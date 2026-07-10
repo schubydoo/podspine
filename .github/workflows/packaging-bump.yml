@@ -37,7 +37,9 @@ jobs:
     # ref can't run this write-capable job. (release events use the default branch anyway.)
     if: ${{ github.event_name == 'release' || github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Must exceed the checksums.txt wait budget below (~20 min) plus the download +
+    # bump + PR work, or Actions kills the job mid-wait for a slow release build.
+    timeout-minutes: 25
     permissions:
       contents: read
       pull-requests: read
