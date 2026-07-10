@@ -450,6 +450,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#per-book-overrides-podspinetoml" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Per-book overrides (.podspine.toml)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#exposing-podspine-safely" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -817,6 +828,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#per-book-overrides-podspinetoml" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Per-book overrides (.podspine.toml)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#exposing-podspine-safely" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1096,6 +1118,66 @@ chaptered episode is already written moov-first).</p>
 chapter, <strong>not</strong> a pinned second copy. The default is <strong>off</strong> because in-place
 serving costs no disk; enable it if slow seeking on those books bothers you and
 you can spare the cache. (A faststart mp4, or any non-mp4, is left untouched.)</p>
+<h2 id="per-book-overrides-podspinetoml">Per-book overrides (<code>.podspine.toml</code>)<a class="headerlink" href="#per-book-overrides-podspinetoml" title="Permanent link">&para;</a></h2>
+<p>Any of the per-book-meaningful settings above can be overridden for <strong>one book</strong>
+with a small <code>.podspine.toml</code> sidecar — handy for troubleshooting a single
+misbehaving book without changing the whole server. Precedence: <strong>sidecar → CLI /
+env → global config file → default.</strong></p>
+<p><strong>Where to put it</strong> (works for every library layout):</p>
+<ul>
+<li><strong>A single file</strong> — name it after the file: <code>Author - Title.podspine.toml</code>
+  beside <code>Author - Title.m4b</code> (same as a <code>.cue</code> sidecar). Works whether the file
+  is at the top level or in its own folder.</li>
+<li><strong>A multi-file (MP3-folder) book, or a lone file kept in its own folder</strong> — drop
+  a <code>.podspine.toml</code> <strong>inside that folder</strong>.</li>
+</ul>
+<p><strong>Keys you can set:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>storage_mode</code></td>
+<td><code>"full"</code>/<code>"saver"</code> for just this book (serve + eviction honor it).</td>
+</tr>
+<tr>
+<td><code>force_embedded_chapters</code></td>
+<td>Ignore this book's <code>.cue</code>/<code>.ffmeta</code> sidecar.</td>
+</tr>
+<tr>
+<td><code>remux_non_faststart</code></td>
+<td>Remux this book to faststart if it's a non-faststart mp4.</td>
+</tr>
+<tr>
+<td><code>default_cover_url</code></td>
+<td>Feed cover fallback for this book.</td>
+</tr>
+<tr>
+<td><code>title</code> / <code>author</code></td>
+<td>Override the feed title/author (fix metadata without renaming files).</td>
+</tr>
+<tr>
+<td><code>disabled</code></td>
+<td><code>true</code> removes this book from the index and every feed/page.</td>
+</tr>
+<tr>
+<td><code>force_reingest</code></td>
+<td><code>true</code> re-processes the book on every scan (drop it once you're done).</td>
+</tr>
+</tbody>
+</table>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="c1"># Author - Title.podspine.toml — force this one big book onto saver, fix its title</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="n">storage_mode</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;saver&quot;</span>
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="n">title</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;The Correct Title&quot;</span>
+</code></pre></div>
+<p>Server-wide keys (<code>bind</code>, <code>base_url</code>, <code>library</code>, <code>data_dir</code>, <code>cache_size</code>,
+<code>cache_ttl</code>, …) are <strong>ignored with a log warning</strong> if they appear in a per-book
+file — they only make sense server-wide. An unparseable sidecar is logged and
+skipped for that book; it never aborts the scan.</p>
 <h2 id="exposing-podspine-safely">Exposing Podspine safely<a class="headerlink" href="#exposing-podspine-safely" title="Permanent link">&para;</a></h2>
 <p>Podspine has two kinds of routes, and they want different exposure:</p>
 <table>
@@ -1130,12 +1212,12 @@ externally. If a link leaks, hit <strong>Regenerate</strong> on the book page �
 <h2 id="docker">Docker<a class="headerlink" href="#docker" title="Permanent link">&para;</a></h2>
 <p>The image bundles <code>ffmpeg</code>, runs as a non-root user (uid 10001), and defaults to
 <code>PODSPINE_LIBRARY=/library</code> and <code>PODSPINE_DATA_DIR=/data</code>.</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>docker<span class="w"> </span>run<span class="w"> </span>-d<span class="w"> </span>--name<span class="w"> </span>podspine<span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w">  </span>-v<span class="w"> </span>/path/to/audiobooks:/library:ro<span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="w">  </span>-v<span class="w"> </span>podspine-data:/data<span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="w">  </span>-p<span class="w"> </span><span class="m">8080</span>:8080<span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="w">  </span>-e<span class="w"> </span><span class="nv">PODSPINE_BASE_URL</span><span class="o">=</span>http://&lt;your-lan-ip&gt;:8080<span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="w">  </span>ghcr.io/schubydoo/podspine:latest
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>docker<span class="w"> </span>run<span class="w"> </span>-d<span class="w"> </span>--name<span class="w"> </span>podspine<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">  </span>-v<span class="w"> </span>/path/to/audiobooks:/library:ro<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="w">  </span>-v<span class="w"> </span>podspine-data:/data<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="w">  </span>-p<span class="w"> </span><span class="m">8080</span>:8080<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="w">  </span>-e<span class="w"> </span><span class="nv">PODSPINE_BASE_URL</span><span class="o">=</span>http://&lt;your-lan-ip&gt;:8080<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="w">  </span>ghcr.io/schubydoo/podspine:latest
 </code></pre></div>
 <ul>
 <li>Mount the library <strong>read-only</strong> (<code>:ro</code>) — Podspine only reads it. This is also a
@@ -1146,25 +1228,25 @@ externally. If a link leaks, hit <strong>Regenerate</strong> on the book page �
   any extracted chapter files, and should persist across restarts and upgrades.</li>
 </ul>
 <h3 id="docker-compose">docker-compose<a class="headerlink" href="#docker-compose" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="nt">services</span><span class="p">:</span>
-<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">  </span><span class="nt">podspine</span><span class="p">:</span>
-<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="w">    </span><span class="nt">image</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ghcr.io/schubydoo/podspine:latest</span>
-<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="w">    </span><span class="nt">restart</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">unless-stopped</span>
-<a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="w">    </span><span class="nt">ports</span><span class="p">:</span>
-<a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="s">&quot;8080:8080&quot;</span>
-<a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="w">    </span><span class="nt">environment</span><span class="p">:</span>
-<a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="w">      </span><span class="nt">PODSPINE_BASE_URL</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">http://your-lan-ip:8080</span>
-<a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="w">    </span><span class="nt">volumes</span><span class="p">:</span>
-<a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a><span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/path/to/audiobooks:/library:ro</span>
-<a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a><span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">podspine-data:/data</span>
-<a id="__codelineno-1-12" name="__codelineno-1-12" href="#__codelineno-1-12"></a><span class="w">    </span><span class="nt">healthcheck</span><span class="p">:</span>
-<a id="__codelineno-1-13" name="__codelineno-1-13" href="#__codelineno-1-13"></a><span class="w">      </span><span class="nt">test</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;CMD&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;wget&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;-qO-&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;http://127.0.0.1:8080/healthz&quot;</span><span class="p p-Indicator">]</span>
-<a id="__codelineno-1-14" name="__codelineno-1-14" href="#__codelineno-1-14"></a><span class="w">      </span><span class="nt">interval</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">30s</span>
-<a id="__codelineno-1-15" name="__codelineno-1-15" href="#__codelineno-1-15"></a><span class="w">      </span><span class="nt">timeout</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">5s</span>
-<a id="__codelineno-1-16" name="__codelineno-1-16" href="#__codelineno-1-16"></a><span class="w">      </span><span class="nt">retries</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">3</span>
-<a id="__codelineno-1-17" name="__codelineno-1-17" href="#__codelineno-1-17"></a>
-<a id="__codelineno-1-18" name="__codelineno-1-18" href="#__codelineno-1-18"></a><span class="nt">volumes</span><span class="p">:</span>
-<a id="__codelineno-1-19" name="__codelineno-1-19" href="#__codelineno-1-19"></a><span class="w">  </span><span class="nt">podspine-data</span><span class="p">:</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="nt">services</span><span class="p">:</span>
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="w">  </span><span class="nt">podspine</span><span class="p">:</span>
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="w">    </span><span class="nt">image</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ghcr.io/schubydoo/podspine:latest</span>
+<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="w">    </span><span class="nt">restart</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">unless-stopped</span>
+<a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="w">    </span><span class="nt">ports</span><span class="p">:</span>
+<a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="s">&quot;8080:8080&quot;</span>
+<a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a><span class="w">    </span><span class="nt">environment</span><span class="p">:</span>
+<a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a><span class="w">      </span><span class="nt">PODSPINE_BASE_URL</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">http://your-lan-ip:8080</span>
+<a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a><span class="w">    </span><span class="nt">volumes</span><span class="p">:</span>
+<a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a><span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/path/to/audiobooks:/library:ro</span>
+<a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a><span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">podspine-data:/data</span>
+<a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a><span class="w">    </span><span class="nt">healthcheck</span><span class="p">:</span>
+<a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a><span class="w">      </span><span class="nt">test</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;CMD&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;wget&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;-qO-&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;http://127.0.0.1:8080/healthz&quot;</span><span class="p p-Indicator">]</span>
+<a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a><span class="w">      </span><span class="nt">interval</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">30s</span>
+<a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a><span class="w">      </span><span class="nt">timeout</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">5s</span>
+<a id="__codelineno-2-16" name="__codelineno-2-16" href="#__codelineno-2-16"></a><span class="w">      </span><span class="nt">retries</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">3</span>
+<a id="__codelineno-2-17" name="__codelineno-2-17" href="#__codelineno-2-17"></a>
+<a id="__codelineno-2-18" name="__codelineno-2-18" href="#__codelineno-2-18"></a><span class="nt">volumes</span><span class="p">:</span>
+<a id="__codelineno-2-19" name="__codelineno-2-19" href="#__codelineno-2-19"></a><span class="w">  </span><span class="nt">podspine-data</span><span class="p">:</span>
 </code></pre></div>
 <h2 id="prebuilt-binary-systemd">Prebuilt binary + systemd<a class="headerlink" href="#prebuilt-binary-systemd" title="Permanent link">&para;</a></h2>
 <p>Download the static musl binary for your architecture from the
@@ -1173,27 +1255,27 @@ externally. If a link leaks, hit <strong>Regenerate</strong> on the book page �
 <code>cosign verify-blob --bundle checksums.txt.sigstore.json checksums.txt</code> then
 <code>sha256sum -c checksums.txt</code> (see <a href="https://github.com/schubydoo/podspine/blob/main/SECURITY.md#release-artifacts">SECURITY.md</a>).
 Example unit:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="c1"># /etc/systemd/system/podspine.service</span>
-<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="k">[Unit]</span>
-<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="na">Description</span><span class="o">=</span><span class="s">Podspine</span>
-<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="na">After</span><span class="o">=</span><span class="s">network-online.target</span>
-<a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="na">Wants</span><span class="o">=</span><span class="s">network-online.target</span>
-<a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a>
-<a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a><span class="k">[Service]</span>
-<a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a><span class="na">ExecStart</span><span class="o">=</span><span class="s">/usr/local/bin/podspine</span>
-<a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a><span class="na">Environment</span><span class="o">=</span><span class="s">PODSPINE_LIBRARY=/srv/audiobooks</span>
-<a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a><span class="na">Environment</span><span class="o">=</span><span class="s">PODSPINE_DATA_DIR=/var/lib/podspine</span>
-<a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a><span class="na">Environment</span><span class="o">=</span><span class="s">PODSPINE_BIND=127.0.0.1:8080</span>
-<a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a><span class="na">Environment</span><span class="o">=</span><span class="s">PODSPINE_BASE_URL=https://podspine.example.com</span>
-<a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a><span class="na">DynamicUser</span><span class="o">=</span><span class="s">yes</span>
-<a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a><span class="na">StateDirectory</span><span class="o">=</span><span class="s">podspine</span>
-<a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a><span class="na">ReadOnlyPaths</span><span class="o">=</span><span class="s">/srv/audiobooks</span>
-<a id="__codelineno-2-16" name="__codelineno-2-16" href="#__codelineno-2-16"></a><span class="na">Restart</span><span class="o">=</span><span class="s">on-failure</span>
-<a id="__codelineno-2-17" name="__codelineno-2-17" href="#__codelineno-2-17"></a>
-<a id="__codelineno-2-18" name="__codelineno-2-18" href="#__codelineno-2-18"></a><span class="k">[Install]</span>
-<a id="__codelineno-2-19" name="__codelineno-2-19" href="#__codelineno-2-19"></a><span class="na">WantedBy</span><span class="o">=</span><span class="s">multi-user.target</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="c1"># /etc/systemd/system/podspine.service</span>
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="k">[Unit]</span>
+<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="na">Description</span><span class="o">=</span><span class="s">Podspine</span>
+<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="na">After</span><span class="o">=</span><span class="s">network-online.target</span>
+<a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="na">Wants</span><span class="o">=</span><span class="s">network-online.target</span>
+<a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a>
+<a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="k">[Service]</span>
+<a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a><span class="na">ExecStart</span><span class="o">=</span><span class="s">/usr/local/bin/podspine</span>
+<a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a><span class="na">Environment</span><span class="o">=</span><span class="s">PODSPINE_LIBRARY=/srv/audiobooks</span>
+<a id="__codelineno-3-10" name="__codelineno-3-10" href="#__codelineno-3-10"></a><span class="na">Environment</span><span class="o">=</span><span class="s">PODSPINE_DATA_DIR=/var/lib/podspine</span>
+<a id="__codelineno-3-11" name="__codelineno-3-11" href="#__codelineno-3-11"></a><span class="na">Environment</span><span class="o">=</span><span class="s">PODSPINE_BIND=127.0.0.1:8080</span>
+<a id="__codelineno-3-12" name="__codelineno-3-12" href="#__codelineno-3-12"></a><span class="na">Environment</span><span class="o">=</span><span class="s">PODSPINE_BASE_URL=https://podspine.example.com</span>
+<a id="__codelineno-3-13" name="__codelineno-3-13" href="#__codelineno-3-13"></a><span class="na">DynamicUser</span><span class="o">=</span><span class="s">yes</span>
+<a id="__codelineno-3-14" name="__codelineno-3-14" href="#__codelineno-3-14"></a><span class="na">StateDirectory</span><span class="o">=</span><span class="s">podspine</span>
+<a id="__codelineno-3-15" name="__codelineno-3-15" href="#__codelineno-3-15"></a><span class="na">ReadOnlyPaths</span><span class="o">=</span><span class="s">/srv/audiobooks</span>
+<a id="__codelineno-3-16" name="__codelineno-3-16" href="#__codelineno-3-16"></a><span class="na">Restart</span><span class="o">=</span><span class="s">on-failure</span>
+<a id="__codelineno-3-17" name="__codelineno-3-17" href="#__codelineno-3-17"></a>
+<a id="__codelineno-3-18" name="__codelineno-3-18" href="#__codelineno-3-18"></a><span class="k">[Install]</span>
+<a id="__codelineno-3-19" name="__codelineno-3-19" href="#__codelineno-3-19"></a><span class="na">WantedBy</span><span class="o">=</span><span class="s">multi-user.target</span>
 </code></pre></div>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>sudo<span class="w"> </span>systemctl<span class="w"> </span>daemon-reload<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>sudo<span class="w"> </span>systemctl<span class="w"> </span><span class="nb">enable</span><span class="w"> </span>--now<span class="w"> </span>podspine
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>sudo<span class="w"> </span>systemctl<span class="w"> </span>daemon-reload<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>sudo<span class="w"> </span>systemctl<span class="w"> </span><span class="nb">enable</span><span class="w"> </span>--now<span class="w"> </span>podspine
 </code></pre></div>
 <h2 id="macos-windows-binaries">macOS &amp; Windows binaries<a class="headerlink" href="#macos-windows-binaries" title="Permanent link">&para;</a></h2>
 <p>The releases page also carries macOS (Intel + Apple Silicon) and Windows (x64)
@@ -1229,35 +1311,35 @@ hostname instead? Drop the <code>@ui</code>/<code>location /</code> blocks and p
 on the whole server — just never require auth on <code>/feed</code>,<code>/audio</code>,<code>/cover</code>, since
 podcast apps can't log in.)</p>
 <p><strong>Caddy</strong> (Range passes through automatically):</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>podspine.example.com {
-<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>    # Public: the capability surface only (unguessable per-book URLs).
-<a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>    @capability path /feed/* /audio/* /cover/* /healthz
-<a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a>    handle @capability {
-<a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a>        reverse_proxy 127.0.0.1:8080
-<a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a>    }
-<a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a>    # Browse UI + regenerate enumerate the library — not reachable from the public host.
-<a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a>    handle {
-<a id="__codelineno-4-9" name="__codelineno-4-9" href="#__codelineno-4-9"></a>        respond 404
-<a id="__codelineno-4-10" name="__codelineno-4-10" href="#__codelineno-4-10"></a>    }
-<a id="__codelineno-4-11" name="__codelineno-4-11" href="#__codelineno-4-11"></a>}
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>podspine.example.com {
+<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>    # Public: the capability surface only (unguessable per-book URLs).
+<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>    @capability path /feed/* /audio/* /cover/* /healthz
+<a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a>    handle @capability {
+<a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a>        reverse_proxy 127.0.0.1:8080
+<a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a>    }
+<a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a>    # Browse UI + regenerate enumerate the library — not reachable from the public host.
+<a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a>    handle {
+<a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a>        respond 404
+<a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a>    }
+<a id="__codelineno-5-11" name="__codelineno-5-11" href="#__codelineno-5-11"></a>}
 </code></pre></div>
 <p><strong>nginx:</strong></p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="k">server</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="w">    </span><span class="kn">server_name</span><span class="w"> </span><span class="s">podspine.example.com</span><span class="p">;</span>
-<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>
-<a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="w">    </span><span class="c1"># Public capability surface: feeds, cover, and audio (with Range).</span>
-<a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="w">    </span><span class="kn">location</span><span class="w"> </span><span class="p">~</span><span class="w"> </span><span class="sr">^/(feed|audio|cover)/</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a><span class="w">        </span><span class="kn">proxy_pass</span><span class="w"> </span><span class="s">http://127.0.0.1:8080</span><span class="p">;</span>
-<a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a><span class="w">        </span><span class="kn">proxy_set_header</span><span class="w"> </span><span class="s">Host</span><span class="w"> </span><span class="nv">$host</span><span class="p">;</span>
-<a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a><span class="w">        </span><span class="kn">proxy_set_header</span><span class="w"> </span><span class="s">Range</span><span class="w"> </span><span class="nv">$http_range</span><span class="p">;</span><span class="w">               </span><span class="c1"># forward seek requests</span>
-<a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a><span class="w">        </span><span class="kn">proxy_set_header</span><span class="w"> </span><span class="s">If-Range</span><span class="w"> </span><span class="nv">$http_if_range</span><span class="p">;</span>
-<a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a><span class="w">        </span><span class="kn">proxy_buffering</span><span class="w"> </span><span class="no">off</span><span class="p">;</span><span class="w">                              </span><span class="c1"># stream large audio</span>
-<a id="__codelineno-5-11" name="__codelineno-5-11" href="#__codelineno-5-11"></a><span class="w">    </span><span class="p">}</span>
-<a id="__codelineno-5-12" name="__codelineno-5-12" href="#__codelineno-5-12"></a><span class="w">    </span><span class="kn">location</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s">/healthz</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="kn">proxy_pass</span><span class="w"> </span><span class="s">http://127.0.0.1:8080</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
-<a id="__codelineno-5-13" name="__codelineno-5-13" href="#__codelineno-5-13"></a>
-<a id="__codelineno-5-14" name="__codelineno-5-14" href="#__codelineno-5-14"></a><span class="w">    </span><span class="c1"># Browse UI + management enumerate the library — not exposed here (use the LAN).</span>
-<a id="__codelineno-5-15" name="__codelineno-5-15" href="#__codelineno-5-15"></a><span class="w">    </span><span class="kn">location</span><span class="w"> </span><span class="s">/</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="kn">return</span><span class="w"> </span><span class="mi">404</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
-<a id="__codelineno-5-16" name="__codelineno-5-16" href="#__codelineno-5-16"></a><span class="p">}</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="k">server</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="w">    </span><span class="kn">server_name</span><span class="w"> </span><span class="s">podspine.example.com</span><span class="p">;</span>
+<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>
+<a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="w">    </span><span class="c1"># Public capability surface: feeds, cover, and audio (with Range).</span>
+<a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="w">    </span><span class="kn">location</span><span class="w"> </span><span class="p">~</span><span class="w"> </span><span class="sr">^/(feed|audio|cover)/</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a><span class="w">        </span><span class="kn">proxy_pass</span><span class="w"> </span><span class="s">http://127.0.0.1:8080</span><span class="p">;</span>
+<a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a><span class="w">        </span><span class="kn">proxy_set_header</span><span class="w"> </span><span class="s">Host</span><span class="w"> </span><span class="nv">$host</span><span class="p">;</span>
+<a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a><span class="w">        </span><span class="kn">proxy_set_header</span><span class="w"> </span><span class="s">Range</span><span class="w"> </span><span class="nv">$http_range</span><span class="p">;</span><span class="w">               </span><span class="c1"># forward seek requests</span>
+<a id="__codelineno-6-9" name="__codelineno-6-9" href="#__codelineno-6-9"></a><span class="w">        </span><span class="kn">proxy_set_header</span><span class="w"> </span><span class="s">If-Range</span><span class="w"> </span><span class="nv">$http_if_range</span><span class="p">;</span>
+<a id="__codelineno-6-10" name="__codelineno-6-10" href="#__codelineno-6-10"></a><span class="w">        </span><span class="kn">proxy_buffering</span><span class="w"> </span><span class="no">off</span><span class="p">;</span><span class="w">                              </span><span class="c1"># stream large audio</span>
+<a id="__codelineno-6-11" name="__codelineno-6-11" href="#__codelineno-6-11"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-6-12" name="__codelineno-6-12" href="#__codelineno-6-12"></a><span class="w">    </span><span class="kn">location</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s">/healthz</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="kn">proxy_pass</span><span class="w"> </span><span class="s">http://127.0.0.1:8080</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<a id="__codelineno-6-13" name="__codelineno-6-13" href="#__codelineno-6-13"></a>
+<a id="__codelineno-6-14" name="__codelineno-6-14" href="#__codelineno-6-14"></a><span class="w">    </span><span class="c1"># Browse UI + management enumerate the library — not exposed here (use the LAN).</span>
+<a id="__codelineno-6-15" name="__codelineno-6-15" href="#__codelineno-6-15"></a><span class="w">    </span><span class="kn">location</span><span class="w"> </span><span class="s">/</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="kn">return</span><span class="w"> </span><span class="mi">404</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<a id="__codelineno-6-16" name="__codelineno-6-16" href="#__codelineno-6-16"></a><span class="p">}</span>
 </code></pre></div>
 <h2 id="health-checks">Health checks<a class="headerlink" href="#health-checks" title="Permanent link">&para;</a></h2>
 <p><code>GET /healthz</code> returns <code>200 ok</code>. Use it for container/orchestrator liveness (see the
