@@ -74,7 +74,7 @@ jobs:
       # The runtime-only Dockerfile COPYs a prebuilt dist/<arch>/podspine, so build
       # the amd64 static musl binary first. Single-arch on an amd64 runner, so plain
       # musl-gcc (links rusqlite's bundled SQLite C) is enough — no cross toolchain.
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: x86_64-unknown-linux-musl
       - name: Install musl toolchain
@@ -112,7 +112,7 @@ jobs:
           exit-code: "0"
       - name: Upload SARIF
         if: always()
-        uses: github/codeql-action/upload-sarif@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4
+        uses: github/codeql-action/upload-sarif@7188fc363630916deb702c7fdcf4e481b751f97a # v4
         with:
           sarif_file: trivy-image.sarif
           category: trivy-image
@@ -154,7 +154,7 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
       - name: Upload SARIF
-        uses: github/codeql-action/upload-sarif@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4
+        uses: github/codeql-action/upload-sarif@7188fc363630916deb702c7fdcf4e481b751f97a # v4
         with:
           sarif_file: results.sarif
           category: zizmor
