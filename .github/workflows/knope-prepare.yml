@@ -33,7 +33,7 @@ jobs:
       # routine push with no fragment is a clean no-op that never touches the
       # podspine-ci App. Only a release-driving push mints the token below — this
       # decouples ordinary merges (docs/CI/no-changelog) from the App entirely.
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -68,7 +68,7 @@ jobs:
       # Re-checkout with the App token persisted so knope's `git push` of the
       # release branch + the PR it opens run as the App identity. Full history +
       # tags so knope can find the last release tag.
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: ${{ steps.changesets.outputs.has == 'true' }}
         with:
           fetch-depth: 0
