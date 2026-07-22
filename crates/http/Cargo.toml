@@ -27,5 +27,5 @@ podspine-scanner = { path = "../scanner" }
 podspine-index = { path = "../index" }
 axum = { workspace = true }
 tokio = { workspace = true }
-tower = { version = "0.5", features = ["util"] }
-http-body-util = "0.1"
+tower = { version = "=0.5.3", features = ["util"] }
+http-body-util = "=0.1.4"

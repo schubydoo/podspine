@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1@sha256:87999aa3d42bdc6bea60565083ee17e86d1f3339802f543c0d03998580f9cb89
 #
 # Runtime-only image: it COPYs a prebuilt static (musl) binary — no Rust toolchain
 # in the build, so `docker buildx` stays fast across linux/amd64 + linux/arm64
