@@ -35,7 +35,7 @@ jobs:
       contents: read
       actions: read
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       # podspine-ci App token as Scorecard's repo_token: the Branch-Protection check
@@ -62,7 +62,7 @@ jobs:
           publish_results: true
           repo_token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
       - name: Upload SARIF
-        uses: github/codeql-action/upload-sarif@7188fc363630916deb702c7fdcf4e481b751f97a # v4
+        uses: github/codeql-action/upload-sarif@e0647621c2984b5ed2f768cb892365bf2a616ad1 # v4.37.2
         with:
           sarif_file: results.sarif
           category: scorecard
