@@ -19,6 +19,11 @@
 /CLAUDE.md
 /.claude/
 
+# Local MCP server config and Serena project state (machine-specific)
+/.mcp.json
+/.mcp.json.lock
+/.serena/
+
 # Release build output (per-arch binaries for the Docker image)
 /dist/
 
