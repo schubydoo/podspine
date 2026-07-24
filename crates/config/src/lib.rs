@@ -6,7 +6,7 @@
 //! unparseable bind address, absent ffmpeg/ffprobe) surface as a clear fatal
 //! error at startup — never mid-request. See TAD §4.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -391,15 +391,32 @@ fn load_file(path: Option<&Path>) -> Result<FileConfig, ConfigError> {
 
 /// Whether two listeners would fight over the same port.
 ///
-/// Equality isn't enough: a wildcard bind claims every interface, so
-/// `0.0.0.0:8080` and `127.0.0.1:8080` collide even though the addresses differ
-/// — and the second listener would fail with a bare "address already in use"
-/// instead of the diagnostic this check exists to produce. Treat a shared port
-/// as a collision whenever the addresses match or either side is a wildcard.
+/// Equality isn't enough on two counts:
+///
+/// - A wildcard bind claims every interface, so `0.0.0.0:8080` and
+///   `127.0.0.1:8080` collide even though the addresses differ.
+/// - Rust compares `IpAddr` by variant, so the IPv4-mapped form of an address
+///   (`[::ffff:127.0.0.1]` vs `127.0.0.1`) reads as different despite being the
+///   same socket to the kernel.
+///
+/// Either miss produces the bare "address already in use" that this check
+/// exists to replace, so normalize mapped addresses first, then treat a shared
+/// port as a collision when the addresses match or either side is a wildcard.
 /// Deliberately conservative: refusing an exotic-but-legal pair costs the
 /// operator one flag change, while missing one costs them a confusing crash.
 fn binds_collide(a: SocketAddr, b: SocketAddr) -> bool {
-    a.port() == b.port() && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())
+    let (ip_a, ip_b) = (canonical_ip(a.ip()), canonical_ip(b.ip()));
+    a.port() == b.port() && (ip_a == ip_b || ip_a.is_unspecified() || ip_b.is_unspecified())
+}
+
+/// Fold an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) down to its IPv4 form so
+/// the two spellings of one address compare equal. Everything else is returned
+/// unchanged.
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        IpAddr::V4(_) => ip,
+    }
 }
 
 /// Verify `ffmpeg` and `ffprobe` are on PATH by execing `-version`. Fails fast so
@@ -710,6 +727,48 @@ mod tests {
         assert!(binds_collide(v6_wildcard, loopback));
         assert!(!binds_collide(loopback, other_port));
         assert!(!binds_collide(wildcard, other_port));
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_is_the_same_address_as_its_ipv4_form() {
+        // `IpAddr` compares by variant, so these read as different addresses in
+        // Rust while the kernel binds them to one socket.
+        let loopback: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let mapped: SocketAddr = "[::ffff:127.0.0.1]:8080".parse().unwrap();
+        assert!(binds_collide(mapped, loopback));
+        assert!(binds_collide(loopback, mapped));
+
+        // The mapped wildcard is still a wildcard once folded.
+        let mapped_wildcard: SocketAddr = "[::ffff:0.0.0.0]:8080".parse().unwrap();
+        assert!(binds_collide(mapped_wildcard, loopback));
+
+        // Folding must not make unrelated addresses collide.
+        let elsewhere: SocketAddr = "[::ffff:192.0.2.1]:8080".parse().unwrap();
+        assert!(!binds_collide(elsewhere, loopback));
+        // ...nor override the port check.
+        let mapped_other_port: SocketAddr = "[::ffff:127.0.0.1]:9090".parse().unwrap();
+        assert!(!binds_collide(mapped_other_port, loopback));
+    }
+
+    #[test]
+    fn a_real_ipv6_address_is_left_alone() {
+        // Only the `::ffff:` mapped range folds; genuine IPv6 stays distinct.
+        let v6: SocketAddr = "[2001:db8::1]:8080".parse().unwrap();
+        let v4: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        assert!(!binds_collide(v6, v4));
+        assert!(binds_collide(v6, v6));
+    }
+
+    #[test]
+    fn mapped_metrics_bind_is_rejected_end_to_end() {
+        assert!(matches!(
+            validate_binds(
+                "podspine-cfg-collide-mapped",
+                "127.0.0.1:8080",
+                "[::ffff:127.0.0.1]:8080"
+            ),
+            Err(ConfigError::MetricsBindConflict { .. })
+        ));
     }
 
     #[test]
