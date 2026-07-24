@@ -44,6 +44,12 @@ serde_json = "1"
 # observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Metrics facade; a no-op unless a recorder is installed (`--metrics-bind`).
+metrics = "0.24.6"
+# `default-features = false` drops the crate's own hyper listener and the
+# rustls/aws-lc-rs push-gateway stack: we render from the handle and serve it
+# on our own axum listener, so none of that is reachable.
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 # errors
 thiserror = "2"
 anyhow = "1"
@@ -95,6 +101,8 @@ podspine-config = { path = "crates/config" }
 podspine-index = { path = "crates/index" }
 podspine-scanner = { path = "crates/scanner" }
 podspine-http = { path = "crates/http" }
+podspine-metrics = { path = "crates/metrics" }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

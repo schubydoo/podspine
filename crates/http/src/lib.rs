@@ -214,6 +214,9 @@ async fn feed(
         return Err(AppError::NotFound);
     }
     let xml = build_feed_xml(&state, feed_id)?;
+    // Counted after the self-check passes, so the metric means "a subscriber got
+    // a usable feed", not "a request arrived".
+    podspine_metrics::feed_served();
     Ok((
         StatusCode::OK,
         [
@@ -889,6 +892,13 @@ impl AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        // Counting here rather than at each `return Err(..)` catches every error
+        // path exactly once, including the ones added later.
+        podspine_metrics::error(match self {
+            AppError::NotFound => podspine_metrics::ErrorKind::NotFound,
+            AppError::Forbidden => podspine_metrics::ErrorKind::Forbidden,
+            AppError::Internal => podspine_metrics::ErrorKind::Internal,
+        });
         match self {
             AppError::NotFound => StatusCode::NOT_FOUND.into_response(),
             AppError::Forbidden => StatusCode::FORBIDDEN.into_response(),

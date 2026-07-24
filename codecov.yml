@@ -113,6 +113,10 @@ component_management:
       paths:
         - crates/config/src/lib.rs
         - crates/config/src/book_overrides.rs
+    - component_id: metrics
+      name: metrics (Prometheus)
+      paths:
+        - crates/metrics/src/lib.rs
     - component_id: server_cli
       name: server & cli
       paths:

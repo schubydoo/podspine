@@ -27,6 +27,7 @@ that precedence. The library path is the only required input.
 | `--cache-size` | `PODSPINE_CACHE_SIZE` | `2GB` | `saver` only: cache cap (`2GB`, `500MB`; `0`/`off` = unbounded). |
 | `--cache-ttl` | `PODSPINE_CACHE_TTL` | off | `saver` only: evict chapters unplayed this long (`30d`, `12h`; `off` = size-only). |
 | `--remux-non-faststart` | `PODSPINE_REMUX_NON_FASTSTART` | off | Remux a non-faststart whole-file mp4 to faststart on demand (cache-managed). See below. |
+| `--metrics-bind` | `PODSPINE_METRICS_BIND` | off | Serve Prometheus metrics on this *separate* address (`127.0.0.1:9090`). See below. |
 | `--config` | `PODSPINE_CONFIG` | none | Path to a TOML config file. |
 
 > **`PODSPINE_BASE_URL` is the one that bites people.** Feed and enclosure (audio)
@@ -309,6 +310,43 @@ server {
 
 `GET /healthz` returns `200 ok`. Use it for container/orchestrator liveness (see the
 compose example above) or an uptime monitor.
+
+## Metrics (Prometheus)
+
+Off by default. Give it an address and Podspine serves `GET /metrics` in the
+Prometheus text format:
+
+```bash
+podspine --library /library --metrics-bind 127.0.0.1:9090
+# → http://127.0.0.1:9090/metrics
+```
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `podspine_books_indexed` | gauge | Books currently in the index (re-read after each reconcile, so prunes show up too). |
+| `podspine_feeds_served_total` | counter | Feeds rendered *and* passed the self-check before being sent. |
+| `podspine_split_duration_seconds` | histogram | Wall-clock per chapter split, successful splits only. |
+| `podspine_errors_total{kind}` | counter | Request failures; `kind` is `not_found`, `forbidden`, or `internal`. |
+
+**This is deliberately a second listener, not a route on `--bind`.** Feed URLs are
+unguessable capability URLs and safe to expose; metrics are operator data — how big
+your library is, how often things fail — and don't belong on an internet-facing
+surface. Bind it to loopback (and let Prometheus scrape over the host network) or to
+a LAN-only interface. Podspine refuses to start if `--metrics-bind` matches `--bind`.
+
+In Docker, publish the port explicitly (`-p 127.0.0.1:9090:9090`) and bind inside the
+container to `0.0.0.0:9090`. A minimal scrape config:
+
+```yaml
+scrape_configs:
+  - job_name: podspine
+    static_configs:
+      - targets: ["127.0.0.1:9090"]
+```
+
+Nothing about listeners, titles, or paths is labelled — the only label in the whole
+set is `kind` on the error counter, so series count stays flat no matter how large
+the library or how much traffic it takes.
 
 ## Data, backups, and updating
 

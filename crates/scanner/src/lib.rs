@@ -828,6 +828,13 @@ pub fn reconcile(
         tracing::warn!(error = %err, "orphan prune failed");
         0
     });
+    // Set from the index rather than accumulated from this run's adds, so a
+    // prune (or a book that failed to ingest) is reflected just as accurately.
+    // Reconcile is startup + debounced-watch only, so the extra read is cheap.
+    match index.list_books() {
+        Ok(books) => podspine_metrics::set_books_indexed(books.len() as u64),
+        Err(err) => tracing::warn!(error = %err, "could not count books for metrics"),
+    }
     summary
 }
 

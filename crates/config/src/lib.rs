@@ -85,6 +85,13 @@ pub struct Cli {
     /// size-only eviction). Ignored in `full` mode.
     #[arg(long, env = "PODSPINE_CACHE_TTL")]
     pub cache_ttl: Option<String>,
+    /// Serve Prometheus metrics on this address, e.g. `127.0.0.1:9090`. Unset =
+    /// no metrics endpoint and no recorder (the instrumentation compiles to
+    /// no-ops). Deliberately a *separate* listener from `--bind`: metrics expose
+    /// operator data — library size, error counts — that has no business on the
+    /// same surface as internet-facing feeds. Bind it to loopback or the LAN.
+    #[arg(long, env = "PODSPINE_METRICS_BIND")]
+    pub metrics_bind: Option<String>,
     /// Optional TOML config file.
     #[arg(long, env = "PODSPINE_CONFIG")]
     pub config: Option<PathBuf>,
@@ -114,6 +121,8 @@ pub struct FileConfig {
     pub cache_size: Option<String>,
     /// On-demand cache TTL (e.g. `30d`; `off` = size-only eviction).
     pub cache_ttl: Option<String>,
+    /// Address for the separate Prometheus metrics listener (unset = disabled).
+    pub metrics_bind: Option<String>,
 }
 
 /// Fully resolved, validated configuration.
@@ -149,6 +158,10 @@ pub struct Config {
     pub cache_size_bytes: Option<u64>,
     /// TTL for cached chapters in `saver` mode (`None` = size-only eviction).
     pub cache_ttl: Option<Duration>,
+    /// Address for the Prometheus metrics listener (`None` = metrics disabled,
+    /// no recorder installed). Always a second listener, never `bind` — see the
+    /// `Cli::metrics_bind` note on why this surface is kept separate.
+    pub metrics_bind: Option<SocketAddr>,
 }
 
 /// Configuration failures — all fatal, all reported at startup.
@@ -171,6 +184,20 @@ pub enum ConfigError {
         /// Parse error.
         source: std::net::AddrParseError,
     },
+    /// The metrics bind address could not be parsed.
+    #[error("invalid metrics bind address {value:?}: {source}")]
+    BadMetricsBind {
+        /// The offending value.
+        value: String,
+        /// Parse error.
+        source: std::net::AddrParseError,
+    },
+    /// The metrics listener was pointed at the same address as the feed server.
+    #[error(
+        "metrics bind address {0} is the same as the feed server's; \
+         give metrics its own address (e.g. 127.0.0.1:9090)"
+    )]
+    MetricsBindConflict(SocketAddr),
     /// The data directory could not be created.
     #[error("could not create data dir {path}: {source}")]
     DataDir {
@@ -288,6 +315,18 @@ impl Config {
             None => None,
         };
 
+        let metrics_bind = match cli
+            .metrics_bind
+            .clone()
+            .or_else(|| file.metrics_bind.clone())
+        {
+            Some(s) => Some(
+                s.parse()
+                    .map_err(|source| ConfigError::BadMetricsBind { value: s, source })?,
+            ),
+            None => None,
+        };
+
         Ok(Self {
             library,
             data_dir,
@@ -299,6 +338,7 @@ impl Config {
             storage_mode,
             cache_size_bytes,
             cache_ttl,
+            metrics_bind,
         })
     }
 
@@ -309,6 +349,11 @@ impl Config {
         }
         if !self.library.is_dir() {
             return Err(ConfigError::LibraryNotDir(self.library.clone()));
+        }
+        // Catch the metrics/feed surface collision here rather than as an opaque
+        // "address in use" from the second listener half a second into startup.
+        if self.metrics_bind == Some(self.bind) {
+            return Err(ConfigError::MetricsBindConflict(self.bind));
         }
         std::fs::create_dir_all(&self.data_dir).map_err(|source| ConfigError::DataDir {
             path: self.data_dir.clone(),
@@ -514,6 +559,65 @@ mod tests {
     }
 
     #[test]
+    fn metrics_are_off_unless_a_bind_is_given() {
+        let c = Config::resolve(&cli(Some("/books")), &FileConfig::default()).unwrap();
+        assert_eq!(c.metrics_bind, None);
+    }
+
+    #[test]
+    fn metrics_bind_is_parsed_and_cli_beats_toml() {
+        let mut c = cli(Some("/books"));
+        c.metrics_bind = Some("127.0.0.1:9090".to_string());
+        let file = FileConfig {
+            metrics_bind: Some("0.0.0.0:9999".to_string()),
+            ..FileConfig::default()
+        };
+        let resolved = Config::resolve(&c, &file).unwrap();
+        assert_eq!(
+            resolved.metrics_bind,
+            Some("127.0.0.1:9090".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn metrics_bind_falls_back_to_toml() {
+        let file = FileConfig {
+            metrics_bind: Some("127.0.0.1:9090".to_string()),
+            ..FileConfig::default()
+        };
+        let resolved = Config::resolve(&cli(Some("/books")), &file).unwrap();
+        assert_eq!(
+            resolved.metrics_bind,
+            Some("127.0.0.1:9090".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn bad_metrics_bind_address_is_rejected() {
+        let mut c = cli(Some("/books"));
+        c.metrics_bind = Some("nope".to_string());
+        assert!(matches!(
+            Config::resolve(&c, &FileConfig::default()),
+            Err(ConfigError::BadMetricsBind { .. })
+        ));
+    }
+
+    #[test]
+    fn metrics_bind_may_not_collide_with_the_feed_server() {
+        let tmp = std::env::temp_dir().join("podspine-cfg-metrics-collide");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut c = cli(Some(tmp.to_str().unwrap()));
+        c.bind = Some("127.0.0.1:8080".to_string());
+        c.metrics_bind = Some("127.0.0.1:8080".to_string());
+        let resolved = Config::resolve(&c, &FileConfig::default()).unwrap();
+        assert!(matches!(
+            resolved.validate(),
+            Err(ConfigError::MetricsBindConflict(_))
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn toml_parses_a_partial_config() {
         let file: FileConfig = toml::from_str("bind = \"0.0.0.0:3000\"\n").unwrap();
         assert_eq!(file.bind.as_deref(), Some("0.0.0.0:3000"));
@@ -533,6 +637,7 @@ mod tests {
             storage_mode: StorageMode::Full,
             cache_size_bytes: Some(DEFAULT_CACHE_SIZE_BYTES),
             cache_ttl: None,
+            metrics_bind: None,
         };
         assert!(matches!(c.validate(), Err(ConfigError::LibraryNotFound(_))));
     }
@@ -554,6 +659,7 @@ mod tests {
             storage_mode: StorageMode::Full,
             cache_size_bytes: Some(DEFAULT_CACHE_SIZE_BYTES),
             cache_ttl: None,
+            metrics_bind: None,
         };
         c.validate().unwrap();
         assert!(data.is_dir(), "data dir created");
