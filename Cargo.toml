@@ -31,7 +31,7 @@ maud = "0.27"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 # tokens (v1.5)
 getrandom = "0.4"
-base64 = "0.22"
+base64 = "0.23"
 blake3 = "1.5"
 # scanning / watching
 notify = "8"
