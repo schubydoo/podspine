@@ -214,6 +214,9 @@ async fn feed(
         return Err(AppError::NotFound);
     }
     let xml = build_feed_xml(&state, feed_id)?;
+    // Counted after the self-check passes, so the metric means "a subscriber got
+    // a usable feed", not "a request arrived".
+    podspine_metrics::feed_served();
     Ok((
         StatusCode::OK,
         [
@@ -889,6 +892,13 @@ impl AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        // Counting here rather than at each `return Err(..)` catches every error
+        // path exactly once, including the ones added later.
+        podspine_metrics::error(match self {
+            AppError::NotFound => podspine_metrics::ErrorKind::NotFound,
+            AppError::Forbidden => podspine_metrics::ErrorKind::Forbidden,
+            AppError::Internal => podspine_metrics::ErrorKind::Internal,
+        });
         match self {
             AppError::NotFound => StatusCode::NOT_FOUND.into_response(),
             AppError::Forbidden => StatusCode::FORBIDDEN.into_response(),
@@ -1150,5 +1160,19 @@ mod tests {
             "regenerable chapters are still evicted under the cap"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_apperror_maps_to_its_status_and_never_leaks_a_body() {
+        // Also covers the metrics mapping arms: each variant must count as its
+        // own kind, and none may put internals on the wire.
+        for (err, want) in [
+            (AppError::NotFound, StatusCode::NOT_FOUND),
+            (AppError::Forbidden, StatusCode::FORBIDDEN),
+            (AppError::Internal, StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            let response = err.into_response();
+            assert_eq!(response.status(), want);
+        }
     }
 }

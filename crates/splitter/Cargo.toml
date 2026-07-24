@@ -10,6 +10,7 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+podspine-metrics = { path = "../metrics" }
 thiserror = { workspace = true }
 wait-timeout = { workspace = true }
 

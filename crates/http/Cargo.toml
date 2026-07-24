@@ -20,6 +20,7 @@ podspine-index = { path = "../index" }
 podspine-feed = { path = "../feed" }
 podspine-splitter = { path = "../splitter" }
 podspine-ui = { path = "../ui" }
+podspine-metrics = { path = "../metrics" }
 tracing = { workspace = true }
 
 [dev-dependencies]

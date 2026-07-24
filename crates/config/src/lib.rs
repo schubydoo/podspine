@@ -6,7 +6,7 @@
 //! unparseable bind address, absent ffmpeg/ffprobe) surface as a clear fatal
 //! error at startup — never mid-request. See TAD §4.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -85,6 +85,13 @@ pub struct Cli {
     /// size-only eviction). Ignored in `full` mode.
     #[arg(long, env = "PODSPINE_CACHE_TTL")]
     pub cache_ttl: Option<String>,
+    /// Serve Prometheus metrics on this address, e.g. `127.0.0.1:9090`. Unset =
+    /// no metrics endpoint and no recorder (the instrumentation compiles to
+    /// no-ops). Deliberately a *separate* listener from `--bind`: metrics expose
+    /// operator data — library size, error counts — that has no business on the
+    /// same surface as internet-facing feeds. Bind it to loopback or the LAN.
+    #[arg(long, env = "PODSPINE_METRICS_BIND")]
+    pub metrics_bind: Option<String>,
     /// Optional TOML config file.
     #[arg(long, env = "PODSPINE_CONFIG")]
     pub config: Option<PathBuf>,
@@ -114,6 +121,8 @@ pub struct FileConfig {
     pub cache_size: Option<String>,
     /// On-demand cache TTL (e.g. `30d`; `off` = size-only eviction).
     pub cache_ttl: Option<String>,
+    /// Address for the separate Prometheus metrics listener (unset = disabled).
+    pub metrics_bind: Option<String>,
 }
 
 /// Fully resolved, validated configuration.
@@ -149,6 +158,10 @@ pub struct Config {
     pub cache_size_bytes: Option<u64>,
     /// TTL for cached chapters in `saver` mode (`None` = size-only eviction).
     pub cache_ttl: Option<Duration>,
+    /// Address for the Prometheus metrics listener (`None` = metrics disabled,
+    /// no recorder installed). Always a second listener, never `bind` — see the
+    /// `Cli::metrics_bind` note on why this surface is kept separate.
+    pub metrics_bind: Option<SocketAddr>,
 }
 
 /// Configuration failures — all fatal, all reported at startup.
@@ -170,6 +183,25 @@ pub enum ConfigError {
         value: String,
         /// Parse error.
         source: std::net::AddrParseError,
+    },
+    /// The metrics bind address could not be parsed.
+    #[error("invalid metrics bind address {value:?}: {source}")]
+    BadMetricsBind {
+        /// The offending value.
+        value: String,
+        /// Parse error.
+        source: std::net::AddrParseError,
+    },
+    /// The metrics listener would contend with the feed server for a port.
+    #[error(
+        "metrics bind address {metrics} collides with the feed server's {bind}; \
+         give metrics its own port (e.g. 127.0.0.1:9090)"
+    )]
+    MetricsBindConflict {
+        /// The requested metrics address.
+        metrics: SocketAddr,
+        /// The feed server's address.
+        bind: SocketAddr,
     },
     /// The data directory could not be created.
     #[error("could not create data dir {path}: {source}")]
@@ -288,6 +320,18 @@ impl Config {
             None => None,
         };
 
+        let metrics_bind = match cli
+            .metrics_bind
+            .clone()
+            .or_else(|| file.metrics_bind.clone())
+        {
+            Some(s) => Some(
+                s.parse()
+                    .map_err(|source| ConfigError::BadMetricsBind { value: s, source })?,
+            ),
+            None => None,
+        };
+
         Ok(Self {
             library,
             data_dir,
@@ -299,6 +343,7 @@ impl Config {
             storage_mode,
             cache_size_bytes,
             cache_ttl,
+            metrics_bind,
         })
     }
 
@@ -309,6 +354,16 @@ impl Config {
         }
         if !self.library.is_dir() {
             return Err(ConfigError::LibraryNotDir(self.library.clone()));
+        }
+        // Catch the metrics/feed surface collision here rather than as an opaque
+        // "address in use" from the second listener half a second into startup.
+        if let Some(metrics) = self.metrics_bind
+            && binds_collide(metrics, self.bind)
+        {
+            return Err(ConfigError::MetricsBindConflict {
+                metrics,
+                bind: self.bind,
+            });
         }
         std::fs::create_dir_all(&self.data_dir).map_err(|source| ConfigError::DataDir {
             path: self.data_dir.clone(),
@@ -332,6 +387,36 @@ fn load_file(path: Option<&Path>) -> Result<FileConfig, ConfigError> {
         path: path.to_path_buf(),
         source: Box::new(source),
     })
+}
+
+/// Whether two listeners would fight over the same port.
+///
+/// Equality isn't enough on two counts:
+///
+/// - A wildcard bind claims every interface, so `0.0.0.0:8080` and
+///   `127.0.0.1:8080` collide even though the addresses differ.
+/// - Rust compares `IpAddr` by variant, so the IPv4-mapped form of an address
+///   (`[::ffff:127.0.0.1]` vs `127.0.0.1`) reads as different despite being the
+///   same socket to the kernel.
+///
+/// Either miss produces the bare "address already in use" that this check
+/// exists to replace, so normalize mapped addresses first, then treat a shared
+/// port as a collision when the addresses match or either side is a wildcard.
+/// Deliberately conservative: refusing an exotic-but-legal pair costs the
+/// operator one flag change, while missing one costs them a confusing crash.
+fn binds_collide(a: SocketAddr, b: SocketAddr) -> bool {
+    let (ip_a, ip_b) = (canonical_ip(a.ip()), canonical_ip(b.ip()));
+    a.port() == b.port() && (ip_a == ip_b || ip_a.is_unspecified() || ip_b.is_unspecified())
+}
+
+/// Fold an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) down to its IPv4 form so
+/// the two spellings of one address compare equal. Everything else is returned
+/// unchanged.
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        IpAddr::V4(_) => ip,
+    }
 }
 
 /// Verify `ffmpeg` and `ffprobe` are on PATH by execing `-version`. Fails fast so
@@ -514,6 +599,179 @@ mod tests {
     }
 
     #[test]
+    fn metrics_are_off_unless_a_bind_is_given() {
+        let c = Config::resolve(&cli(Some("/books")), &FileConfig::default()).unwrap();
+        assert_eq!(c.metrics_bind, None);
+    }
+
+    #[test]
+    fn metrics_bind_is_parsed_and_cli_beats_toml() {
+        let mut c = cli(Some("/books"));
+        c.metrics_bind = Some("127.0.0.1:9090".to_string());
+        let file = FileConfig {
+            metrics_bind: Some("0.0.0.0:9999".to_string()),
+            ..FileConfig::default()
+        };
+        let resolved = Config::resolve(&c, &file).unwrap();
+        assert_eq!(
+            resolved.metrics_bind,
+            Some("127.0.0.1:9090".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn metrics_bind_falls_back_to_toml() {
+        let file = FileConfig {
+            metrics_bind: Some("127.0.0.1:9090".to_string()),
+            ..FileConfig::default()
+        };
+        let resolved = Config::resolve(&cli(Some("/books")), &file).unwrap();
+        assert_eq!(
+            resolved.metrics_bind,
+            Some("127.0.0.1:9090".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn bad_metrics_bind_address_is_rejected() {
+        let mut c = cli(Some("/books"));
+        c.metrics_bind = Some("nope".to_string());
+        assert!(matches!(
+            Config::resolve(&c, &FileConfig::default()),
+            Err(ConfigError::BadMetricsBind { .. })
+        ));
+    }
+
+    /// `validate` needs a real library dir; give each case its own.
+    fn validate_binds(dir: &str, bind: &str, metrics: &str) -> Result<(), ConfigError> {
+        let tmp = std::env::temp_dir().join(dir);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut c = cli(Some(tmp.to_str().unwrap()));
+        c.bind = Some(bind.to_string());
+        c.metrics_bind = Some(metrics.to_string());
+        let resolved = Config::resolve(&c, &FileConfig::default()).unwrap();
+        let result = resolved.validate();
+        let _ = std::fs::remove_dir_all(&tmp);
+        result
+    }
+
+    #[test]
+    fn metrics_bind_may_not_reuse_the_feed_servers_address() {
+        assert!(matches!(
+            validate_binds(
+                "podspine-cfg-collide-exact",
+                "127.0.0.1:8080",
+                "127.0.0.1:8080"
+            ),
+            Err(ConfigError::MetricsBindConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn a_wildcard_feed_bind_collides_with_a_specific_metrics_bind() {
+        // 0.0.0.0:8080 already claims 127.0.0.1:8080 — without this the second
+        // listener dies with a bare "address already in use" at startup.
+        assert!(matches!(
+            validate_binds(
+                "podspine-cfg-collide-wild",
+                "0.0.0.0:8080",
+                "127.0.0.1:8080"
+            ),
+            Err(ConfigError::MetricsBindConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn a_wildcard_metrics_bind_collides_with_a_specific_feed_bind() {
+        assert!(matches!(
+            validate_binds(
+                "podspine-cfg-collide-wild-rev",
+                "127.0.0.1:8080",
+                "0.0.0.0:8080"
+            ),
+            Err(ConfigError::MetricsBindConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn different_ports_never_collide() {
+        assert!(
+            validate_binds("podspine-cfg-collide-ok", "0.0.0.0:8080", "0.0.0.0:9090").is_ok(),
+            "distinct ports must be allowed, wildcard or not"
+        );
+    }
+
+    #[test]
+    fn distinct_interfaces_on_one_port_are_allowed() {
+        // Legal and occasionally deliberate: two specific, different interfaces.
+        assert!(
+            validate_binds(
+                "podspine-cfg-collide-ifaces",
+                "127.0.0.1:8080",
+                "192.0.2.1:8080"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn collision_check_is_symmetric_and_port_scoped() {
+        let loopback: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let wildcard: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        let other_port: SocketAddr = "0.0.0.0:9090".parse().unwrap();
+        let v6_wildcard: SocketAddr = "[::]:8080".parse().unwrap();
+
+        assert!(binds_collide(loopback, wildcard));
+        assert!(binds_collide(wildcard, loopback));
+        assert!(binds_collide(loopback, loopback));
+        assert!(binds_collide(v6_wildcard, loopback));
+        assert!(!binds_collide(loopback, other_port));
+        assert!(!binds_collide(wildcard, other_port));
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_is_the_same_address_as_its_ipv4_form() {
+        // `IpAddr` compares by variant, so these read as different addresses in
+        // Rust while the kernel binds them to one socket.
+        let loopback: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let mapped: SocketAddr = "[::ffff:127.0.0.1]:8080".parse().unwrap();
+        assert!(binds_collide(mapped, loopback));
+        assert!(binds_collide(loopback, mapped));
+
+        // The mapped wildcard is still a wildcard once folded.
+        let mapped_wildcard: SocketAddr = "[::ffff:0.0.0.0]:8080".parse().unwrap();
+        assert!(binds_collide(mapped_wildcard, loopback));
+
+        // Folding must not make unrelated addresses collide.
+        let elsewhere: SocketAddr = "[::ffff:192.0.2.1]:8080".parse().unwrap();
+        assert!(!binds_collide(elsewhere, loopback));
+        // ...nor override the port check.
+        let mapped_other_port: SocketAddr = "[::ffff:127.0.0.1]:9090".parse().unwrap();
+        assert!(!binds_collide(mapped_other_port, loopback));
+    }
+
+    #[test]
+    fn a_real_ipv6_address_is_left_alone() {
+        // Only the `::ffff:` mapped range folds; genuine IPv6 stays distinct.
+        let v6: SocketAddr = "[2001:db8::1]:8080".parse().unwrap();
+        let v4: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        assert!(!binds_collide(v6, v4));
+        assert!(binds_collide(v6, v6));
+    }
+
+    #[test]
+    fn mapped_metrics_bind_is_rejected_end_to_end() {
+        assert!(matches!(
+            validate_binds(
+                "podspine-cfg-collide-mapped",
+                "127.0.0.1:8080",
+                "[::ffff:127.0.0.1]:8080"
+            ),
+            Err(ConfigError::MetricsBindConflict { .. })
+        ));
+    }
+
+    #[test]
     fn toml_parses_a_partial_config() {
         let file: FileConfig = toml::from_str("bind = \"0.0.0.0:3000\"\n").unwrap();
         assert_eq!(file.bind.as_deref(), Some("0.0.0.0:3000"));
@@ -533,6 +791,7 @@ mod tests {
             storage_mode: StorageMode::Full,
             cache_size_bytes: Some(DEFAULT_CACHE_SIZE_BYTES),
             cache_ttl: None,
+            metrics_bind: None,
         };
         assert!(matches!(c.validate(), Err(ConfigError::LibraryNotFound(_))));
     }
@@ -554,6 +813,7 @@ mod tests {
             storage_mode: StorageMode::Full,
             cache_size_bytes: Some(DEFAULT_CACHE_SIZE_BYTES),
             cache_ttl: None,
+            metrics_bind: None,
         };
         c.validate().unwrap();
         assert!(data.is_dir(), "data dir created");

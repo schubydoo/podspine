@@ -41,6 +41,7 @@ The crates are described below; the pipeline runs left to right, with the SQLite
 | `feed` | Build one RSS 2.0 channel (itunes + podcast namespaces) per book, and a self-check that refuses to serve a malformed feed. |
 | `http` | Axum router: UI, feed, cover, and Range audio routes, plus the security/DoS middleware. |
 | `ui` | `maud` server-rendered pages: book grid, per-book copy-URL + QR + regenerate, and the per-book **subscribe page** (one-tap "Open in…" deep links + per-app QRs). Pure presentation — no DB or HTTP dependency. |
+| `metrics` | Optional Prometheus instrumentation: metric names, the recorder, the helpers other crates record through, and a standalone `/metrics` listener bound separately from the feed server. A no-op unless `--metrics-bind` is set. |
 
 Plus the `podspine` server binary (`src/main.rs`, wiring config → scan → watch →
 serve) and a `podspine-cli` proof-of-concept for the single-file split pipeline.
@@ -132,6 +133,11 @@ safe to expose externally (a guessed id 404s); see
 | `GET /audio/{feed_id}/{n}` | capability | Episode audio with HTTP Range (206 / `Content-Range` / 416) via `axum-range`. |
 | `GET /cover/{feed_id}` | capability | Book cover image. |
 | `GET /healthz` | — | Liveness. |
+
+`GET /metrics` is deliberately **not** in this table: when enabled it lives on a
+separate listener (`--metrics-bind`), never on the surface above. Feed routes are
+built to be publicly exposable; metrics describe the operator's library and belong
+on loopback or the LAN.
 
 ## Invariants
 

@@ -16,6 +16,7 @@ podspine-chapters = { path = "../chapters" }
 podspine-splitter = { path = "../splitter" }
 podspine-index = { path = "../index" }
 podspine-feed = { path = "../feed" }
+podspine-metrics = { path = "../metrics" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 # library auto-watch (v1.5): filesystem notifications, with a manual debounce

@@ -21,6 +21,25 @@ async fn main() -> Result<()> {
         .init();
 
     let config = Config::load().context("resolving configuration")?;
+
+    // Install the recorder (and bind its listener) before the first reconcile,
+    // so startup ingest is measured rather than silently dropped. Both failures
+    // are fatal: metrics were explicitly asked for, so a missing endpoint should
+    // surface here, not as a gap in a dashboard.
+    let metrics = match config.metrics_bind {
+        Some(bind) => {
+            let handle = podspine_metrics::install()
+                .map_err(|err| anyhow::anyhow!("{err}"))
+                .context("installing the metrics recorder")?;
+            let listener = tokio::net::TcpListener::bind(bind)
+                .await
+                .with_context(|| format!("binding the metrics listener on {bind}"))?;
+            tracing::info!(%bind, "podspine metrics listening");
+            Some((listener, handle))
+        }
+        None => None,
+    };
+
     let db_path = config.data_dir.join("podspine.db");
     let index = Index::open(&db_path).context("opening the index")?;
     let saver = matches!(config.storage_mode, StorageMode::Saver);
@@ -46,6 +65,14 @@ async fn main() -> Result<()> {
         saver,
         config.remux_non_faststart,
     );
+
+    if let Some((listener, handle)) = metrics {
+        tokio::spawn(async move {
+            if let Err(err) = podspine_metrics::serve(listener, handle).await {
+                tracing::error!(error = %err, "metrics listener stopped");
+            }
+        });
+    }
 
     let state = AppState::new(
         index,

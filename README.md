@@ -129,6 +129,10 @@ browse UI (`/`, `/book/{slug}`) enumerates your library, so keep it on the LAN o
 behind proxy-auth while the capability routes are safe to expose — see
 **[exposing Podspine safely](docs/DEPLOYMENT.md#exposing-podspine-safely)**.
 
+Want to graph it? `--metrics-bind 127.0.0.1:9090` exposes Prometheus metrics —
+books indexed, feeds served, split duration, errors — on their own listener,
+separate from the feed server. See **[metrics](docs/DEPLOYMENT.md#metrics-prometheus)**.
+
 ## Supported formats
 
 Point Podspine at a folder; each audiobook becomes its own feed. A book can be a
