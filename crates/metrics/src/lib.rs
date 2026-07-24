@@ -308,6 +308,43 @@ mod tests {
         assert_eq!(ErrorKind::Internal.as_label(), "internal");
     }
 
+    #[tokio::test]
+    async fn serve_answers_a_real_scrape_over_tcp() {
+        // The oneshot tests above exercise the router; this covers `serve`
+        // itself — the listener, the spawned upkeep task, and the wiring in
+        // between, which is what a Prometheus scrape actually talks to.
+        let installed = handle();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { serve(listener, installed).await });
+
+        let body = reqwest_get(&format!("http://{addr}/metrics")).await;
+        assert!(
+            body.contains(BOOKS_INDEXED),
+            "scrape over TCP should render the exposition, got: {body}"
+        );
+
+        server.abort();
+    }
+
+    /// Minimal HTTP/1.1 GET — enough to prove the listener answers, without
+    /// adding an HTTP client dependency for one test.
+    async fn reqwest_get(url: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (host, path) = url.trim_start_matches("http://").split_once('/').unwrap();
+        let mut stream = tokio::net::TcpStream::connect(host).await.unwrap();
+        stream
+            .write_all(
+                format!("GET /{path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        response
+    }
+
     #[test]
     fn split_buckets_are_ascending_and_positive() {
         assert!(SPLIT_BUCKETS.windows(2).all(|w| w[0] < w[1]));

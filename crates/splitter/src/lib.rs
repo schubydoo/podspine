@@ -358,9 +358,10 @@ pub fn split_chapter(
     let out_path = out_dir.join(format!("{:03}.{out_ext}", ch.idx + 1));
     let args = build_ffmpeg_args(input, &out_path, ch.start_sec, ch.end_sec);
 
-    // Timed around the ffmpeg call only. Observed on success alone: a failed or
-    // timed-out split would otherwise pollute the latency distribution with a
-    // duration that reflects the timeout, not the work.
+    // Timed around the ffmpeg call only. The observation is recorded at the end,
+    // once the output has been validated: a failed or timed-out split would
+    // otherwise pollute the latency distribution with a duration that reflects
+    // the failure rather than the work.
     let started = std::time::Instant::now();
     match run_ffmpeg(&args) {
         Ok(()) => {}
@@ -374,7 +375,7 @@ pub fn split_chapter(
         }
         Err(RunError::TimedOut) => return Err(SplitError::TimedOut { idx: ch.idx }),
     }
-    podspine_metrics::split_observed(started.elapsed());
+    let elapsed = started.elapsed();
 
     // enclosure length MUST come from the real file, never prorated.
     let byte_length = fs::metadata(&out_path)
@@ -389,6 +390,11 @@ pub fn split_chapter(
             path: out_path,
         });
     }
+
+    // Only now: ffmpeg exited 0 *and* the output is present and non-empty. An
+    // ffmpeg that "succeeds" into a missing or zero-byte file is a failed split,
+    // and must not land in a histogram documented as successful splits only.
+    podspine_metrics::split_observed(elapsed);
 
     Ok(SplitEpisode {
         idx: ch.idx,

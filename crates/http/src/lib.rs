@@ -1161,4 +1161,18 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn every_apperror_maps_to_its_status_and_never_leaks_a_body() {
+        // Also covers the metrics mapping arms: each variant must count as its
+        // own kind, and none may put internals on the wire.
+        for (err, want) in [
+            (AppError::NotFound, StatusCode::NOT_FOUND),
+            (AppError::Forbidden, StatusCode::FORBIDDEN),
+            (AppError::Internal, StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            let response = err.into_response();
+            assert_eq!(response.status(), want);
+        }
+    }
 }

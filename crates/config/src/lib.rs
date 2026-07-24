@@ -192,12 +192,17 @@ pub enum ConfigError {
         /// Parse error.
         source: std::net::AddrParseError,
     },
-    /// The metrics listener was pointed at the same address as the feed server.
+    /// The metrics listener would contend with the feed server for a port.
     #[error(
-        "metrics bind address {0} is the same as the feed server's; \
-         give metrics its own address (e.g. 127.0.0.1:9090)"
+        "metrics bind address {metrics} collides with the feed server's {bind}; \
+         give metrics its own port (e.g. 127.0.0.1:9090)"
     )]
-    MetricsBindConflict(SocketAddr),
+    MetricsBindConflict {
+        /// The requested metrics address.
+        metrics: SocketAddr,
+        /// The feed server's address.
+        bind: SocketAddr,
+    },
     /// The data directory could not be created.
     #[error("could not create data dir {path}: {source}")]
     DataDir {
@@ -352,8 +357,13 @@ impl Config {
         }
         // Catch the metrics/feed surface collision here rather than as an opaque
         // "address in use" from the second listener half a second into startup.
-        if self.metrics_bind == Some(self.bind) {
-            return Err(ConfigError::MetricsBindConflict(self.bind));
+        if let Some(metrics) = self.metrics_bind
+            && binds_collide(metrics, self.bind)
+        {
+            return Err(ConfigError::MetricsBindConflict {
+                metrics,
+                bind: self.bind,
+            });
         }
         std::fs::create_dir_all(&self.data_dir).map_err(|source| ConfigError::DataDir {
             path: self.data_dir.clone(),
@@ -377,6 +387,19 @@ fn load_file(path: Option<&Path>) -> Result<FileConfig, ConfigError> {
         path: path.to_path_buf(),
         source: Box::new(source),
     })
+}
+
+/// Whether two listeners would fight over the same port.
+///
+/// Equality isn't enough: a wildcard bind claims every interface, so
+/// `0.0.0.0:8080` and `127.0.0.1:8080` collide even though the addresses differ
+/// — and the second listener would fail with a bare "address already in use"
+/// instead of the diagnostic this check exists to produce. Treat a shared port
+/// as a collision whenever the addresses match or either side is a wildcard.
+/// Deliberately conservative: refusing an exotic-but-legal pair costs the
+/// operator one flag change, while missing one costs them a confusing crash.
+fn binds_collide(a: SocketAddr, b: SocketAddr) -> bool {
+    a.port() == b.port() && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())
 }
 
 /// Verify `ffmpeg` and `ffprobe` are on PATH by execing `-version`. Fails fast so
@@ -602,19 +625,91 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn metrics_bind_may_not_collide_with_the_feed_server() {
-        let tmp = std::env::temp_dir().join("podspine-cfg-metrics-collide");
+    /// `validate` needs a real library dir; give each case its own.
+    fn validate_binds(dir: &str, bind: &str, metrics: &str) -> Result<(), ConfigError> {
+        let tmp = std::env::temp_dir().join(dir);
         std::fs::create_dir_all(&tmp).unwrap();
         let mut c = cli(Some(tmp.to_str().unwrap()));
-        c.bind = Some("127.0.0.1:8080".to_string());
-        c.metrics_bind = Some("127.0.0.1:8080".to_string());
+        c.bind = Some(bind.to_string());
+        c.metrics_bind = Some(metrics.to_string());
         let resolved = Config::resolve(&c, &FileConfig::default()).unwrap();
-        assert!(matches!(
-            resolved.validate(),
-            Err(ConfigError::MetricsBindConflict(_))
-        ));
+        let result = resolved.validate();
         let _ = std::fs::remove_dir_all(&tmp);
+        result
+    }
+
+    #[test]
+    fn metrics_bind_may_not_reuse_the_feed_servers_address() {
+        assert!(matches!(
+            validate_binds(
+                "podspine-cfg-collide-exact",
+                "127.0.0.1:8080",
+                "127.0.0.1:8080"
+            ),
+            Err(ConfigError::MetricsBindConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn a_wildcard_feed_bind_collides_with_a_specific_metrics_bind() {
+        // 0.0.0.0:8080 already claims 127.0.0.1:8080 — without this the second
+        // listener dies with a bare "address already in use" at startup.
+        assert!(matches!(
+            validate_binds(
+                "podspine-cfg-collide-wild",
+                "0.0.0.0:8080",
+                "127.0.0.1:8080"
+            ),
+            Err(ConfigError::MetricsBindConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn a_wildcard_metrics_bind_collides_with_a_specific_feed_bind() {
+        assert!(matches!(
+            validate_binds(
+                "podspine-cfg-collide-wild-rev",
+                "127.0.0.1:8080",
+                "0.0.0.0:8080"
+            ),
+            Err(ConfigError::MetricsBindConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn different_ports_never_collide() {
+        assert!(
+            validate_binds("podspine-cfg-collide-ok", "0.0.0.0:8080", "0.0.0.0:9090").is_ok(),
+            "distinct ports must be allowed, wildcard or not"
+        );
+    }
+
+    #[test]
+    fn distinct_interfaces_on_one_port_are_allowed() {
+        // Legal and occasionally deliberate: two specific, different interfaces.
+        assert!(
+            validate_binds(
+                "podspine-cfg-collide-ifaces",
+                "127.0.0.1:8080",
+                "192.0.2.1:8080"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn collision_check_is_symmetric_and_port_scoped() {
+        let loopback: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let wildcard: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        let other_port: SocketAddr = "0.0.0.0:9090".parse().unwrap();
+        let v6_wildcard: SocketAddr = "[::]:8080".parse().unwrap();
+
+        assert!(binds_collide(loopback, wildcard));
+        assert!(binds_collide(wildcard, loopback));
+        assert!(binds_collide(loopback, loopback));
+        assert!(binds_collide(v6_wildcard, loopback));
+        assert!(!binds_collide(loopback, other_port));
+        assert!(!binds_collide(wildcard, other_port));
     }
 
     #[test]
