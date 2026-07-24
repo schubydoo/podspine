@@ -544,6 +544,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#metrics-prometheus" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Metrics (Prometheus)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#data-backups-and-updating" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -922,6 +933,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#metrics-prometheus" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Metrics (Prometheus)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#data-backups-and-updating" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1046,6 +1068,12 @@ that precedence. The library path is the only required input.</p>
 <td><code>PODSPINE_REMUX_NON_FASTSTART</code></td>
 <td>off</td>
 <td>Remux a non-faststart whole-file mp4 to faststart on demand (cache-managed). See below.</td>
+</tr>
+<tr>
+<td><code>--metrics-bind</code></td>
+<td><code>PODSPINE_METRICS_BIND</code></td>
+<td>off</td>
+<td>Serve Prometheus metrics on this <em>separate</em> address (<code>127.0.0.1:9090</code>). See below.</td>
 </tr>
 <tr>
 <td><code>--config</code></td>
@@ -1344,6 +1372,58 @@ podcast apps can't log in.)</p>
 <h2 id="health-checks">Health checks<a class="headerlink" href="#health-checks" title="Permanent link">&para;</a></h2>
 <p><code>GET /healthz</code> returns <code>200 ok</code>. Use it for container/orchestrator liveness (see the
 compose example above) or an uptime monitor.</p>
+<h2 id="metrics-prometheus">Metrics (Prometheus)<a class="headerlink" href="#metrics-prometheus" title="Permanent link">&para;</a></h2>
+<p>Off by default. Give it an address and Podspine serves <code>GET /metrics</code> in the
+Prometheus text format:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>podspine<span class="w"> </span>--library<span class="w"> </span>/library<span class="w"> </span>--metrics-bind<span class="w"> </span><span class="m">127</span>.0.0.1:9090
+<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="c1"># → http://127.0.0.1:9090/metrics</span>
+</code></pre></div>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Type</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>podspine_books_indexed</code></td>
+<td>gauge</td>
+<td>Books currently in the index (re-read after each reconcile, so prunes show up too).</td>
+</tr>
+<tr>
+<td><code>podspine_feeds_served_total</code></td>
+<td>counter</td>
+<td>Feeds rendered <em>and</em> passed the self-check before being sent.</td>
+</tr>
+<tr>
+<td><code>podspine_split_duration_seconds</code></td>
+<td>histogram</td>
+<td>Wall-clock per chapter split, successful splits only.</td>
+</tr>
+<tr>
+<td><code>podspine_errors_total{kind}</code></td>
+<td>counter</td>
+<td>Request failures; <code>kind</code> is <code>not_found</code>, <code>forbidden</code>, or <code>internal</code>.</td>
+</tr>
+</tbody>
+</table>
+<p><strong>This is deliberately a second listener, not a route on <code>--bind</code>.</strong> Feed URLs are
+unguessable capability URLs and safe to expose; metrics are operator data — how big
+your library is, how often things fail — and don't belong on an internet-facing
+surface. Bind it to loopback (and let Prometheus scrape over the host network) or to
+a LAN-only interface. Podspine refuses to start if <code>--metrics-bind</code> matches <code>--bind</code>.</p>
+<p>In Docker, publish the port explicitly (<code>-p 127.0.0.1:9090:9090</code>) and bind inside the
+container to <code>0.0.0.0:9090</code>. A minimal scrape config:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="nt">scrape_configs</span><span class="p">:</span>
+<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">job_name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">podspine</span>
+<a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a><span class="w">    </span><span class="nt">static_configs</span><span class="p">:</span>
+<a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a><span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">targets</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;127.0.0.1:9090&quot;</span><span class="p p-Indicator">]</span>
+</code></pre></div>
+<p>Nothing about listeners, titles, or paths is labelled — the only label in the whole
+set is <code>kind</code> on the error counter, so series count stays flat no matter how large
+the library or how much traffic it takes.</p>
 <h2 id="data-backups-and-updating">Data, backups, and updating<a class="headerlink" href="#data-backups-and-updating" title="Permanent link">&para;</a></h2>
 <ul>
 <li><strong>Back up <code>&lt;data_dir&gt;</code></strong> — <code>podspine.db</code> (plus its <code>-wal</code>/<code>-shm</code> sidecars) and

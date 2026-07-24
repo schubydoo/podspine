@@ -873,6 +873,10 @@ restart.</p>
 <td><code>ui</code></td>
 <td><code>maud</code> server-rendered pages: book grid, per-book copy-URL + QR + regenerate, and the per-book <strong>subscribe page</strong> (one-tap "Open in…" deep links + per-app QRs). Pure presentation — no DB or HTTP dependency.</td>
 </tr>
+<tr>
+<td><code>metrics</code></td>
+<td>Optional Prometheus instrumentation: metric names, the recorder, the helpers other crates record through, and a standalone <code>/metrics</code> listener bound separately from the feed server. A no-op unless <code>--metrics-bind</code> is set.</td>
+</tr>
 </tbody>
 </table>
 <p>Plus the <code>podspine</code> server binary (<code>src/main.rs</code>, wiring config → scan → watch →
@@ -994,6 +998,10 @@ safe to expose externally (a guessed id 404s); see
 </tr>
 </tbody>
 </table>
+<p><code>GET /metrics</code> is deliberately <strong>not</strong> in this table: when enabled it lives on a
+separate listener (<code>--metrics-bind</code>), never on the surface above. Feed routes are
+built to be publicly exposable; metrics describe the operator's library and belong
+on loopback or the LAN.</p>
 <h2 id="invariants">Invariants<a class="headerlink" href="#invariants" title="Permanent link">&para;</a></h2>
 <p>These are the rules the whole design exists to protect — the reasons the crates are
 split the way they are.</p>
