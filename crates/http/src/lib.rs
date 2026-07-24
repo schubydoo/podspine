@@ -1162,6 +1162,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn serve_binds_and_answers_a_real_request() {
+        // The router is covered by the integration tests via `oneshot`; this
+        // covers `serve` itself — the bind and the axum wiring a client talks to.
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe); // free the port we just proved is available
+
+        let dir = std::env::temp_dir().join("podspine-http-serve-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = AppState::new(
+            podspine_index::Index::open_in_memory().unwrap(),
+            "http://test".to_string(),
+            &dir,
+            &dir,
+            None,
+            false,
+            None,
+            None,
+        );
+        let server = tokio::spawn(async move { serve(addr, state).await });
+
+        // Retry briefly: the listener isn't up the instant the task is spawned.
+        let mut response = None;
+        for _ in 0..50 {
+            if let Ok(mut stream) = tokio::net::TcpStream::connect(addr).await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                stream
+                    .write_all(b"GET /healthz HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                let mut buf = String::new();
+                stream.read_to_string(&mut buf).await.unwrap();
+                response = Some(buf);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        server.abort();
+        let response = response.expect("serve should accept a connection");
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "expected a served response, got: {response}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn every_apperror_maps_to_its_status_and_never_leaks_a_body() {
         // Also covers the metrics mapping arms: each variant must count as its
@@ -1174,5 +1223,23 @@ mod tests {
             let response = err.into_response();
             assert_eq!(response.status(), want);
         }
+    }
+
+    #[test]
+    fn internal_swallows_the_source_error() {
+        // `AppError::internal` is what every `.map_err(..)` on the request path
+        // funnels through: whatever the underlying error was — a poisoned mutex,
+        // a rusqlite failure — it must collapse to a bare Internal, so no
+        // filesystem path or SQL text can reach the client.
+        let from_io = AppError::internal(std::io::Error::other("secret /srv/path detail"));
+        assert!(matches!(from_io, AppError::Internal));
+        assert_eq!(
+            from_io.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        // Generic over the error type, so exercise a second instantiation.
+        let from_str = AppError::internal("some other failure");
+        assert!(matches!(from_str, AppError::Internal));
     }
 }

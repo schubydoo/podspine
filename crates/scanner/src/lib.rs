@@ -1100,6 +1100,22 @@ mod tests {
         dir
     }
 
+    #[test]
+    fn an_mp3_folder_with_no_tracks_is_a_typed_error() {
+        // A folder of cover art and metadata with no audio is a user mistake, not
+        // a crash and not a silently empty book: it must surface as EmptyFolder.
+        let dir = scratch("empty-mp3-folder");
+        std::fs::write(dir.join("cover.jpg"), b"img").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"no audio here").unwrap();
+        let index = Index::open_in_memory().unwrap();
+        let data = dir.join("data");
+
+        let err = scan_mp3_folder(&dir, "book-id", &data, &index, &BookOverrides::default())
+            .expect_err("a folder with no mp3s must not scan");
+
+        assert!(matches!(err, ScanError::EmptyFolder(_)), "got {err:?}");
+    }
+
     /// Synthesize an AAC file; `chapters` true embeds three 10s chapters.
     fn synth(dir: &Path, chapters: bool) -> PathBuf {
         let name = if chapters { "chapters" } else { "flat" };

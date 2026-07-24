@@ -165,3 +165,32 @@ fn mtime_epoch(p: &Path) -> Result<i64> {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slugify_collapses_runs_and_trims_separators() {
+        assert_eq!(slugify("The Hobbit"), "the-hobbit");
+        // A run of non-alphanumerics collapses to ONE dash, and leading/trailing
+        // separators are dropped — otherwise slugs like `--a--b--` reach URLs.
+        assert_eq!(
+            slugify("  A Tale --- of Two   Cities!! "),
+            "a-tale-of-two-cities"
+        );
+        assert_eq!(
+            slugify("Nineteen Eighty-Four (1949)"),
+            "nineteen-eighty-four-1949"
+        );
+    }
+
+    #[test]
+    fn slugify_falls_back_when_nothing_survives() {
+        // Titles that are entirely punctuation or non-ASCII would otherwise
+        // produce an empty slug, i.e. a route that can't be addressed.
+        assert_eq!(slugify("!!!"), "book");
+        assert_eq!(slugify(""), "book");
+        assert_eq!(slugify("　—　"), "book");
+    }
+}
