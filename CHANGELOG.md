@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.0 (2026-07-25)
+
+### Features
+
+- Expose optional Prometheus metrics on a separate `--metrics-bind` listener, covering books indexed, feeds served, chapter-split duration, and errors by kind ([#104](https://github.com/schubydoo/podspine/pull/104))
+
 ## 1.3.0 (2026-07-10)
 
 ### Features
