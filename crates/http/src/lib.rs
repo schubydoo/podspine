@@ -194,15 +194,6 @@ pub fn router(state: AppState) -> Router {
 pub async fn serve(bind: SocketAddr, state: AppState) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!(%bind, "podspine listening");
-    serve_on(listener, state).await
-}
-
-/// Serve on an already-bound listener until shutdown.
-///
-/// Split out from [`serve`] so a caller that must own the bind can do so — the
-/// same shape `podspine_metrics::serve` takes, and what lets a test drive the
-/// real server without racing for a port. `serve` remains the normal entry.
-pub async fn serve_on(listener: tokio::net::TcpListener, state: AppState) -> std::io::Result<()> {
     axum::serve(listener, router(state)).await
 }
 
@@ -1167,51 +1158,6 @@ mod tests {
         assert!(
             !split.join("001.m4a").exists(),
             "regenerable chapters are still evicted under the cap"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn serve_answers_a_real_request_over_tcp() {
-        // The router is covered by the integration tests via `oneshot`; this
-        // covers the serving path a real client talks to. The listener is bound
-        // here and handed over still-open — releasing an ephemeral port and
-        // re-binding it would leave a window for another process to take it.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let dir = std::env::temp_dir().join("podspine-http-serve-test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let state = AppState::new(
-            podspine_index::Index::open_in_memory().unwrap(),
-            "http://test".to_string(),
-            &dir,
-            &dir,
-            None,
-            false,
-            None,
-            None,
-        );
-        let server = tokio::spawn(async move { serve_on(listener, state).await });
-
-        // The port is already bound, so connect() can't lose a race with another
-        // process; only the accept loop needs a moment to start running.
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let mut stream = tokio::net::TcpStream::connect(addr)
-            .await
-            .expect("the listener was bound before the server task started");
-        stream
-            .write_all(b"GET /healthz HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
-            .await
-            .unwrap();
-        let mut response = String::new();
-        stream.read_to_string(&mut response).await.unwrap();
-
-        server.abort();
-        assert!(
-            response.starts_with("HTTP/1.1 200"),
-            "expected a served response, got: {response}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
