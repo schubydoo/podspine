@@ -441,6 +441,18 @@ mod tests {
     }
 
     #[test]
+    fn an_unencodable_qr_yields_an_empty_string_not_a_panic() {
+        // QR capacity tops out around 2953 bytes; a longer base_url would
+        // otherwise panic on a page request. Empty string = the page still
+        // renders, just without a code.
+        let too_long = "u".repeat(4000);
+        assert!(qr_svg_sized(&too_long, 180).is_empty());
+        // Sanity: a normal URL still produces a code, so the assert above is
+        // testing the capacity limit and not a broken renderer.
+        assert!(qr_svg_sized("http://podspine.test/feed/abc.xml", 180).contains("<svg"));
+    }
+
+    #[test]
     fn index_lists_books_with_links_and_cover_alt() {
         let books = [
             card("dune", "Dune", true),

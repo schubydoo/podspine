@@ -1175,4 +1175,22 @@ mod tests {
             assert_eq!(response.status(), want);
         }
     }
+
+    #[test]
+    fn internal_swallows_the_source_error() {
+        // `AppError::internal` is what every `.map_err(..)` on the request path
+        // funnels through: whatever the underlying error was — a poisoned mutex,
+        // a rusqlite failure — it must collapse to a bare Internal, so no
+        // filesystem path or SQL text can reach the client.
+        let from_io = AppError::internal(std::io::Error::other("secret /srv/path detail"));
+        assert!(matches!(from_io, AppError::Internal));
+        assert_eq!(
+            from_io.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        // Generic over the error type, so exercise a second instantiation.
+        let from_str = AppError::internal("some other failure");
+        assert!(matches!(from_str, AppError::Internal));
+    }
 }

@@ -261,6 +261,28 @@ mod tests {
     }
 
     #[test]
+    fn an_ffmeta_sidecar_that_yields_no_chapters_falls_back_to_embedded() {
+        // A present-but-useless sidecar (header only, or hand-edited to nothing)
+        // must not win over real embedded markers and leave the book chapterless.
+        let dir = std::env::temp_dir().join("podspine-chapters-empty-ffmeta");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let audio = dir.join("book.m4b");
+        std::fs::write(&audio, b"audio").unwrap();
+        std::fs::write(
+            dir.join("book.ffmeta"),
+            ";FFMETADATA1\ntitle=No chapters here\n",
+        )
+        .unwrap();
+
+        let resolved = resolve(&audio, &embedded(), 100.0, false);
+
+        assert_eq!(resolved.source, ChapterSource::Embedded);
+        assert_eq!(resolved.chapters.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn cue_index_75_frames_per_second() {
         // 01:00:37 -> 60 + 37/75 = 60.4933...
         assert!((cue_index_secs("INDEX 01 01:00:37").unwrap() - 60.4933333).abs() < 1e-6);

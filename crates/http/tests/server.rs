@@ -10,8 +10,47 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 use podspine_http::{AppState, router};
-use podspine_index::Index;
+use podspine_index::{BookRow, EpisodeRow, Index};
 use podspine_scanner::{BookOverrides, scan_book, scan_book_as, scan_library};
+
+/// A minimal ready book row. Tests that need a *poisoned* row build it directly
+/// rather than scanning: the guards under test exist for rows the scanner would
+/// never write (bad migration, manual edit, partial rescan), so synthesizing
+/// real audio would prove nothing and would tie the test to ffmpeg.
+fn book_row(id: &str, feed_id: &str) -> BookRow {
+    BookRow {
+        id: id.to_string(),
+        slug: "a-book".to_string(),
+        feed_id: feed_id.to_string(),
+        title: "A Book".to_string(),
+        author: None,
+        cover_path: None,
+        source_path: "/nonexistent/source.m4b".to_string(),
+        source_mtime: 0,
+        status: "ready".to_string(),
+        storage_mode: String::new(),
+        default_cover_url: None,
+        force_embedded: false,
+    }
+}
+
+/// An extracted (chaptered) episode: empty `source_path`, so it resolves through
+/// the data-dir path rather than the serve-in-place branch.
+fn episode_row(book_id: &str, idx: i64, byte_length: i64) -> EpisodeRow {
+    EpisodeRow {
+        guid: format!("{book_id}-{idx}"),
+        book_id: book_id.to_string(),
+        idx,
+        title: format!("Chapter {}", idx + 1),
+        file_path: format!("{:03}.m4a", idx + 1),
+        source_path: String::new(),
+        needs_faststart: false,
+        byte_length,
+        duration_sec: 10.0,
+        start_sec: 0.0,
+        pubdate_epoch: 1_700_000_000 + idx,
+    }
+}
 
 fn ffmpeg_available() -> bool {
     Command::new("ffmpeg")
@@ -1201,5 +1240,102 @@ async fn serves_feed_and_range_audio() {
         );
     }
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The chapter dir is `<data_dir>/books/<book.id>`, and `book.id` is an opaque
+/// DB key — but a poisoned row must never resolve outside the data dir. The
+/// escape target is a *real* directory holding a *real* file, so a pass here
+/// means the containment check rejected it, not that the path merely failed to
+/// canonicalize.
+#[tokio::test]
+async fn audio_book_dir_outside_the_data_dir_is_a_404() {
+    let dir = std::env::temp_dir().join("podspine-http-audio-dir-escape");
+    let _ = std::fs::remove_dir_all(&dir);
+    let data = dir.join("data");
+    // `books` must exist: canonicalize resolves `..` against real components.
+    std::fs::create_dir_all(data.join("books")).unwrap();
+    let escaped = dir.join("escaped");
+    std::fs::create_dir_all(&escaped).unwrap();
+    std::fs::write(escaped.join("001.m4a"), b"you should never read this").unwrap();
+
+    let index = Index::open_in_memory().unwrap();
+    let feed_id = "capabilityidforescapetest";
+    // <data>/books/../../escaped == <dir>/escaped, which is outside <data>.
+    let book = book_row("../../escaped", feed_id);
+    index.upsert_book(&book).unwrap();
+    index.upsert_episode(&episode_row(&book.id, 0, 26)).unwrap();
+
+    let state = AppState::new(
+        index,
+        "http://test".to_string(),
+        &data,
+        &dir,
+        None,
+        false,
+        None,
+        None,
+    );
+    let resp = router(state)
+        .oneshot(
+            Request::get(format!("/audio/{feed_id}/1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert!(
+        body_bytes(resp).await.is_empty(),
+        "a rejected path must not leak bytes or filesystem detail"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The feed self-check is the last line of defense against shipping a broken
+/// feed to a podcatcher. A zero `byte_length` (an enclosure with no real length)
+/// must fail generation and surface as a 500 — never as a 200 carrying a feed
+/// that would misbehave in a client.
+#[tokio::test]
+async fn a_feed_failing_the_self_check_is_a_500_not_a_broken_feed() {
+    let dir = std::env::temp_dir().join("podspine-http-selfcheck-fail");
+    let _ = std::fs::remove_dir_all(&dir);
+    let data = dir.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+
+    let index = Index::open_in_memory().unwrap();
+    let feed_id = "capabilityidforselfcheck";
+    let book = book_row("selfcheck-book", feed_id);
+    index.upsert_book(&book).unwrap();
+    // byte_length 0 => MissingEnclosureLength, the #1 feed bug this check exists
+    // to catch (an enclosure length must be the real file size, never 0).
+    index.upsert_episode(&episode_row(&book.id, 0, 0)).unwrap();
+
+    let state = AppState::new(
+        index,
+        "http://test".to_string(),
+        &data,
+        &dir,
+        None,
+        false,
+        None,
+        None,
+    );
+    let resp = router(state)
+        .oneshot(
+            Request::get(format!("/feed/{feed_id}.xml"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = body_bytes(resp).await;
+    assert!(
+        body.is_empty(),
+        "the failure detail belongs in the log, not the response"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
