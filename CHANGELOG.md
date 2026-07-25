@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.1 (2026-07-25)
+
+### Fixes
+
+- Harden the saver-mode chapter-regeneration path: the book source is now canonicalized and asserted to live under the library root before it can reach ffmpeg, matching the checks the serve-in-place and faststart-remux paths already had ([#108](https://github.com/schubydoo/podspine/pull/108))
+
 ## 1.4.0 (2026-07-25)
 
 ### Features
