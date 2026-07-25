@@ -500,8 +500,10 @@ struct AudioTarget {
 
 /// Inputs to regenerate one cache file on demand — a `saver` chapter split, or a
 /// faststart remux of a whole-file episode (Sprint 6.3). The source is always a
-/// validated file under a trusted root; the op decides which ffmpeg call rebuilds
-/// the deterministic output.
+/// canonicalized file asserted to live under the library root — both arms of
+/// [`resolve_audio_target`] validate before constructing this, so nothing that
+/// reaches ffmpeg can have escaped. The op decides which ffmpeg call rebuilds the
+/// deterministic output.
 struct Regen {
     source: PathBuf,
     out_dir: PathBuf,
@@ -649,29 +651,46 @@ fn resolve_audio_target(
                 duration_sec: ep.duration_sec,
             },
         })
-    } else {
+    } else if book_is_saver(&book, state.saver) && FsPath::new(&book.source_path).is_file() {
         // A chaptered episode. Regen is possible only in `saver` mode (per-book,
         // Sprint 6.4) when the book's source is a single file to re-split; the
         // `is_file` guard is belt-and-suspenders (a directory source would make
         // `ffmpeg <directory>` fail), so a missing file is a clean 404, not a 500.
-        (book_is_saver(&book, state.saver) && FsPath::new(&book.source_path).is_file()).then(|| {
-            Regen {
-                source: PathBuf::from(&book.source_path),
-                out_dir,
-                out_ext,
-                // `end_sec` is reconstructed as start + duration. This is EXACT, not an
-                // approximation: the scanner stores `duration_sec = cut.end - cut.start`
-                // (the requested cut length, not a measured output duration), so this
-                // yields the same `[start, end)` the ingest split used — and ffmpeg's
-                // 6-decimal arg formatting absorbs any float round-trip. The stream
-                // copy is therefore byte-identical (asserted in the serve test).
-                op: RegenOp::Chapter(ChapterCut {
-                    idx: idx as usize,
-                    start_sec: ep.start_sec,
-                    end_sec: ep.start_sec + ep.duration_sec,
-                }),
-            }
+        //
+        // Same A01 containment rule as the remux arm above: `book.source_path` is
+        // an opaque DB value, so canonicalize it and assert it stays under the
+        // library root before it can reach ffmpeg. Checked here rather than at
+        // regen time so a poisoned row is rejected before anything is opened or
+        // written — including when the cached chapter happens to already exist.
+        let src = FsPath::new(&book.source_path)
+            .canonicalize()
+            .map_err(|_| AppError::NotFound)?;
+        if !src.starts_with(&state.library_dir) {
+            tracing::warn!(
+                feed_id,
+                number,
+                "saver regen source escaped the library root"
+            );
+            return Err(AppError::NotFound);
+        }
+        Some(Regen {
+            source: src,
+            out_dir,
+            out_ext,
+            // `end_sec` is reconstructed as start + duration. This is EXACT, not an
+            // approximation: the scanner stores `duration_sec = cut.end - cut.start`
+            // (the requested cut length, not a measured output duration), so this
+            // yields the same `[start, end)` the ingest split used — and ffmpeg's
+            // 6-decimal arg formatting absorbs any float round-trip. The stream
+            // copy is therefore byte-identical (asserted in the serve test).
+            op: RegenOp::Chapter(ChapterCut {
+                idx: idx as usize,
+                start_sec: ep.start_sec,
+                end_sec: ep.start_sec + ep.duration_sec,
+            }),
         })
+    } else {
+        None
     };
     Ok(AudioTarget { path, regen })
 }

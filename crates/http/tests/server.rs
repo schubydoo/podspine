@@ -1339,3 +1339,128 @@ async fn a_feed_failing_the_self_check_is_a_500_not_a_broken_feed() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The saver-mode regen arm re-splits from `book.source_path`, an opaque DB
+/// value that reaches ffmpeg. A poisoned row pointing outside the library root
+/// must 404 rather than hand ffmpeg an arbitrary file — the same A01 containment
+/// rule the remux arm already enforced (Sprint 6.4 follow-up).
+///
+/// The escape target is a real file, so a pass means the containment check
+/// rejected it and not that the path merely failed to canonicalize.
+#[tokio::test]
+async fn saver_regen_source_outside_the_library_is_a_404() {
+    let dir = std::env::temp_dir().join("podspine-http-saver-regen-escape");
+    let _ = std::fs::remove_dir_all(&dir);
+    let library = dir.join("library");
+    let data = dir.join("data");
+    let book_id = "saver-escape-book";
+    // The book dir must exist: resolve_audio_target canonicalizes it first.
+    std::fs::create_dir_all(data.join("books").join(book_id)).unwrap();
+    std::fs::create_dir_all(&library).unwrap();
+    // A real file, outside the library root.
+    let outside = dir.join("outside.m4b");
+    std::fs::write(&outside, b"not yours to split").unwrap();
+
+    let index = Index::open_in_memory().unwrap();
+    let feed_id = "capabilityidforsaverescape";
+    let mut book = book_row(book_id, feed_id);
+    book.source_path = outside.to_string_lossy().into_owned();
+    book.storage_mode = "saver".to_string(); // per-book override; independent of the global flag
+    index.upsert_book(&book).unwrap();
+    // A chaptered episode: empty source_path, so it takes the saver-regen arm
+    // rather than the serve-in-place or faststart-remux arms.
+    index
+        .upsert_episode(&episode_row(book_id, 0, 1024))
+        .unwrap();
+
+    let state = AppState::new(
+        index,
+        "http://test".to_string(),
+        &data,
+        &library,
+        None,
+        false, // global full: the per-book "saver" override is what selects the arm
+        None,
+        None,
+    );
+    let resp = router(state)
+        .oneshot(
+            Request::get(format!("/audio/{feed_id}/1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert!(
+        body_bytes(resp).await.is_empty(),
+        "a rejected source must not leak bytes or filesystem detail"
+    );
+    // The rejection must happen before ffmpeg is invoked: nothing may be written
+    // into the book's cache dir.
+    let produced = std::fs::read_dir(data.join("books").join(book_id))
+        .unwrap()
+        .count();
+    assert_eq!(
+        produced, 0,
+        "no cache file may be regenerated from an escaped source"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The containment check must not break the legitimate path: a saver book whose
+/// source is inside the library still resolves (here the chapter file already
+/// exists, so it serves without invoking ffmpeg).
+#[tokio::test]
+async fn saver_source_inside_the_library_still_serves() {
+    let dir = std::env::temp_dir().join("podspine-http-saver-regen-ok");
+    let _ = std::fs::remove_dir_all(&dir);
+    let library = dir.join("library");
+    let data = dir.join("data");
+    let book_id = "saver-ok-book";
+    let book_dir = data.join("books").join(book_id);
+    std::fs::create_dir_all(&book_dir).unwrap();
+    std::fs::create_dir_all(&library).unwrap();
+    let source = library.join("book.m4b");
+    std::fs::write(&source, b"source inside the library").unwrap();
+    // Pre-seed the cached chapter so the request is served without ffmpeg.
+    std::fs::write(book_dir.join("001.m4a"), b"cached chapter bytes").unwrap();
+
+    let index = Index::open_in_memory().unwrap();
+    let feed_id = "capabilityidforsaverok";
+    let mut book = book_row(book_id, feed_id);
+    book.source_path = source.to_string_lossy().into_owned();
+    book.storage_mode = "saver".to_string();
+    index.upsert_book(&book).unwrap();
+    index
+        .upsert_episode(&episode_row(
+            book_id,
+            0,
+            "cached chapter bytes".len() as i64,
+        ))
+        .unwrap();
+
+    let state = AppState::new(
+        index,
+        "http://test".to_string(),
+        &data,
+        &library,
+        None,
+        false,
+        None,
+        None,
+    );
+    let resp = router(state)
+        .oneshot(
+            Request::get(format!("/audio/{feed_id}/1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_bytes(resp).await, b"cached chapter bytes");
+    let _ = std::fs::remove_dir_all(&dir);
+}
