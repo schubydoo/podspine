@@ -544,6 +544,34 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
+  <a href="#141-2026-07-25" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1.4.1 (2026-07-25)
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="1.4.1 (2026-07-25)">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#fixes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Fixes
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#140-2026-07-25" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -668,7 +696,7 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#fixes" class="md-nav__link">
+  <a href="#fixes_1" class="md-nav__link">
     <span class="md-ellipsis">
       
         Fixes
@@ -811,6 +839,34 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
+  <a href="#141-2026-07-25" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1.4.1 (2026-07-25)
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="1.4.1 (2026-07-25)">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#fixes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Fixes
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#140-2026-07-25" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -935,7 +991,7 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#fixes" class="md-nav__link">
+  <a href="#fixes_1" class="md-nav__link">
     <span class="md-ellipsis">
       
         Fixes
@@ -1011,6 +1067,11 @@
 
 <!-- Rendered from the canonical CHANGELOG.md at the repo root (knope-managed). -->
 <h1 id="changelog">Changelog<a class="headerlink" href="#changelog" title="Permanent link">&para;</a></h1>
+<h2 id="141-2026-07-25">1.4.1 (2026-07-25)<a class="headerlink" href="#141-2026-07-25" title="Permanent link">&para;</a></h2>
+<h3 id="fixes">Fixes<a class="headerlink" href="#fixes" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Harden the saver-mode chapter-regeneration path: the book source is now canonicalized and asserted to live under the library root before it can reach ffmpeg, matching the checks the serve-in-place and faststart-remux paths already had (<a href="https://github.com/schubydoo/podspine/pull/108">#108</a>)</li>
+</ul>
 <h2 id="140-2026-07-25">1.4.0 (2026-07-25)<a class="headerlink" href="#140-2026-07-25" title="Permanent link">&para;</a></h2>
 <h3 id="features">Features<a class="headerlink" href="#features" title="Permanent link">&para;</a></h3>
 <ul>
@@ -1035,7 +1096,7 @@
 <li>Add an "Add to a podcast app" subscribe page: the book-page QR now opens <code>/subscribe/{feed_id}</code> with one-tap "Open in…" deep links for Apple Podcasts, Overcast, Pocket Casts, Castro, AntennaPod, and Podcast Addict (per-app QRs behind an expander) instead of raw feed XML the iOS Camera couldn't open. (<a href="https://github.com/schubydoo/podspine/pull/22">#22</a>)</li>
 </ul>
 <h2 id="101-2026-07-05">1.0.1 (2026-07-05)<a class="headerlink" href="#101-2026-07-05" title="Permanent link">&para;</a></h2>
-<h3 id="fixes">Fixes<a class="headerlink" href="#fixes" title="Permanent link">&para;</a></h3>
+<h3 id="fixes_1">Fixes<a class="headerlink" href="#fixes_1" title="Permanent link">&para;</a></h3>
 <ul>
 <li>Set the audio <code>Content-Type</code> on <code>/audio</code> responses so Apple Podcasts and other iOS clients can play episodes (axum-range sets none, which made playback fail with "this episode can't be played on this device"). (<a href="https://github.com/schubydoo/podspine/pull/20">#20</a>)</li>
 </ul>
