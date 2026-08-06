@@ -3,9 +3,11 @@
 #   commit stage : fast hygiene + fmt --check + clippy (-D warnings) + lib unit tests   (~seconds)
 #   push  stage  : full workspace test suite (incl. ffmpeg-backed integration tests)
 #
-# cargo audit / cargo deny run in CI only — they need the online advisory DB and are
-# not installed locally. Hook commands mirror .github/workflows/ci.yml exactly so the
-# local gate and CI never drift. Bypass a hook deliberately with SKIP=<id> or --no-verify.
+# cargo audit / cargo deny also run at the PUSH stage locally (see below) — they need the
+# online advisory DB, and `language: system` means both binaries must be on PATH:
+# `cargo install cargo-audit cargo-deny`. Without them the pre-push hook fails.
+# Hook commands mirror .github/workflows/ci.yml exactly so the local gate and CI never
+# drift. Bypass a hook deliberately with SKIP=<id> or --no-verify.
 minimum_pre_commit_version: "3.2.0"
 default_install_hook_types: [pre-commit, pre-push]
 
