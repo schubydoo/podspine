@@ -18,4 +18,4 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tower = { version = "=0.5.3", features = ["util"] }
-http-body-util = "=0.1.4"
+http-body-util = "=0.1.5"
