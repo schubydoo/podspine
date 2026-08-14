@@ -917,6 +917,58 @@ fn resolve_book_overrides(source: &Path, library_root: &Path) -> BookOverrides {
 /// episodes under `<data_dir>/books/<slug>/`. One independent book per top-level
 /// audio file or per-book subfolder. Slugs are collision-free and deterministic
 /// across re-scans; a single failing book is logged and skipped, never fatal.
+/// Collapse any set of index rows that share one source to a single row, keeping
+/// the lexicographically smallest id (the base `foo` over a suffixed `foo-2`) and
+/// deleting the rest with their extracted output.
+///
+/// This is the floor the rest of the identity logic stands on: **one source, one
+/// book row, one feed.** Nothing the current scanner writes creates a second row
+/// for one source — the source→id reuse map in [`scan_library`] sees to that — but
+/// a database written by an earlier build, or edited by hand, can hold them, and
+/// neither reuse nor orphan pruning would ever reconcile it: the map keeps one id
+/// arbitrarily, and both rows survive pruning because their shared source still
+/// exists. The book would stay listed under two capability URLs forever. Running
+/// this first makes the reuse map unambiguous and heals such a database in one
+/// reconcile.
+///
+/// A row whose source is *gone* is left for [`prune_orphans`] — grouping only
+/// canonicalizable paths also means an unmounted library (every source missing)
+/// collapses nothing. Best-effort: a failed lookup leaves the index untouched.
+fn collapse_duplicate_source_rows(index: &Index, data_dir: &Path) {
+    let Ok(books) = index.list_books() else {
+        return;
+    };
+    let mut ids_by_source: HashMap<PathBuf, Vec<String>> = HashMap::new();
+    for b in books {
+        if let Ok(real) = Path::new(&b.source_path).canonicalize() {
+            ids_by_source.entry(real).or_default().push(b.id);
+        }
+    }
+    for (_source, mut ids) in ids_by_source {
+        if ids.len() < 2 {
+            continue;
+        }
+        ids.sort();
+        let kept = &ids[0];
+        for dup in &ids[1..] {
+            let book_out = data_dir.join("books").join(dup);
+            if book_out.exists()
+                && let Err(err) = std::fs::remove_dir_all(&book_out)
+            {
+                tracing::warn!(error = %err, dir = %book_out.display(), "could not remove a duplicate book's output");
+            }
+            match index.delete_book(dup) {
+                Ok(_) => {
+                    tracing::warn!(id = %dup, kept = %kept, "removed a duplicate feed row for one source")
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, id = %dup, "could not remove a duplicate feed row")
+                }
+            }
+        }
+    }
+}
+
 pub fn scan_library(
     library: &Path,
     data_dir: &Path,
@@ -930,6 +982,10 @@ pub fn scan_library(
         .canonicalize()
         .unwrap_or_else(|_| library.to_path_buf());
     let sources = discover(&library_root, data_dir);
+
+    // Enforce one row per source BEFORE the reuse map is read, so the map cannot
+    // inherit a duplicate (invariant A — see the function's doc).
+    collapse_duplicate_source_rows(index, data_dir);
 
     // Every already-indexed book, keyed by its (canonical) source path. A source
     // that is already indexed keeps whatever id it has — including a `-2` suffix it
@@ -2934,6 +2990,104 @@ mod tests {
     /// would keep working and start serving a different audiobook. This is the
     /// case a folder of several `.m4b` files opened up — its second file was never
     /// discovered before, and its stem can collide with an existing book.
+    /// A database that already holds two rows for one source (an older build, a
+    /// manual edit) must heal to a single row — otherwise the book stays under two
+    /// capability feeds across every future reconcile, since both survive pruning.
+    #[test]
+    fn duplicate_source_rows_collapse_to_one() {
+        let root = scratch("collapse-dups");
+        let data = root.join("data");
+        let source = root.join("book.m4b");
+        touch(&source);
+        let source_str = source
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let index = Index::open_in_memory().unwrap();
+        let row = |id: &str, feed: &str| BookRow {
+            id: id.into(),
+            slug: id.into(),
+            feed_id: feed.into(),
+            title: "Book".into(),
+            author: None,
+            cover_path: None,
+            source_path: source_str.clone(),
+            source_mtime: 1,
+            status: "ready".into(),
+            storage_mode: String::new(),
+            default_cover_url: None,
+            force_embedded: false,
+            transcode: "off".into(),
+        };
+        index.upsert_book(&row("book", "cap-book")).unwrap();
+        index.upsert_book(&row("book-2", "cap-book-2")).unwrap();
+        // Extracted output for both; only the survivor's should remain.
+        touch(&data.join("books/book/001.m4a"));
+        touch(&data.join("books/book-2/001.m4a"));
+
+        collapse_duplicate_source_rows(&index, &data);
+
+        let ids: Vec<String> = index
+            .list_books()
+            .unwrap()
+            .into_iter()
+            .map(|b| b.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["book"],
+            "the base id is kept, the suffixed dup deleted"
+        );
+        assert!(
+            data.join("books/book/001.m4a").exists(),
+            "survivor output kept"
+        );
+        assert!(
+            !data.join("books/book-2").exists(),
+            "duplicate output reclaimed"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Two rows sharing a source whose file is GONE are prune_orphans' job, not
+    /// this one — and an unmounted library (every source missing) must collapse
+    /// nothing, so a mount blip can't wipe the index.
+    #[test]
+    fn collapse_leaves_gone_sources_for_pruning() {
+        let root = scratch("collapse-gone");
+        let data = root.join("data");
+        let index = Index::open_in_memory().unwrap();
+        let missing = root.join("not-here.m4b").to_string_lossy().into_owned();
+        for id in ["book", "book-2"] {
+            index
+                .upsert_book(&BookRow {
+                    id: id.into(),
+                    slug: id.into(),
+                    feed_id: format!("cap-{id}"),
+                    title: "Book".into(),
+                    author: None,
+                    cover_path: None,
+                    source_path: missing.clone(),
+                    source_mtime: 1,
+                    status: "ready".into(),
+                    storage_mode: String::new(),
+                    default_cover_url: None,
+                    force_embedded: false,
+                    transcode: "off".into(),
+                })
+                .unwrap();
+        }
+        collapse_duplicate_source_rows(&index, &data);
+        assert_eq!(
+            index.list_books().unwrap().len(),
+            2,
+            "a gone source is not collapsed — prune_orphans handles it"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The two-scan hazard: a newcomer suffixed because a stale row held its base
     /// id must not, once that stale row is pruned, be re-indexed under the freed
     /// base id on the next scan — that is one audiobook under two feeds. Reusing an
