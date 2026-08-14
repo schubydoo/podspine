@@ -1093,6 +1093,11 @@ playback order is correct.</p>
 </ul>
 <h3 id="audio-wont-play-or-wont-scrubseek">Audio won't play or won't scrub/seek<a class="headerlink" href="#audio-wont-play-or-wont-scrubseek" title="Permanent link">&para;</a></h3>
 <ul>
+<li><strong>The app rejects the format.</strong> Most podcast apps play only MP3 and AAC — a
+  FLAC, Ogg Vorbis, Opus or ALAC book may simply refuse to start (Apple Podcasts
+  and Overcast do). Set <code>PODSPINE_TRANSCODE=aac</code> to re-encode just those books to
+  AAC 128k at ingest; MP3/AAC books are never touched. See
+  <a href="../DEPLOYMENT/#transcoding-oddball-formats-podspine_transcode">transcoding</a>.</li>
 <li>Podspine supports HTTP Range (seek) on <code>/audio/...</code>. If a proxy strips
   <code>Range</code>/<code>Accept-Ranges</code> headers, seeking breaks — configure it to pass them
   through.</li>

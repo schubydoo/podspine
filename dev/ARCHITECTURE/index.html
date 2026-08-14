@@ -918,13 +918,26 @@ depends on whether it is a whole source file or a sub-range of a container:</p>
   <code>PODSPINE_REMUX_NON_FASTSTART</code> is on, the handler instead serves a faststart
   <strong>remux</strong> regenerated on demand into the cache (<code>file_path != source_path</code>) —
   Sprint 6.3; otherwise it logs a callout and serves in place.</li>
-<li><strong>Chaptered episode</strong> — a sub-range of a container — must be <strong>extracted</strong> under
+<li><strong>Transcoded episode</strong> (Task 5.2, <code>PODSPINE_TRANSCODE=aac|mp3</code>) — a source whose
+  codec no podcatcher can be relied on to play (FLAC/Vorbis/Opus/ALAC) is
+  <strong>re-encoded</strong> at ingest instead of stream-copied, and <code>book.transcode</code> records
+  the mode. Such a book is always materialized under <code>&lt;data_dir&gt;</code> — never served in
+  place, never regenerated on demand, never evicted — because a re-encode is not
+  byte-reproducible across ffmpeg builds and its <code>enclosure length</code> is already
+  published. MP3/AAC sources are always stream-copied.</li>
+</ul>
+<p>Every produced episode (a split, a transcode) is written to a <code>NNN.part.&lt;ext&gt;</code>
+sibling and <strong>renamed into place</strong>, so a request that arrives mid-encode is served
+the previous complete file rather than a truncated one, and a failed encode leaves
+the published episode and its recorded length untouched. A re-ingest that changes
+the container also deletes the episodes in the old one, so a mode change can't
+strand a full copy of the book under <code>&lt;data_dir&gt;</code>.
+- <strong>Chaptered episode</strong> — a sub-range of a container — must be <strong>extracted</strong> under
   <code>&lt;data_dir&gt;</code> (a raw byte range of an <code>.m4b</code> isn't a standalone file). In <code>full</code>
   mode (default) every chapter is pre-split at ingest and kept; in <code>saver</code> mode
   each is split once at ingest to record its exact byte length, then deleted and
   regenerated on demand into a bounded cache — so <code>saver</code> cuts steady-state disk,
-  not ingest time or I/O.</li>
-</ul>
+  not ingest time or I/O.</p>
 <p>So <code>&lt;data_dir&gt;</code> grows on top of the originals only for chaptered books; whole-file
 books cost only their index row and any extracted cover. See
 <a href="../DEPLOYMENT/#storage-mode-full-vs-saver">DEPLOYMENT.md</a> for the disk-budget
