@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use podspine_config::{Config, StorageMode};
 use podspine_http::{AppState, serve};
 use podspine_index::Index;
-use podspine_scanner::{reconcile, spawn_library_watcher};
+use podspine_scanner::{ScanOptions, reconcile, spawn_library_watcher};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -43,17 +43,16 @@ async fn main() -> Result<()> {
     let db_path = config.data_dir.join("podspine.db");
     let index = Index::open(&db_path).context("opening the index")?;
     let saver = matches!(config.storage_mode, StorageMode::Saver);
+    let scan_opts = ScanOptions {
+        force_embedded: config.force_embedded_chapters,
+        saver,
+        remux_non_faststart: config.remux_non_faststart,
+        transcode: config.transcode,
+    };
 
     // Initial reconcile: index new/changed books and prune ones deleted while the
     // server was down.
-    reconcile(
-        &config.library,
-        &config.data_dir,
-        &index,
-        config.force_embedded_chapters,
-        saver,
-        config.remux_non_faststart,
-    );
+    reconcile(&config.library, &config.data_dir, &index, scan_opts);
 
     // Auto-refresh: a background thread (its own WAL index connection) re-runs the
     // reconcile whenever the library changes, so feeds appear without a restart.
@@ -61,9 +60,7 @@ async fn main() -> Result<()> {
         config.library.clone(),
         config.data_dir.clone(),
         db_path,
-        config.force_embedded_chapters,
-        saver,
-        config.remux_non_faststart,
+        scan_opts,
     );
 
     if let Some((listener, handle)) = metrics {

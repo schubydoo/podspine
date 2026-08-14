@@ -1,5 +1,6 @@
 //! `splitter` — `ffmpeg` wrapper that cuts one audiobook file into per-chapter
-//! episode files by **stream copy** (no re-encode).
+//! episode files by **stream copy** (no re-encode), or — opt-in, for sources no
+//! podcatcher can play — by **re-encoding** to AAC/MP3 (Task 5.2).
 //!
 //! Per chapter it runs, as an **argv vector** (never a shell string — chapter
 //! metadata is untrusted):
@@ -13,7 +14,7 @@
 //! ## Invariants (the reason this crate exists)
 //! - `-ss` goes **before** `-i` (fast index seek) and duration is `-t <end-start>`.
 //!   Using `-to` after `-i` together with `-ss` before `-i` does **not** subtract
-//!   the offset and yields a ~2× file — so we never emit `-to`. [`build_ffmpeg_args`]
+//!   the offset and yields a ~2× file — so we never emit `-to`. `build_encode_args`
 //!   encodes this and is unit-tested without invoking ffmpeg.
 //! - `byte_length` is read from the **actual output file** (`fs::metadata().len()`),
 //!   never prorated from a bitrate.
@@ -41,6 +42,64 @@ use wait_timeout::ChildExt;
 /// splitting a whole 10h book is ≤2min (NFR-P1), so any single child running
 /// past this is hung, not slow.
 const FFMPEG_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Per-child ffmpeg wall-clock timeout for a **re-encode** ([`Encoding::Aac`] /
+/// [`Encoding::Mp3`], Task 5.2). A re-encode is bounded by CPU, not by the index:
+/// a whole chapterless 10h FLAC is a single child that runs for tens of minutes
+/// on a Raspberry Pi, so [`FFMPEG_TIMEOUT`] would kill honest work. Still a hard
+/// bound — a child past this is hung, not slow.
+const TRANSCODE_TIMEOUT: Duration = Duration::from_secs(7200);
+
+/// How an episode's audio is produced from the source.
+///
+/// [`Encoding::Copy`] is the default and the only mode used for podcast-safe
+/// sources (MP3/AAC): the bytes are copied out of the container untouched. The
+/// re-encode modes exist for Tier-2 sources (FLAC/Vorbis/Opus/ALAC) that most
+/// podcatchers refuse to play, and are opt-in per server (`PODSPINE_TRANSCODE`).
+///
+/// A re-encode is **not** byte-reproducible across ffmpeg builds, so a transcoded
+/// book is always materialized once at ingest and never regenerated on demand —
+/// that is what keeps `enclosure length` equal to the file actually served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Encoding {
+    /// Stream copy (`-c copy`) — no re-encode, the default everywhere.
+    #[default]
+    Copy,
+    /// Re-encode to AAC 128 kbps (ffmpeg's built-in `aac` encoder, `.m4a`).
+    Aac,
+    /// Re-encode to MP3 128 kbps (`libmp3lame`, `.mp3`) — the fallback target for
+    /// clients that still choke on AAC.
+    Mp3,
+}
+
+impl Encoding {
+    /// The per-child timeout this encoding runs under.
+    fn timeout(self) -> Duration {
+        match self {
+            Encoding::Copy => FFMPEG_TIMEOUT,
+            Encoding::Aac | Encoding::Mp3 => TRANSCODE_TIMEOUT,
+        }
+    }
+
+    /// The codec arguments, appended after the stream maps.
+    ///
+    /// `-write_xing 1` on the MP3 target keeps a Xing/LAME header in the output so
+    /// clients can read the duration of a VBR-capable file (TAD §5.4).
+    fn codec_args(self) -> Vec<OsString> {
+        match self {
+            Encoding::Copy => vec!["-c".into(), "copy".into()],
+            Encoding::Aac => vec!["-c:a".into(), "aac".into(), "-b:a".into(), "128k".into()],
+            Encoding::Mp3 => vec![
+                "-c:a".into(),
+                "libmp3lame".into(),
+                "-b:a".into(),
+                "128k".into(),
+                "-write_xing".into(),
+                "1".into(),
+            ],
+        }
+    }
+}
 
 /// A chapter to cut: its position and its `[start, end)` in seconds.
 ///
@@ -214,7 +273,7 @@ enum RunError {
         /// Trimmed stderr.
         stderr: String,
     },
-    /// Exceeded [`FFMPEG_TIMEOUT`] and was killed.
+    /// Exceeded the run's timeout and was killed.
     TimedOut,
 }
 
@@ -222,6 +281,12 @@ enum RunError {
 /// timeout+kill. stdout is discarded; stderr is captured (small under
 /// `-loglevel error`) so a failure can be logged without leaking it to clients.
 fn run_ffmpeg(args: &[OsString]) -> Result<(), RunError> {
+    run_ffmpeg_within(args, FFMPEG_TIMEOUT)
+}
+
+/// As [`run_ffmpeg`], with an explicit per-child timeout — a re-encode needs a
+/// far longer bound than a stream copy ([`Encoding::timeout`]).
+fn run_ffmpeg_within(args: &[OsString], timeout: Duration) -> Result<(), RunError> {
     let _permit = ffmpeg_gate().acquire();
 
     let mut child = Command::new("ffmpeg")
@@ -249,10 +314,7 @@ fn run_ffmpeg(args: &[OsString]) -> Result<(), RunError> {
             .to_string()
     };
 
-    match child
-        .wait_timeout(FFMPEG_TIMEOUT)
-        .map_err(RunError::Spawn)?
-    {
+    match child.wait_timeout(timeout).map_err(RunError::Spawn)? {
         Some(status) if status.success() => Ok(()),
         Some(status) => Err(RunError::Failed {
             code: status.code(),
@@ -331,6 +393,19 @@ pub fn split_book(
     chapters: &[ChapterCut],
     out_ext: &str,
 ) -> Result<Vec<SplitEpisode>, SplitError> {
+    split_book_encoded(input, out_dir, chapters, out_ext, Encoding::Copy)
+}
+
+/// As [`split_book`], with an explicit [`Encoding`] — [`Encoding::Copy`] is the
+/// stream-copy default; the re-encode modes serve Task 5.2's opt-in transcoding
+/// of sources podcatchers can't play.
+pub fn split_book_encoded(
+    input: &Path,
+    out_dir: &Path,
+    chapters: &[ChapterCut],
+    out_ext: &str,
+    enc: Encoding,
+) -> Result<Vec<SplitEpisode>, SplitError> {
     fs::create_dir_all(out_dir).map_err(|source| SplitError::CreateDir {
         path: out_dir.to_path_buf(),
         source,
@@ -338,7 +413,7 @@ pub fn split_book(
 
     let mut episodes = Vec::with_capacity(chapters.len());
     for ch in chapters {
-        episodes.push(split_chapter(input, out_dir, ch, out_ext)?);
+        episodes.push(split_chapter_encoded(input, out_dir, ch, out_ext, enc)?);
     }
     Ok(episodes)
 }
@@ -350,20 +425,33 @@ pub fn split_chapter(
     ch: &ChapterCut,
     out_ext: &str,
 ) -> Result<SplitEpisode, SplitError> {
+    split_chapter_encoded(input, out_dir, ch, out_ext, Encoding::Copy)
+}
+
+/// As [`split_chapter`], with an explicit [`Encoding`]. A re-encode runs under
+/// the longer [`TRANSCODE_TIMEOUT`]; everything else (argv-only invocation, the
+/// concurrency gate, `byte_length` read from the real output) is identical.
+pub fn split_chapter_encoded(
+    input: &Path,
+    out_dir: &Path,
+    ch: &ChapterCut,
+    out_ext: &str,
+    enc: Encoding,
+) -> Result<SplitEpisode, SplitError> {
     let duration_sec = ch.end_sec - ch.start_sec;
     if duration_sec <= 0.0 {
         return Err(SplitError::EmptyChapter { idx: ch.idx });
     }
 
     let out_path = out_dir.join(format!("{:03}.{out_ext}", ch.idx + 1));
-    let args = build_ffmpeg_args(input, &out_path, ch.start_sec, ch.end_sec);
+    let args = build_encode_args(input, &out_path, Some((ch.start_sec, ch.end_sec)), enc);
 
     // Timed around the ffmpeg call only. The observation is recorded at the end,
     // once the output has been validated: a failed or timed-out split would
     // otherwise pollute the latency distribution with a duration that reflects
     // the failure rather than the work.
     let started = std::time::Instant::now();
-    match run_ffmpeg(&args) {
+    match run_ffmpeg_within(&args, enc.timeout()) {
         Ok(()) => {}
         Err(RunError::Spawn(e)) => return Err(SplitError::Spawn(e)),
         Err(RunError::Failed { code, stderr }) => {
@@ -394,6 +482,9 @@ pub fn split_chapter(
     // Only now: ffmpeg exited 0 *and* the output is present and non-empty. An
     // ffmpeg that "succeeds" into a missing or zero-byte file is a failed split,
     // and must not land in a histogram documented as successful splits only.
+    // A re-encode is observed here too: it is the same unit of work (one episode
+    // produced), and it is the slowest ingest work an operator can have — hiding
+    // it would make the histogram lie about the tail.
     podspine_metrics::split_observed(elapsed);
 
     Ok(SplitEpisode {
@@ -452,6 +543,65 @@ pub fn remux_faststart(
     })
 }
 
+/// Re-encode a whole (chapterless) file into one episode under `out_dir` —
+/// Task 5.2's transcode path for a source no podcatcher will play (a FLAC with no
+/// `.cue`, say). Unlike [`split_chapter_encoded`] this emits **no `-ss`/`-t`**: the
+/// episode is the entire file, so a probed duration that is a hair short must not
+/// clip the ending. `duration_sec` is carried through to the enclosure unchanged
+/// (the ffprobe duration), while `byte_length` is read from the real output.
+///
+/// `enc` must be a re-encode mode; [`Encoding::Copy`] here would just be a
+/// container rewrite, which is [`remux_faststart`]'s job.
+pub fn transcode_whole(
+    input: &Path,
+    out_dir: &Path,
+    idx: usize,
+    out_ext: &str,
+    duration_sec: f64,
+    enc: Encoding,
+) -> Result<SplitEpisode, SplitError> {
+    fs::create_dir_all(out_dir).map_err(|source| SplitError::CreateDir {
+        path: out_dir.to_path_buf(),
+        source,
+    })?;
+
+    let out_path = out_dir.join(format!("{:03}.{out_ext}", idx + 1));
+    let args = build_encode_args(input, &out_path, None, enc);
+
+    let started = std::time::Instant::now();
+    match run_ffmpeg_within(&args, enc.timeout()) {
+        Ok(()) => {}
+        Err(RunError::Spawn(e)) => return Err(SplitError::Spawn(e)),
+        Err(RunError::Failed { code, stderr }) => {
+            return Err(SplitError::Ffmpeg { idx, code, stderr });
+        }
+        Err(RunError::TimedOut) => return Err(SplitError::TimedOut { idx }),
+    }
+    let elapsed = started.elapsed();
+
+    // enclosure length MUST come from the real file, never prorated.
+    let byte_length = fs::metadata(&out_path)
+        .map_err(|source| SplitError::Metadata {
+            path: out_path.clone(),
+            source,
+        })?
+        .len();
+    if byte_length == 0 {
+        return Err(SplitError::OutputMissing {
+            idx,
+            path: out_path,
+        });
+    }
+    podspine_metrics::split_observed(elapsed);
+
+    Ok(SplitEpisode {
+        idx,
+        path: out_path,
+        byte_length,
+        duration_sec,
+    })
+}
+
 /// argv for a whole-file faststart remux: keep audio only, drop chapters, copy
 /// codecs (no re-encode), relocate `moov`. No `-ss`/`-t` — the whole file. An
 /// argument vector, never a shell string (untrusted paths).
@@ -475,34 +625,45 @@ fn build_remux_args(input: &Path, output: &Path) -> Vec<OsString> {
     ]
 }
 
-/// Build the exact ffmpeg argv for a stream-copy chapter cut.
+/// Build the exact ffmpeg argv for one produced episode.
 ///
 /// Factored out so the ordering invariants (`-ss` before `-i`, `-t` not `-to`,
-/// `-c copy`, `+faststart`) can be asserted in a unit test without ffmpeg.
+/// the codec args, `+faststart`) can be asserted in a unit test without ffmpeg.
 /// `+faststart` is an mp4-family muxer option, so it is emitted only for
 /// `.m4a`/`.m4b`/`.mp4` outputs (Tier-2 `.flac`/`.ogg`/`.opus` reject it).
-fn build_ffmpeg_args(input: &Path, output: &Path, start_sec: f64, end_sec: f64) -> Vec<OsString> {
-    let duration = (end_sec - start_sec).max(0.0);
+///
+/// `range` is `Some((start, end))` for a chapter cut and `None` for a whole file
+/// (no `-ss`/`-t` at all — see [`transcode_whole`]). `enc` supplies the codec
+/// arguments; every ordering invariant holds for a re-encode too.
+fn build_encode_args(
+    input: &Path,
+    output: &Path,
+    range: Option<(f64, f64)>,
+    enc: Encoding,
+) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec![
         "-nostdin".into(),
         "-y".into(),
         "-loglevel".into(),
         "error".into(),
-        // -ss BEFORE -i: fast seek via the index.
-        "-ss".into(),
-        fmt_secs(start_sec).into(),
-        "-i".into(),
-        input.as_os_str().to_os_string(),
-        // -t <duration>, NEVER -to (which with a pre-input -ss makes a 2x file).
-        "-t".into(),
-        fmt_secs(duration).into(),
-        "-map".into(),
-        "0:a:0".into(),
-        "-map_chapters".into(),
-        "-1".into(),
-        "-c".into(),
-        "copy".into(),
     ];
+    if let Some((start_sec, _)) = range {
+        // -ss BEFORE -i: fast seek via the index.
+        args.push("-ss".into());
+        args.push(fmt_secs(start_sec).into());
+    }
+    args.push("-i".into());
+    args.push(input.as_os_str().to_os_string());
+    if let Some((start_sec, end_sec)) = range {
+        // -t <duration>, NEVER -to (which with a pre-input -ss makes a 2x file).
+        args.push("-t".into());
+        args.push(fmt_secs((end_sec - start_sec).max(0.0)).into());
+    }
+    args.push("-map".into());
+    args.push("0:a:0".into());
+    args.push("-map_chapters".into());
+    args.push("-1".into());
+    args.extend(enc.codec_args());
     if is_mp4_family(output) {
         args.push("-movflags".into());
         args.push("+faststart".into());
@@ -542,8 +703,16 @@ mod tests {
     }
 
     fn args_as_strings(start: f64, end: f64) -> Vec<String> {
-        build_ffmpeg_args(Path::new("in.m4b"), Path::new("out.m4a"), start, end)
-            .iter()
+        strings(&build_encode_args(
+            Path::new("in.m4b"),
+            Path::new("out.m4a"),
+            Some((start, end)),
+            Encoding::Copy,
+        ))
+    }
+
+    fn strings(args: &[OsString]) -> Vec<String> {
+        args.iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
     }
@@ -589,13 +758,90 @@ mod tests {
     }
 
     #[test]
+    fn aac_transcode_replaces_copy_and_keeps_cut_invariants() {
+        let args = strings(&build_encode_args(
+            Path::new("in.flac"),
+            Path::new("out/001.m4a"),
+            Some((10.0, 40.0)),
+            Encoding::Aac,
+        ));
+        let pair = |a: &str, b: &str| args.windows(2).any(|w| w[0] == a && w[1] == b);
+        assert!(pair("-c:a", "aac"), "must select the aac encoder");
+        assert!(pair("-b:a", "128k"), "must target 128 kbps");
+        assert!(
+            !args.iter().any(|a| a == "copy"),
+            "a transcode must NOT stream-copy"
+        );
+        // The cut invariants are the same ones a stream copy obeys.
+        let pos = |s: &str| args.iter().position(|x| x == s);
+        assert!(pos("-ss") < pos("-i"), "-ss must still precede -i");
+        assert!(pos("-to").is_none(), "-to must NEVER be used (2x-file bug)");
+        let t = pos("-t").expect("-t present");
+        assert_eq!(args[t + 1], "30.000000");
+        assert!(pair("-map", "0:a:0"), "still one audio stream only");
+        assert!(pair("-map_chapters", "-1"), "still drops chapters");
+        // .m4a output ⇒ the mp4-family faststart flag still applies.
+        assert!(pair("-movflags", "+faststart"));
+        assert_eq!(args.last().unwrap(), "out/001.m4a");
+    }
+
+    #[test]
+    fn mp3_transcode_keeps_a_xing_header() {
+        let args = strings(&build_encode_args(
+            Path::new("in.flac"),
+            Path::new("out/001.mp3"),
+            Some((0.0, 5.0)),
+            Encoding::Mp3,
+        ));
+        let pair = |a: &str, b: &str| args.windows(2).any(|w| w[0] == a && w[1] == b);
+        assert!(pair("-c:a", "libmp3lame"));
+        assert!(pair("-b:a", "128k"));
+        // Without a Xing/LAME header a client can't read the duration (TAD §5.4).
+        assert!(pair("-write_xing", "1"));
+        assert!(
+            !args.iter().any(|a| a == "-movflags"),
+            "no mp4-only flag on an .mp3 output"
+        );
+    }
+
+    #[test]
+    fn whole_file_transcode_emits_no_seek_or_duration() {
+        // The episode IS the whole file: a probed duration that is a hair short
+        // must not clip the ending, so neither -ss nor -t may appear.
+        let args = strings(&build_encode_args(
+            Path::new("in.flac"),
+            Path::new("out/001.m4a"),
+            None,
+            Encoding::Aac,
+        ));
+        assert!(!args.iter().any(|a| a == "-ss"), "no -ss for a whole file");
+        assert!(!args.iter().any(|a| a == "-t"), "no -t for a whole file");
+        assert!(!args.iter().any(|a| a == "-to"), "and never -to");
+        assert!(
+            args.windows(2).any(|w| w[0] == "-c:a" && w[1] == "aac"),
+            "still re-encodes"
+        );
+    }
+
+    #[test]
+    fn a_reencode_gets_the_longer_timeout() {
+        // A stream copy of one chapter is seconds; a whole-book re-encode is tens
+        // of minutes, so it must not run under the stream-copy bound.
+        assert_eq!(Encoding::Copy.timeout(), FFMPEG_TIMEOUT);
+        assert_eq!(Encoding::Aac.timeout(), TRANSCODE_TIMEOUT);
+        assert_eq!(Encoding::Mp3.timeout(), TRANSCODE_TIMEOUT);
+        assert!(TRANSCODE_TIMEOUT > FFMPEG_TIMEOUT);
+    }
+
+    #[test]
     fn tier2_output_omits_mp4_only_faststart() {
         // A .flac output must not carry the mp4-only -movflags option.
-        let args: Vec<String> =
-            build_ffmpeg_args(Path::new("in.flac"), Path::new("out/001.flac"), 0.0, 5.0)
-                .iter()
-                .map(|a| a.to_string_lossy().into_owned())
-                .collect();
+        let args: Vec<String> = strings(&build_encode_args(
+            Path::new("in.flac"),
+            Path::new("out/001.flac"),
+            Some((0.0, 5.0)),
+            Encoding::Copy,
+        ));
         assert!(args.iter().any(|a| a == "copy"), "still stream-copies");
         assert!(
             !args.iter().any(|a| a == "-movflags"),
