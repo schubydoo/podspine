@@ -918,7 +918,7 @@ fn resolve_book_overrides(source: &Path, library_root: &Path) -> BookOverrides {
 /// audio file or per-book subfolder. Slugs are collision-free and deterministic
 /// across re-scans; a single failing book is logged and skipped, never fatal.
 /// Collapse any set of index rows that share one source to a single row, keeping
-/// the lexicographically smallest id (the base `foo` over a suffixed `foo-2`) and
+/// the **earliest-created** row (the feed subscribers have held longest) and
 /// deleting the rest with their extracted output.
 ///
 /// This is the floor the rest of the identity logic stands on: **one source, one
@@ -935,34 +935,39 @@ fn resolve_book_overrides(source: &Path, library_root: &Path) -> BookOverrides {
 /// canonicalizable paths also means an unmounted library (every source missing)
 /// collapses nothing. Best-effort: a failed lookup leaves the index untouched.
 fn collapse_duplicate_source_rows(index: &Index, data_dir: &Path) {
-    let Ok(books) = index.list_books() else {
+    let Ok(identities) = index.book_source_identities() else {
         return;
     };
-    let mut ids_by_source: HashMap<PathBuf, Vec<String>> = HashMap::new();
-    for b in books {
-        if let Ok(real) = Path::new(&b.source_path).canonicalize() {
-            ids_by_source.entry(real).or_default().push(b.id);
-        }
-    }
-    for (_source, mut ids) in ids_by_source {
-        if ids.len() < 2 {
+    // `book_source_identities` is ordered oldest-first (created_at asc), so the
+    // FIRST row seen for a source is the earliest-created — the feed subscribers
+    // have held longest — and is the one to keep. Sorting by id instead would drop
+    // an established `foo-2` in favour of a `foo` a later bug duplicated, deleting
+    // the very feed people use (Greptile).
+    let mut kept_for_source: HashMap<PathBuf, String> = HashMap::new();
+    for (id, source_path, _created_at) in identities {
+        // A gone source is orphan-pruning's job; grouping only canonicalizable
+        // paths also means an unmounted library collapses nothing.
+        let Ok(real) = Path::new(&source_path).canonicalize() else {
             continue;
-        }
-        ids.sort();
-        let kept = &ids[0];
-        for dup in &ids[1..] {
-            let book_out = data_dir.join("books").join(dup);
-            if book_out.exists()
-                && let Err(err) = std::fs::remove_dir_all(&book_out)
-            {
-                tracing::warn!(error = %err, dir = %book_out.display(), "could not remove a duplicate book's output");
+        };
+        match kept_for_source.get(&real) {
+            None => {
+                kept_for_source.insert(real, id);
             }
-            match index.delete_book(dup) {
-                Ok(_) => {
-                    tracing::warn!(id = %dup, kept = %kept, "removed a duplicate feed row for one source")
+            Some(kept) => {
+                let book_out = data_dir.join("books").join(&id);
+                if book_out.exists()
+                    && let Err(err) = std::fs::remove_dir_all(&book_out)
+                {
+                    tracing::warn!(error = %err, dir = %book_out.display(), "could not remove a duplicate book's output");
                 }
-                Err(err) => {
-                    tracing::warn!(error = %err, id = %dup, "could not remove a duplicate feed row")
+                match index.delete_book(&id) {
+                    Ok(_) => {
+                        tracing::warn!(id = %id, kept = %kept, "removed a duplicate feed row for one source (kept the earliest)")
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, id = %id, "could not remove a duplicate feed row")
+                    }
                 }
             }
         }
@@ -3021,11 +3026,16 @@ mod tests {
             force_embedded: false,
             transcode: "off".into(),
         };
-        index.upsert_book(&row("book", "cap-book")).unwrap();
+        // The ESTABLISHED feed is the suffixed `book-2` (indexed first, so earlier
+        // created_at); the later duplicate is the base `book`. The survivor must be
+        // chosen by age, not by id — an id sort would delete the very feed
+        // subscribers use (Greptile). A few ms between inserts makes created_at
+        // distinct on any real clock.
         index.upsert_book(&row("book-2", "cap-book-2")).unwrap();
-        // Extracted output for both; only the survivor's should remain.
-        touch(&data.join("books/book/001.m4a"));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        index.upsert_book(&row("book", "cap-book")).unwrap();
         touch(&data.join("books/book-2/001.m4a"));
+        touch(&data.join("books/book/001.m4a"));
 
         collapse_duplicate_source_rows(&index, &data);
 
@@ -3037,16 +3047,16 @@ mod tests {
             .collect();
         assert_eq!(
             ids,
-            vec!["book"],
-            "the base id is kept, the suffixed dup deleted"
+            vec!["book-2"],
+            "the earliest-created row survives, whatever its id"
         );
         assert!(
-            data.join("books/book/001.m4a").exists(),
+            data.join("books/book-2/001.m4a").exists(),
             "survivor output kept"
         );
         assert!(
-            !data.join("books/book-2").exists(),
-            "duplicate output reclaimed"
+            !data.join("books/book").exists(),
+            "later duplicate output reclaimed"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
