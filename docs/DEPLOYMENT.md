@@ -135,7 +135,9 @@ Things worth knowing before you turn it on:
   `--data-dir`.
 - **Flipping the setting re-ingests the affected books** on the next scan (the
   container and every byte length change), with **no** change to episode GUIDs, so
-  subscribers don't re-download the rest of the feed. An `.m4a`/`.m4b` book is the
+  subscribers don't re-download the rest of the feed. The episodes in the previous
+  container are deleted as part of that re-ingest, so switching back and forth
+  doesn't pile up copies under `--data-dir`. An `.m4a`/`.m4b` book is the
   one exception: Podspine can't tell AAC from ALAC without re-probing, so an ALAC
   book keeps its existing episodes until its file changes — set `force_reingest =
   true` in its `.podspine.toml` to pick the new setting up immediately.
