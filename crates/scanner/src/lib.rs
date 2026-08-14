@@ -915,13 +915,19 @@ pub fn scan_library(
     let mut seen = HashSet::new();
     let mut summary = ScanSummary::default();
     for source in sources {
-        // Reserve a slug for every candidate in deterministic order so a book's
-        // slug is stable across re-scans regardless of siblings' outcomes.
-        let slug = unique_slug(&slugify(&source.base_name(&library_root)), &mut seen);
         let source_path = match &source {
             BookSource::File(p) => p.as_path(),
             BookSource::Mp3Folder(d) => d.as_path(),
         };
+        // Reserve a slug for every candidate in deterministic order so a book's
+        // slug is stable across re-scans regardless of siblings' outcomes — and
+        // never one a different, still-present book already holds.
+        let slug = assign_slug(
+            &slugify(&source.base_name(&library_root)),
+            source_path,
+            index,
+            &mut seen,
+        );
         let mut overrides = resolve_book_overrides(source_path, &library_root);
         // A nested book's filename is usually `Author -   - Title.m4b`; its folder
         // is just `Title`. Seed the title from the folder unless the book's own
@@ -1338,17 +1344,57 @@ fn classify_dir(dir: &Path) -> Vec<BookSource> {
 
 /// Reserve `base` if free, else `base-2`, `base-3`, … Inserts the chosen slug
 /// into `seen` and returns it.
-fn unique_slug(base: &str, seen: &mut HashSet<String>) -> String {
-    if seen.insert(base.to_string()) {
-        return base.to_string();
-    }
-    let mut n = 2;
+/// Choose this source's slug, which becomes its `book.id`.
+///
+/// Two constraints, both about not stealing an identity:
+///
+/// - unique within this scan, so two same-named books get `x` and `x-2`;
+/// - **never a slug the index already holds for a different source that still
+///   exists.** `upsert_book` preserves a book's capability `feed_id` per id, so
+///   handing an existing id to another file keeps the subscriber's URL alive and
+///   swaps the audiobook underneath it. That is the one failure this crate must
+///   never produce, and dedup within a single scan cannot see it: the colliding
+///   book may not be discovered until later in the same walk, or may not be
+///   rediscovered at all.
+///
+/// A row whose source no longer exists is fair game — that is a moved or renamed
+/// library, and the stale row is pruned in the same reconcile.
+fn assign_slug(base: &str, source: &Path, index: &Index, seen: &mut HashSet<String>) -> String {
+    let mut n = 1;
     loop {
-        let candidate = format!("{base}-{n}");
-        if seen.insert(candidate.clone()) {
+        let candidate = if n == 1 {
+            base.to_string()
+        } else {
+            format!("{base}-{n}")
+        };
+        // A candidate refused because someone else owns it is NOT consumed: the
+        // rightful owner is often discovered later in the same walk and must still
+        // be able to claim it. Consuming it here would push that book onto a fresh
+        // id — a new capability feed, and a stale row still serving the old one.
+        if !seen.contains(&candidate) && !owns_a_different_source(index, &candidate, source) {
+            seen.insert(candidate.clone());
             return candidate;
         }
         n += 1;
+    }
+}
+
+/// Whether `slug` is already an indexed book built from a *different* file that is
+/// still on disk. Index errors count as "not owned": a failed lookup must not
+/// rename every book in the library.
+fn owns_a_different_source(index: &Index, slug: &str, source: &Path) -> bool {
+    let Ok(Some(existing)) = index.get_book(slug) else {
+        return false;
+    };
+    let existing_path = Path::new(&existing.source_path);
+    if !existing_path.exists() {
+        return false;
+    }
+    // Compare canonically: the stored path is canonical, while a discovered one
+    // need not be (`/tmp` is a symlink to `/private/var` on macOS).
+    match (existing_path.canonicalize(), source.canonicalize()) {
+        (Ok(indexed), Ok(discovered)) => indexed != discovered,
+        _ => existing.source_path != source.to_string_lossy(),
     }
 }
 
@@ -2650,12 +2696,16 @@ mod tests {
     }
 
     #[test]
-    fn unique_slug_disambiguates_collisions() {
+    fn assign_slug_disambiguates_collisions() {
+        // With an empty index, assignment is pure within-scan deduplication.
+        let index = Index::open_in_memory().unwrap();
+        let path = Path::new("/library/whatever.m4b");
         let mut seen = HashSet::new();
-        assert_eq!(unique_slug("dracula", &mut seen), "dracula");
-        assert_eq!(unique_slug("dracula", &mut seen), "dracula-2");
-        assert_eq!(unique_slug("dracula", &mut seen), "dracula-3");
-        assert_eq!(unique_slug("other", &mut seen), "other");
+        let mut next = |base: &str| assign_slug(base, path, &index, &mut seen);
+        assert_eq!(next("dracula"), "dracula");
+        assert_eq!(next("dracula"), "dracula-2");
+        assert_eq!(next("dracula"), "dracula-3");
+        assert_eq!(next("other"), "other");
     }
 
     // ---- recursive library discovery ----
@@ -2818,6 +2868,105 @@ mod tests {
     /// book's capability feed id is preserved per id across re-scans — so a
     /// reordering hands each subscriber the *other* audiobook under the URL they
     /// already have. Root files and directories must stay interleaved by name.
+    /// A newly discovered file must not take the id of a book that already exists,
+    /// because `upsert_book` preserves the capability `feed_id` per id: the URL
+    /// would keep working and start serving a different audiobook. This is the
+    /// case a folder of several `.m4b` files opened up — its second file was never
+    /// discovered before, and its stem can collide with an existing book.
+    #[test]
+    fn a_new_file_cannot_take_a_live_books_slug() {
+        let root = scratch("slug-ownership");
+        let established = root.join("b.m4b");
+        touch(&established);
+        let newcomer = root.join("Shelf/b.m4b");
+        touch(&newcomer);
+
+        let index = Index::open_in_memory().unwrap();
+        index
+            .upsert_book(&BookRow {
+                id: "b".into(),
+                slug: "b".into(),
+                feed_id: "cap-b".into(),
+                title: "B".into(),
+                author: None,
+                cover_path: None,
+                source_path: established
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                source_mtime: 1,
+                status: "ready".into(),
+                storage_mode: String::new(),
+                default_cover_url: None,
+                force_embedded: false,
+                transcode: "off".into(),
+            })
+            .unwrap();
+
+        // The newcomer is refused the slug even though it is processed first.
+        let mut seen = HashSet::new();
+        assert_eq!(assign_slug("b", &newcomer, &index, &mut seen), "b-2");
+        // And the book that owns it still gets it.
+        assert_eq!(assign_slug("b", &established, &index, &mut seen), "b");
+
+        // A row whose file is gone is a moved or renamed library, not a conflict:
+        // its id is free, and the stale row is pruned in the same reconcile.
+        std::fs::remove_file(&established).unwrap();
+        let mut seen = HashSet::new();
+        assert_eq!(assign_slug("b", &newcomer, &index, &mut seen), "b");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_broken_link_is_skipped_rather_than_indexed() {
+        // `canonicalize` fails on a dangling link, which must not be treated as
+        // "inside the library" — nor panic the scan.
+        let root = scratch("discover-broken-link");
+        touch(&root.join("Author/Real/real.m4b"));
+        let dangling_dir = root.join("Author/Dangling");
+        std::fs::create_dir_all(&dangling_dir).unwrap();
+        std::os::unix::fs::symlink(
+            root.join("nothing-here.m4b"),
+            dangling_dir.join("dangling.m4b"),
+        )
+        .unwrap();
+
+        let found = discover(&root, &root.join("data"));
+        assert_eq!(
+            found,
+            vec![BookSource::File(root.join("Author/Real/real.m4b"))]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_directory_costs_one_book_not_the_scan() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("discover-unreadable");
+        touch(&root.join("Author/Readable/ok.m4b"));
+        let locked = root.join("Author/Locked");
+        touch(&locked.join("hidden.m4b"));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let found = discover(&root, &root.join("data"));
+        // Running as root defeats the permission bits; skip rather than fail.
+        if std::fs::read_dir(&locked).is_ok() {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let _ = std::fs::remove_dir_all(&root);
+            skip!("running as root, permissions are not enforced");
+        }
+        assert_eq!(
+            found,
+            vec![BookSource::File(root.join("Author/Readable/ok.m4b"))],
+            "an unreadable directory must not abort the walk"
+        );
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn root_files_and_directories_keep_their_historical_order() {
         let root = scratch("discover-order");
@@ -2840,10 +2989,17 @@ mod tests {
             "directories must not be pushed behind every root file"
         );
 
+        let index = Index::open_in_memory().unwrap();
         let mut seen = HashSet::new();
         let slugs: Vec<String> = found
             .iter()
-            .map(|s| unique_slug(&slugify(&s.base_name(&root)), &mut seen))
+            .map(|s| {
+                let p = match s {
+                    BookSource::File(p) => p.as_path(),
+                    BookSource::Mp3Folder(d) => d.as_path(),
+                };
+                assign_slug(&slugify(&s.base_name(&root)), p, &index, &mut seen)
+            })
             .collect();
         // `Dracula/inner.m4b` keeps `inner`; the folder book and the root file do not
         // trade ids.
@@ -2957,10 +3113,17 @@ mod tests {
         touch(&root.join("Author One/Dracula/dracula.m4b"));
         touch(&root.join("Author Two/Dracula/dracula.m4b"));
 
+        let index = Index::open_in_memory().unwrap();
         let mut seen = HashSet::new();
         let slugs: Vec<String> = discover(&root, &root.join("data"))
             .iter()
-            .map(|s| unique_slug(&slugify(&s.base_name(&root)), &mut seen))
+            .map(|s| {
+                let p = match s {
+                    BookSource::File(p) => p.as_path(),
+                    BookSource::Mp3Folder(d) => d.as_path(),
+                };
+                assign_slug(&slugify(&s.base_name(&root)), p, &index, &mut seen)
+            })
             .collect();
         // Not `dracula` and `dracula-2`, whose assignment would hinge on walk order.
         assert_eq!(slugs, vec!["author-one-dracula", "author-two-dracula"]);
@@ -2973,7 +3136,9 @@ mod tests {
         // audio files in numbered folders, so a naive walk would index podspine's
         // own output as books and re-split it.
         let root = scratch("discover-datadir");
-        let data = root.join(".podspine");
+        // Deliberately NOT a dot-directory: those are skipped by name, which would
+        // let this test pass without the data-dir guard ever running.
+        let data = root.join("podspine-data");
         touch(&root.join("Author/Title/book.m4b"));
         touch(&data.join("books/author-title/001.m4a"));
         touch(&data.join("books/author-title/002.m4a"));

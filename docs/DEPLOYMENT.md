@@ -163,7 +163,10 @@ library/
 ```
 
 - **A folder holding several `.m4b`/`.m4a` files is several books** — one file is
-  one whole audiobook. A folder of several `.mp3` files is the opposite: one book,
+  one whole audiobook. A book already in the index keeps its slug: a newly
+  discovered file never takes an id that another book, whose file is still there,
+  already holds (it gets a `-2` suffix instead). That id is what a feed URL is
+  built from. A folder of several `.mp3` files is the opposite: one book,
   its tracks in order.
 - **A book folder is not descended into.** The first level with audio wins, so a
   book's own `extras/` folder is never ingested as another book. The trade: in a
