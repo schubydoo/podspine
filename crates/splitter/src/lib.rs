@@ -734,12 +734,15 @@ mod tests {
     /// encoder for the format the test needs.
     ///
     /// The `eprintln!` and the `return` live here, once, instead of at every call
-    /// site. Wherever ffmpeg IS installed — CI, most dev machines — those two lines
-    /// are unreachable, and 60-odd copies of them dominated the uncovered-line
-    /// count on PR 152 (35 of the 56 lines in that diff). Whether that count now
-    /// collapses depends on llvm-cov attributing a `macro_rules!` body to its
-    /// definition rather than to each expansion; the call site itself always
-    /// executes, so the tests read the same either way.
+    /// site. Wherever ffmpeg IS installed — CI, most dev machines — they cannot
+    /// execute, and 62 copies of them dominated the uncovered-line count (35 of the
+    /// 56 lines in PR 152's diff).
+    ///
+    /// Measured, not assumed: llvm-cov attributes a macro body to each **expansion**,
+    /// not to the definition, so a call site still reports one unreachable line —
+    /// one instead of two, which took 63 lines off the report (scanner 158 → 105
+    /// misses, splitter 45 → 35). One line per skip is the floor for deciding at
+    /// runtime; something has to stand for "this didn't run".
     macro_rules! skip {
         ($($why:tt)*) => {{
             eprintln!("skipping: {}", format_args!($($why)*));
