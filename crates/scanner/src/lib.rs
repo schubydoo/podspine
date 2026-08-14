@@ -604,12 +604,13 @@ fn scan_mp3_folder(
     data_dir: &Path,
     index: &Index,
     overrides: &BookOverrides,
+    library_root: &Path,
 ) -> Result<BookRow, ScanError> {
     // Canonicalize the folder so every track path stored below is absolute and
     // symlink-resolved — in-place serving must not depend on the server's cwd.
     let dir_canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     let dir = dir_canonical.as_path();
-    let files = collect_mp3s(dir);
+    let files = collect_mp3s(dir, library_root);
     if files.is_empty() {
         return Err(ScanError::EmptyFolder(dir.to_path_buf()));
     }
@@ -754,7 +755,7 @@ fn order_mp3_tracks(tracks: &mut [Mp3Track], dir: &Path) {
 }
 
 /// Collect the top-level `.mp3` files in `dir` (unordered; the caller sorts).
-fn collect_mp3s(dir: &Path) -> Vec<PathBuf> {
+fn collect_mp3s(dir: &Path, library_root: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -762,6 +763,24 @@ fn collect_mp3s(dir: &Path) -> Vec<PathBuf> {
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.is_file() && ext_lower(p).as_deref() == Some("mp3"))
+        // A track can itself be a symlink out of the library even when its folder
+        // is inside it — `source_is_inside` only vetted the folder. Such a track
+        // would be indexed into the feed and then 404 at serve time, because the
+        // http layer canonicalizes each enclosure and refuses anything outside the
+        // library root. Drop it here, loudly (Greptile).
+        .filter(|p| {
+            match p.canonicalize() {
+                Ok(real) if real.starts_with(library_root) => true,
+                Ok(real) => {
+                    tracing::warn!(track = %p.display(), target = %real.display(), "skipping an MP3 track that links outside the library");
+                    false
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, track = %p.display(), "skipping an unreadable MP3 track");
+                    false
+                }
+            }
+        })
         .collect()
 }
 
@@ -961,7 +980,7 @@ pub fn scan_library(
                 }
             }
             BookSource::Mp3Folder(dir) => {
-                match scan_mp3_folder(&dir, &slug, data_dir, index, &overrides) {
+                match scan_mp3_folder(&dir, &slug, data_dir, index, &overrides, &library_root) {
                     Ok(book) => {
                         summary.indexed += 1;
                         tracing::info!(slug = %book.slug, title = %book.title, "indexed MP3-folder book");
@@ -1379,20 +1398,31 @@ fn assign_slug(base: &str, source: &Path, index: &Index, seen: &mut HashSet<Stri
     }
 }
 
-/// Whether `slug` is already an indexed book built from a *different* file that is
-/// still on disk. Index errors count as "not owned": a failed lookup must not
-/// rename every book in the library.
+/// Whether `slug` is an indexed book built from a *different* file than `source`.
+///
+/// Existence of that book's file is deliberately NOT consulted. An earlier version
+/// freed the id when the stored source was gone (to let a moved book reclaim it),
+/// but that reopened the exact theft this guard exists to stop: a newcomer sorting
+/// before a moved book's new location would inherit the vacated id — and its
+/// preserved capability feed — while the moved book was pushed onto a fresh feed
+/// (Greptile). There is no content identity to tell "the moved book" from "a
+/// different book of the same name" apart, so the safe rule is uniform: a live
+/// index row owns its id until [`prune_orphans`] retires it, one reconcile later.
+/// A book therefore keeps its feed across an in-place re-ingest (same path) but not
+/// across a move — the same feed-rotates-on-rename contract the flat scanner had.
+///
+/// Index errors count as "not owned": a failed lookup must not rename every book.
 fn owns_a_different_source(index: &Index, slug: &str, source: &Path) -> bool {
     let Ok(Some(existing)) = index.get_book(slug) else {
         return false;
     };
-    let existing_path = Path::new(&existing.source_path);
-    if !existing_path.exists() {
-        return false;
-    }
-    // Compare canonically: the stored path is canonical, while a discovered one
-    // need not be (`/tmp` is a symlink to `/private/var` on macOS).
-    match (existing_path.canonicalize(), source.canonicalize()) {
+    // Compare canonically where both resolve (the stored path is canonical, a
+    // discovered one need not be — `/tmp` is a symlink to `/private/var` on macOS);
+    // fall back to the raw strings when the stored file is gone.
+    match (
+        Path::new(&existing.source_path).canonicalize(),
+        source.canonicalize(),
+    ) {
         (Ok(indexed), Ok(discovered)) => indexed != discovered,
         _ => existing.source_path != source.to_string_lossy(),
     }
@@ -1602,8 +1632,15 @@ mod tests {
         let index = Index::open_in_memory().unwrap();
         let data = dir.join("data");
 
-        let err = scan_mp3_folder(&dir, "book-id", &data, &index, &BookOverrides::default())
-            .expect_err("a folder with no mp3s must not scan");
+        let err = scan_mp3_folder(
+            &dir,
+            "book-id",
+            &data,
+            &index,
+            &BookOverrides::default(),
+            &dir,
+        )
+        .expect_err("a folder with no mp3s must not scan");
 
         assert!(matches!(err, ScanError::EmptyFolder(_)), "got {err:?}");
     }
@@ -2910,12 +2947,40 @@ mod tests {
         // And the book that owns it still gets it.
         assert_eq!(assign_slug("b", &established, &index, &mut seen), "b");
 
-        // A row whose file is gone is a moved or renamed library, not a conflict:
-        // its id is free, and the stale row is pruned in the same reconcile.
+        // Even when the owner's file is gone (a move), the live index row still
+        // holds the id — a newcomer must NOT inherit its capability feed. The row
+        // is retired by `prune_orphans` in the same reconcile, freeing the id for a
+        // LATER scan; within this one, the newcomer stays on `b-2`.
         std::fs::remove_file(&established).unwrap();
         let mut seen = HashSet::new();
-        assert_eq!(assign_slug("b", &newcomer, &index, &mut seen), "b");
+        assert_eq!(assign_slug("b", &newcomer, &index, &mut seen), "b-2");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_mp3_track_that_links_outside_the_library_is_dropped() {
+        // The folder is inside the library, but a track within it symlinks out.
+        // `source_is_inside` only vetted the folder, so the track has to be caught
+        // where the tracks are gathered, or it 404s at serve time.
+        let outside = scratch("mp3-outside");
+        std::fs::write(outside.join("external.mp3"), b"x").unwrap();
+
+        let root = scratch("mp3-escape");
+        let folder = root.join("A Book");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("01.mp3"), b"x").unwrap();
+        std::os::unix::fs::symlink(outside.join("external.mp3"), folder.join("02.mp3")).unwrap();
+
+        let real_root = root.canonicalize().unwrap();
+        let tracks = collect_mp3s(&folder.canonicalize().unwrap(), &real_root);
+        let names: Vec<String> = tracks
+            .iter()
+            .map(|t| t.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["01.mp3"], "the escaping track must be dropped");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[cfg(unix)]
