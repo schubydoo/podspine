@@ -393,6 +393,14 @@ async fn audio(
     Path((feed_id, number)): Path<(String, u32)>,
     range: Option<TypedHeader<Range>>,
 ) -> Result<impl IntoResponse, AppError> {
+    // The row is snapshotted under the index lock inside the resolver and the lock
+    // is released before any file I/O. A re-ingest that moves this book into
+    // another container (a transcode flag or target flip) can therefore replace the
+    // rows and sweep the old file between that snapshot and the `File::open` below.
+    // Every step from here fails closed, so the request 404s and the client
+    // retries — it can never be served partial or stale-length bytes. See the note
+    // at the sweep in `podspine_scanner::scan_book_as` for why that microsecond
+    // window is left unguarded.
     let target = resolve_audio_target(&state, &feed_id, number)?;
     // A missing file is regenerated on demand when the resolver supplied a `Regen`
     // (a `saver` chapter split, or a faststart remux of a whole-file episode);
@@ -485,6 +493,18 @@ fn build_feed_xml(state: &AppState, feed_id: &str) -> Result<String, AppError> {
 /// Whether a book's effective storage mode is `saver`: its per-book
 /// `.podspine.toml` override (Sprint 6.4) if set, else the server default. An
 /// empty string is a pre-6.4 row that follows the server config until re-scanned.
+/// Whether this book's episodes were **re-encoded** at ingest (Task 5.2).
+///
+/// A re-encode is not byte-reproducible across ffmpeg builds, so such an episode
+/// must never be regenerated on demand (the rebuilt file's length could no longer
+/// match the `enclosure length` already published in the feed) and must never be
+/// evicted (nothing could rebuild it). Both callers below therefore treat a
+/// transcoded book as `full`, whatever its `storage_mode` says. `""` is a pre-5.2
+/// row, which was necessarily stream-copied.
+fn book_is_transcoded(book: &BookRow) -> bool {
+    !matches!(book.transcode.as_str(), "" | "off")
+}
+
 fn book_is_saver(book: &BookRow, global_saver: bool) -> bool {
     match book.storage_mode.as_str() {
         "saver" => true,
@@ -534,7 +554,8 @@ enum RegenOp {
 ///   canonical `data_dir` plus **opaque DB keys** (`book.id`, chapter index) and a
 ///   validated audio extension — never built from request input — so it stays
 ///   under the data dir by construction (no traversal). In `saver` mode it's
-///   regenerated on demand ([`RegenOp::Chapter`]); existence is not required.
+///   regenerated on demand ([`RegenOp::Chapter`]); existence is not required —
+///   unless the book was transcoded (Task 5.2), which is never regenerated.
 fn resolve_audio_target(
     state: &AppState,
     feed_id: &str,
@@ -651,7 +672,10 @@ fn resolve_audio_target(
                 duration_sec: ep.duration_sec,
             },
         })
-    } else if book_is_saver(&book, state.saver) && FsPath::new(&book.source_path).is_file() {
+    } else if book_is_saver(&book, state.saver)
+        && !book_is_transcoded(&book)
+        && FsPath::new(&book.source_path).is_file()
+    {
         // A chaptered episode. Regen is possible only in `saver` mode (per-book,
         // Sprint 6.4) when the book's source is a single file to re-split; the
         // `is_file` guard is belt-and-suspenders (a directory source would make
@@ -761,9 +785,10 @@ async fn enforce_cache(state: &AppState, keep: &FsPath) {
         return; // unbounded + no TTL: nothing to evict
     }
     let books = state.data_dir.join("books");
-    // Evict only from **effective-`saver`, single-file-source** books (per-book
-    // storage_mode, Sprint 6.4): their cached chapters re-split on demand, so
-    // deleting one is safe. A `full` book's chapters are kept — evicting them
+    // Evict only from **effective-`saver`, single-file-source, stream-copied**
+    // books (per-book storage_mode, Sprint 6.4): their cached chapters re-split on
+    // demand, so deleting one is safe. A transcoded book (Task 5.2) is excluded —
+    // nothing regenerates a re-encode, so evicting it would 404 until a rescan. A `full` book's chapters are kept — evicting them
     // would 404 (no regen) — and a non-single-file book (MP3 folder) is served in
     // place, so those dirs are left alone. (A `full` book's remux cache, if any,
     // therefore persists — a minor, safe over-conservatism.) Snapshot the sources
@@ -776,8 +801,9 @@ async fn enforce_cache(state: &AppState, keep: &FsPath) {
             Ok(bs) => bs
                 .into_iter()
                 .map(|b| {
-                    let regen =
-                        book_is_saver(&b, state.saver) && FsPath::new(&b.source_path).is_file();
+                    let regen = book_is_saver(&b, state.saver)
+                        && !book_is_transcoded(&b)
+                        && FsPath::new(&b.source_path).is_file();
                     (b.id, regen)
                 })
                 .collect(),
@@ -955,6 +981,7 @@ mod tests {
             storage_mode: mode.into(),
             default_cover_url: None,
             force_embedded: false,
+            transcode: String::new(),
         };
         // An explicit per-book mode wins regardless of the server default.
         assert!(book_is_saver(&mk("saver"), false));
@@ -962,6 +989,33 @@ mod tests {
         // An empty mode (a pre-6.4 row) follows the server default.
         assert!(book_is_saver(&mk(""), true));
         assert!(!book_is_saver(&mk(""), false));
+    }
+
+    #[test]
+    fn a_transcoded_book_is_never_treated_as_regenerable() {
+        let mk = |storage: &str, transcode: &str| BookRow {
+            id: "b".into(),
+            slug: "b".into(),
+            feed_id: "cap".into(),
+            title: "T".into(),
+            author: None,
+            cover_path: None,
+            source_path: "/x".into(),
+            source_mtime: 0,
+            status: "ready".into(),
+            storage_mode: storage.into(),
+            default_cover_url: None,
+            force_embedded: false,
+            transcode: transcode.into(),
+        };
+        // A re-encode can't be rebuilt byte-for-byte, so `saver` must not apply.
+        assert!(book_is_transcoded(&mk("saver", "aac")));
+        assert!(book_is_transcoded(&mk("saver", "mp3")));
+        // Stream-copied books (and pre-5.2 rows) stay regenerable.
+        assert!(!book_is_transcoded(&mk("saver", "off")));
+        assert!(!book_is_transcoded(&mk("saver", "")));
+        // The two predicates compose: still a saver book, but not a regenerable one.
+        assert!(book_is_saver(&mk("saver", "aac"), false));
     }
 
     #[test]

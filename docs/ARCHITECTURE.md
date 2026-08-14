@@ -88,6 +88,20 @@ depends on whether it is a whole source file or a sub-range of a container:
   `PODSPINE_REMUX_NON_FASTSTART` is on, the handler instead serves a faststart
   **remux** regenerated on demand into the cache (`file_path != source_path`) —
   Sprint 6.3; otherwise it logs a callout and serves in place.
+- **Transcoded episode** (Task 5.2, `PODSPINE_TRANSCODE=aac|mp3`) — a source whose
+  codec no podcatcher can be relied on to play (FLAC/Vorbis/Opus/ALAC) is
+  **re-encoded** at ingest instead of stream-copied, and `book.transcode` records
+  the mode. Such a book is always materialized under `<data_dir>` — never served in
+  place, never regenerated on demand, never evicted — because a re-encode is not
+  byte-reproducible across ffmpeg builds and its `enclosure length` is already
+  published. MP3/AAC sources are always stream-copied.
+
+Every produced episode (a split, a transcode) is written to a `NNN.part.<ext>`
+sibling and **renamed into place**, so a request that arrives mid-encode is served
+the previous complete file rather than a truncated one, and a failed encode leaves
+the published episode and its recorded length untouched. A re-ingest that changes
+the container also deletes the episodes in the old one, so a mode change can't
+strand a full copy of the book under `<data_dir>`.
 - **Chaptered episode** — a sub-range of a container — must be **extracted** under
   `<data_dir>` (a raw byte range of an `.m4b` isn't a standalone file). In `full`
   mode (default) every chapter is pre-split at ingest and kept; in `saver` mode

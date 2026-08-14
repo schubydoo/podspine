@@ -114,6 +114,12 @@ disk (not ingest time) for a small first-play delay. So budget extra space for
 chaptered libraries; whole-file libraries cost only their index and covers. Full
 details: **[storage mode](docs/DEPLOYMENT.md#storage-mode-full-vs-saver)**.
 
+**FLAC, Ogg, Opus or ALAC books?** Most podcast apps refuse to play them.
+Podspine is copy-first, so by default it serves them as-is; set
+`PODSPINE_TRANSCODE=aac` to re-encode just those books to AAC 128k at ingest
+(MP3/AAC sources are never touched) — see
+**[transcoding](docs/DEPLOYMENT.md#transcoding-oddball-formats-podspine_transcode)**.
+
 A whole-file `.m4a`/`.m4b` that isn't "faststart" plays fine but seeks slowly;
 Podspine flags it at ingest, and `PODSPINE_REMUX_NON_FASTSTART=true` will remux it
 to faststart on demand (cache-managed, no re-encode) — see

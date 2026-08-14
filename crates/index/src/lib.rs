@@ -52,7 +52,8 @@ CREATE TABLE IF NOT EXISTS book (
     status       TEXT NOT NULL,
     storage_mode TEXT NOT NULL DEFAULT '',
     default_cover_url TEXT,
-    force_embedded INTEGER NOT NULL DEFAULT 0
+    force_embedded INTEGER NOT NULL DEFAULT 0,
+    transcode    TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS episode (
     guid          TEXT PRIMARY KEY,
@@ -104,6 +105,11 @@ pub struct BookRow {
     /// override). Persisted only so a scan can detect a toggle and re-ingest;
     /// not read at serve time.
     pub force_embedded: bool,
+    /// Effective transcode mode at last ingest (`""`/`"off"`/`"aac"`/`"mp3"`,
+    /// Task 5.2). Persisted only so a scan can detect a `PODSPINE_TRANSCODE`
+    /// toggle — which changes the episode container and every `byte_length` — and
+    /// re-ingest the book; not read at serve time. `""` is a pre-5.2 row.
+    pub transcode: String,
 }
 
 /// One episode (a split chapter). Numeric fields are stored as SQLite integers.
@@ -262,6 +268,20 @@ impl Index {
                 [],
             )?;
         }
+        // `book.transcode` (opt-in re-encoding, Task 5.2). Existing rows default
+        // to `''` — "unknown, pre-5.2" — which a scan treats as "not transcoded",
+        // matching how every pre-5.2 book was actually produced.
+        let has_book_transcode: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('book') WHERE name = 'transcode'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_book_transcode == 0 {
+            conn.execute(
+                "ALTER TABLE book ADD COLUMN transcode TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -274,14 +294,14 @@ impl Index {
     pub fn upsert_book(&self, b: &BookRow) -> Result<(), IndexError> {
         self.conn.execute(
             "INSERT INTO book
-               (id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status, storage_mode, default_cover_url, force_embedded)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+               (id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status, storage_mode, default_cover_url, force_embedded, transcode)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(id) DO UPDATE SET
                slug=excluded.slug, title=excluded.title, author=excluded.author,
                cover_path=excluded.cover_path, source_path=excluded.source_path,
                source_mtime=excluded.source_mtime, status=excluded.status,
                storage_mode=excluded.storage_mode, default_cover_url=excluded.default_cover_url,
-               force_embedded=excluded.force_embedded",
+               force_embedded=excluded.force_embedded, transcode=excluded.transcode",
             params![
                 b.id,
                 b.slug,
@@ -295,6 +315,7 @@ impl Index {
                 b.storage_mode,
                 b.default_cover_url,
                 b.force_embedded,
+                b.transcode,
             ],
         )?;
         Ok(())
@@ -334,7 +355,7 @@ impl Index {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status, storage_mode, default_cover_url, force_embedded
+                "SELECT id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status, storage_mode, default_cover_url, force_embedded, transcode
                  FROM book WHERE id = ?1",
                 [id],
                 book_from_row,
@@ -347,7 +368,7 @@ impl Index {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status, storage_mode, default_cover_url, force_embedded
+                "SELECT id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status, storage_mode, default_cover_url, force_embedded, transcode
                  FROM book WHERE slug = ?1",
                 [slug],
                 book_from_row,
@@ -358,7 +379,7 @@ impl Index {
     /// All books, ordered by title.
     pub fn list_books(&self) -> Result<Vec<BookRow>, IndexError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status, storage_mode, default_cover_url, force_embedded
+            "SELECT id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status, storage_mode, default_cover_url, force_embedded, transcode
              FROM book ORDER BY title",
         )?;
         let rows = stmt.query_map([], book_from_row)?;
@@ -382,7 +403,7 @@ impl Index {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status, storage_mode, default_cover_url, force_embedded
+                "SELECT id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status, storage_mode, default_cover_url, force_embedded, transcode
                  FROM book WHERE feed_id = ?1",
                 [feed_id],
                 book_from_row,
@@ -438,6 +459,7 @@ fn book_from_row(row: &Row) -> rusqlite::Result<BookRow> {
         storage_mode: row.get(9)?,
         default_cover_url: row.get(10)?,
         force_embedded: row.get(11)?,
+        transcode: row.get(12)?,
     })
 }
 
@@ -475,6 +497,7 @@ mod tests {
             storage_mode: String::new(),
             default_cover_url: None,
             force_embedded: false,
+            transcode: String::new(),
         }
     }
 
@@ -642,6 +665,11 @@ mod tests {
             idx.get_book_by_feed_id("cap-b1").unwrap().unwrap().id,
             "b1",
             "capability feed_id preserved across migration"
+        );
+        let book = idx.get_book("b1").unwrap().unwrap();
+        assert_eq!(
+            book.transcode, "",
+            "migrated rows default to an empty transcode mode (pre-5.2, not transcoded)"
         );
 
         // Idempotent: reopening an already-migrated DB is a no-op.

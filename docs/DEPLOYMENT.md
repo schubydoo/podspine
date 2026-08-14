@@ -27,6 +27,7 @@ that precedence. The library path is the only required input.
 | `--cache-size` | `PODSPINE_CACHE_SIZE` | `2GB` | `saver` only: cache cap (`2GB`, `500MB`; `0`/`off` = unbounded). |
 | `--cache-ttl` | `PODSPINE_CACHE_TTL` | off | `saver` only: evict chapters unplayed this long (`30d`, `12h`; `off` = size-only). |
 | `--remux-non-faststart` | `PODSPINE_REMUX_NON_FASTSTART` | off | Remux a non-faststart whole-file mp4 to faststart on demand (cache-managed). See below. |
+| `--transcode` | `PODSPINE_TRANSCODE` | `off` | Re-encode sources podcatchers can't play (FLAC/Ogg/Opus/ALAC) to `aac` or `mp3`. MP3/AAC sources are never re-encoded. See below. |
 | `--metrics-bind` | `PODSPINE_METRICS_BIND` | off | Serve Prometheus metrics on this *separate* address (`127.0.0.1:9090`). See below. |
 | `--config` | `PODSPINE_CONFIG` | none | Path to a TOML config file. |
 
@@ -97,6 +98,53 @@ chapter, **not** a pinned second copy. The default is **off** because in-place
 serving costs no disk; enable it if slow seeking on those books bothers you and
 you can spare the cache. (A faststart mp4, or any non-mp4, is left untouched.)
 
+### Transcoding oddball formats (`PODSPINE_TRANSCODE`)
+
+Podspine is **copy-first**: every episode is a stream copy of the source, so no
+quality is lost and a split costs almost no CPU. That works because MP3 and AAC
+(`.mp3`, `.m4a`/`.m4b`) play in every podcast app. FLAC, Ogg Vorbis, Opus and ALAC
+do **not** — Apple Podcasts and Overcast, among others, simply refuse them.
+
+Set `PODSPINE_TRANSCODE=aac` (or `mp3`) to re-encode those sources at ingest:
+
+```bash
+PODSPINE_TRANSCODE=aac
+```
+
+- **`off` (default)** — nothing is ever re-encoded; a FLAC book is served as FLAC.
+- **`aac`** — non-podcast-safe sources become AAC 128 kbps in `.m4a`. The right
+  choice for almost everyone: it's what M4B audiobooks already are.
+- **`mp3`** — MP3 128 kbps instead, for a client that still chokes on AAC. Needs
+  an ffmpeg built with `libmp3lame` (the bundled Docker image has one).
+
+Things worth knowing before you turn it on:
+
+- **MP3 and AAC sources are never touched**, whatever this is set to — they
+  already play everywhere, and re-encoding them would only lose quality.
+- **Ingest gets much slower** for the affected books: a re-encode is CPU-bound
+  where a stream copy is not. Expect minutes per book rather than seconds, more on
+  a Raspberry Pi. It happens once, at ingest, under the same concurrency limit as
+  every other ffmpeg job.
+- **A transcoded book is always stored `full`**, even under
+  `PODSPINE_STORAGE_MODE=saver`, and it is never evicted from the cache. A
+  re-encode is not reproducible byte-for-byte across ffmpeg versions, so a
+  regenerated chapter could no longer match the `enclosure length` already
+  published in the feed. Budget disk for those books as if `saver` were off.
+- **A chapterless FLAC/Ogg book stops being served in place** for the same
+  reason — the bytes clients receive are the re-encoded ones, which live under
+  `--data-dir`.
+- **Flipping the setting re-ingests the affected books** on the next scan (the
+  container and every byte length change), with **no** change to episode GUIDs, so
+  subscribers don't re-download the rest of the feed. The episodes in the previous
+  container are deleted as part of that re-ingest, so switching back and forth
+  doesn't pile up copies under `--data-dir`. An `.m4a`/`.m4b` book is the
+  one exception: Podspine can't tell AAC from ALAC without re-probing, so an ALAC
+  book keeps its existing episodes until its file changes — set `force_reingest =
+  true` in its `.podspine.toml` to pick the new setting up immediately.
+
+Prefer converting the files yourself if you care about the encoder settings; this
+flag exists so a library you'd rather not touch still plays.
+
 ## Per-book overrides (`.podspine.toml`)
 
 Any of the per-book-meaningful settings above can be overridden for **one book**
@@ -131,8 +179,9 @@ title = "The Correct Title"
 ```
 
 Server-wide keys (`bind`, `base_url`, `library`, `data_dir`, `cache_size`,
-`cache_ttl`, …) are **ignored with a log warning** if they appear in a per-book
-file — they only make sense server-wide. An unparseable sidecar is logged and
+`cache_ttl`, `transcode`, …) are **ignored with a log warning** if they appear in a
+per-book file — they only make sense server-wide. (`transcode` is server-wide for
+now: it is decided from the source codec, so a per-book key would buy little.) An unparseable sidecar is logged and
 skipped for that book; it never aborts the scan.
 
 ## Exposing Podspine safely

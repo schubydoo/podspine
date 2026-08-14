@@ -11,7 +11,9 @@ use tower::ServiceExt;
 
 use podspine_http::{AppState, router};
 use podspine_index::{BookRow, EpisodeRow, Index};
-use podspine_scanner::{BookOverrides, scan_book, scan_book_as, scan_library};
+use podspine_scanner::{
+    BookOverrides, ScanOptions, TranscodeMode, scan_book, scan_book_as, scan_library,
+};
 
 /// A minimal ready book row. Tests that need a *poisoned* row build it directly
 /// rather than scanning: the guards under test exist for rows the scanner would
@@ -31,6 +33,7 @@ fn book_row(id: &str, feed_id: &str) -> BookRow {
         storage_mode: String::new(),
         default_cover_url: None,
         force_embedded: false,
+        transcode: String::new(),
     }
 }
 
@@ -89,6 +92,38 @@ fn synth_three_chapters(dir: &Path) -> PathBuf {
         .expect("spawn ffmpeg");
     assert!(status.success(), "ffmpeg synth failed");
     input
+}
+
+/// Synthesize a two-chapter FLAC (chapters via a `.cue` sidecar — embedded FLAC
+/// chapters carry no titles). `None` when this ffmpeg has no FLAC encoder.
+fn synth_flac_with_cue(dir: &Path) -> Option<PathBuf> {
+    let input = dir.join("book.flac");
+    let ok = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=20",
+            "-c:a",
+            "flac",
+        ])
+        .arg(&input)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        return None;
+    }
+    std::fs::write(
+        input.with_extension("cue"),
+        "TRACK 01 AUDIO\n  TITLE \"One\"\n  INDEX 01 00:00:00\n\
+         TRACK 02 AUDIO\n  TITLE \"Two\"\n  INDEX 01 00:10:00\n",
+    )
+    .unwrap();
+    Some(input)
 }
 
 async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
@@ -206,9 +241,10 @@ async fn saver_mode_regenerates_a_chapter_on_demand() {
         "saverbook",
         &data,
         &index,
-        false,
-        true,
-        false,
+        ScanOptions {
+            saver: true,
+            ..Default::default()
+        },
         &BookOverrides::default(),
     )
     .unwrap();
@@ -291,9 +327,10 @@ async fn saver_cache_evicts_over_the_size_cap() {
         "evictbook",
         &data,
         &index,
-        false,
-        true,
-        false,
+        ScanOptions {
+            saver: true,
+            ..Default::default()
+        },
         &BookOverrides::default(),
     )
     .unwrap();
@@ -635,9 +672,10 @@ async fn serves_a_remuxed_faststart_copy_on_demand() {
         "remuxbook",
         &data,
         &index,
-        false,
-        false,
-        true,
+        ScanOptions {
+            remux_non_faststart: true,
+            ..Default::default()
+        },
         &BookOverrides::default(),
     )
     .unwrap();
@@ -736,7 +774,7 @@ async fn per_book_saver_serves_even_when_server_is_full() {
 
     let index = Index::open_in_memory().unwrap();
     // Global full (saver = false); the sidecar forces this one book to saver.
-    scan_library(&library, &data, &index, false, false, false);
+    scan_library(&library, &data, &index, ScanOptions::default());
     let books = index.list_books().unwrap();
     assert_eq!(books.len(), 1);
     assert_eq!(books[0].storage_mode, "saver", "per-book saver persisted");
@@ -875,9 +913,10 @@ async fn remux_source_outside_the_library_is_a_404() {
         "rmx",
         &data,
         &index,
-        false,
-        false,
-        true,
+        ScanOptions {
+            remux_non_faststart: true,
+            ..Default::default()
+        },
         &BookOverrides::default(),
     )
     .unwrap();
@@ -1462,5 +1501,103 @@ async fn saver_source_inside_the_library_still_serves() {
 
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(body_bytes(resp).await, b"cached chapter bytes");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Task 5.2 end-to-end: with transcoding on, a FLAC book serves as AAC/`audio/mp4`
+/// — and even on a `saver` server its episodes are neither regenerated nor evicted
+/// (a re-encode can't be rebuilt byte-for-byte), so what the feed advertises is
+/// exactly what a client gets.
+#[tokio::test]
+async fn transcoded_flac_book_serves_as_aac_and_is_never_evicted() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+    let dir = std::env::temp_dir().join("podspine-http-transcode");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let data = dir.join("data");
+
+    let index = Index::open_in_memory().unwrap();
+    let Some(input) = synth_flac_with_cue(&dir) else {
+        eprintln!("skipping: no flac encoder");
+        return;
+    };
+    let book = scan_book_as(
+        &input,
+        "flacbook",
+        &data,
+        &index,
+        ScanOptions {
+            // A saver server, deliberately: transcoding must override it per book.
+            saver: true,
+            transcode: TranscodeMode::Aac,
+            ..Default::default()
+        },
+        &BookOverrides::default(),
+    )
+    .unwrap();
+    let feed_id = book.feed_id.clone();
+    let eps = index.episodes_for_book(&book.id).unwrap();
+    assert_eq!(eps.len(), 2);
+    let ch1 = eps[0].file_path.clone();
+    let recorded_len = eps[0].byte_length;
+    assert!(ch1.ends_with(".m4a"), "{ch1}");
+
+    // A tiny cache cap + a served request would evict a regenerable chapter here;
+    // a transcoded one must survive.
+    let state = AppState::new(
+        index,
+        "http://test".to_string(),
+        &data,
+        &dir,
+        None,
+        true,
+        Some(1),
+        None,
+    );
+    let app = router(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/audio/{feed_id}/1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "audio/mp4",
+        "an .m4a episode is advertised as audio/mp4, whatever the source was"
+    );
+    let bytes = body_bytes(resp).await;
+    assert_eq!(
+        bytes.len() as i64,
+        recorded_len,
+        "served body matches the recorded enclosure length"
+    );
+    assert!(
+        std::path::Path::new(&ch1).exists(),
+        "a transcoded episode must never be evicted — nothing could rebuild it"
+    );
+
+    // The feed advertises the transcoded container, with the real file size.
+    let resp = app
+        .oneshot(
+            Request::get(format!("/feed/{feed_id}.xml"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let xml = String::from_utf8(body_bytes(resp).await).unwrap();
+    assert!(xml.contains("type=\"audio/mp4\""), "{xml}");
+    assert!(xml.contains(&format!("length=\"{recorded_len}\"")), "{xml}");
+
     let _ = std::fs::remove_dir_all(&dir);
 }
