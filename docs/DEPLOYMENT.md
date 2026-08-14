@@ -178,6 +178,11 @@ library/
 - **Skipped while walking:** dot-directories, `@eaDir`, `lost+found`, and the
   `--data-dir` if you put it inside the library. Nesting deeper than 8 levels is
   logged and not descended into.
+- **Symlinks are followed only within the library.** A link pointing at audio
+  elsewhere on the host is logged and skipped, because Podspine refuses to serve an
+  episode whose file resolves outside the library root — indexing it would publish
+  a feed whose audio 404s. A link that stays inside the library is fine, and the
+  same book reached two ways is indexed once.
 - Several `.ogg`/`.opus`/`.flac` files in one folder are **skipped with a warning**
   — only `.mp3` folders are read as one book's tracks. Give each such book its own
   folder, or add a `.cue`.
