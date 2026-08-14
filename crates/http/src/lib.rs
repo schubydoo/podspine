@@ -1021,8 +1021,8 @@ mod tests {
     #[test]
     fn valid_slug_allow_list() {
         // Accepts exactly what slugify produces.
-        assert!(valid_slug("dune"));
-        assert!(valid_slug("dune-2"));
+        assert!(valid_slug("dracula"));
+        assert!(valid_slug("dracula-2"));
         assert!(valid_slug("a1b2-c3"));
         // Rejects traversal / separators / absolute / case / dots / empty.
         for bad in [
@@ -1033,7 +1033,7 @@ mod tests {
             "a\\b",
             "/abs",
             "C:",
-            "Dune",
+            "Dracula",
             "a.b",
             "a b",
             "a%2e",

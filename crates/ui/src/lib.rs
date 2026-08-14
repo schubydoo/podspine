@@ -455,16 +455,16 @@ mod tests {
     #[test]
     fn index_lists_books_with_links_and_cover_alt() {
         let books = [
-            card("dune", "Dune", true),
+            card("dracula", "Dracula", true),
             card("solaris", "Solaris", false),
         ];
         let html = index_page(&books).into_string();
-        assert!(html.contains("href=\"/book/dune\""));
+        assert!(html.contains("href=\"/book/dracula\""));
         assert!(html.contains("href=\"/book/solaris\""));
         // Cover present -> img with alt; absent -> labelled placeholder.
         // Covers are served by capability id, not the slug.
-        assert!(html.contains("src=\"/cover/cap-dune\""));
-        assert!(html.contains("alt=\"Cover of Dune\""));
+        assert!(html.contains("src=\"/cover/cap-dracula\""));
+        assert!(html.contains("alt=\"Cover of Dracula\""));
         assert!(html.contains("aria-label=\"No cover art for Solaris\""));
     }
 
@@ -477,9 +477,9 @@ mod tests {
 
     fn detail() -> BookDetail {
         BookDetail {
-            slug: "dune".into(),
+            slug: "dracula".into(),
             feed_id: "Xk9mQ2vP7nR4tB1cY6wZ8a".into(),
-            title: "Dune".into(),
+            title: "Dracula".into(),
             author: Some("Frank Herbert".into()),
             has_cover: true,
             feed_url: "http://host:8080/feed/Xk9mQ2vP7nR4tB1cY6wZ8a.xml".into(),
@@ -501,7 +501,7 @@ mod tests {
         assert!(html.contains("href=\"/subscribe/Xk9mQ2vP7nR4tB1cY6wZ8a\""));
         // The regenerate control posts to the slug-keyed route (feed_id never in
         // the action URL).
-        assert!(html.contains("action=\"/book/dune/regenerate\""));
+        assert!(html.contains("action=\"/book/dracula/regenerate\""));
         assert!(html.contains("Regenerate link"));
     }
 

@@ -145,6 +145,52 @@ Things worth knowing before you turn it on:
 Prefer converting the files yourself if you care about the encoder settings; this
 flag exists so a library you'd rather not touch still plays.
 
+## Library layout
+
+Point `--library` at the top of your collection. Podspine walks it and treats the
+**first folder that contains audio** as a book, so all of these work side by side:
+
+```
+library/
+├── Standalone Book.m4b                     # a loose file
+├── Another Book/book.m4b                   # a book in its own folder
+├── Jules Verne/
+│   ├── The Mysterious Island/verne - island.m4b   # author → title
+│   └── Journey to the Centre of the Earth/jttcote.m4b
+└── Homer/
+    └── The Epic Cycle/                     # author → series → title
+        └── 1 - The Odyssey/odyssey.m4b
+```
+
+- **A folder holding several `.m4b`/`.m4a` files is several books** — one file is
+  one whole audiobook. A book already in the index keeps its slug: a newly
+  discovered file never takes an id that another book, whose file is still there,
+  already holds (it gets a `-2` suffix instead). That id is what a feed URL is
+  built from. A folder of several `.mp3` files is the opposite: one book,
+  its tracks in order.
+- **A book folder is not descended into.** The first level with audio wins, so a
+  book's own `extras/` folder is never ingested as another book. The trade: in a
+  mixed `Author/{loose.m4b, Title/…}`, only `loose.m4b` is found — give each book
+  its own folder.
+- **Nested books are named by their folder.** `Jules Verne/The Mysterious
+  Island/Jules Verne -   - The Mysterious Island.m4b` is titled *The Mysterious
+  Island*, not the filename, and gets the slug `jules-verne-the-mysterious-island`
+  so two authors can both have a *Dracula*. Books at the top level
+  (or one folder below it) keep the names they already had — their slug is their
+  id, and changing it would rotate a book's capability feed URL out from under
+  anyone subscribed to it.
+- **Skipped while walking:** dot-directories, `@eaDir`, `lost+found`, and the
+  `--data-dir` if you put it inside the library. Nesting deeper than 8 levels is
+  logged and not descended into.
+- **Symlinks are followed only within the library.** A link pointing at audio
+  elsewhere on the host is logged and skipped, because Podspine refuses to serve an
+  episode whose file resolves outside the library root — indexing it would publish
+  a feed whose audio 404s. A link that stays inside the library is fine, and the
+  same book reached two ways is indexed once.
+- Several `.ogg`/`.opus`/`.flac` files in one folder are **skipped with a warning**
+  — only `.mp3` folders are read as one book's tracks. Give each such book its own
+  folder, or add a `.cue`.
+
 ## Per-book overrides (`.podspine.toml`)
 
 Any of the per-book-meaningful settings above can be overridden for **one book**

@@ -27,7 +27,7 @@
 //! recorded; nothing is copied under `<data_dir>`. Only chaptered books, whose
 //! episodes are sub-ranges of a container, are extracted (`full`/`saver`).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -604,12 +604,13 @@ fn scan_mp3_folder(
     data_dir: &Path,
     index: &Index,
     overrides: &BookOverrides,
+    library_root: &Path,
 ) -> Result<BookRow, ScanError> {
     // Canonicalize the folder so every track path stored below is absolute and
     // symlink-resolved — in-place serving must not depend on the server's cwd.
     let dir_canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     let dir = dir_canonical.as_path();
-    let files = collect_mp3s(dir);
+    let files = collect_mp3s(dir, library_root);
     if files.is_empty() {
         return Err(ScanError::EmptyFolder(dir.to_path_buf()));
     }
@@ -754,7 +755,7 @@ fn order_mp3_tracks(tracks: &mut [Mp3Track], dir: &Path) {
 }
 
 /// Collect the top-level `.mp3` files in `dir` (unordered; the caller sorts).
-fn collect_mp3s(dir: &Path) -> Vec<PathBuf> {
+fn collect_mp3s(dir: &Path, library_root: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -762,6 +763,24 @@ fn collect_mp3s(dir: &Path) -> Vec<PathBuf> {
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.is_file() && ext_lower(p).as_deref() == Some("mp3"))
+        // A track can itself be a symlink out of the library even when its folder
+        // is inside it — `source_is_inside` only vetted the folder. Such a track
+        // would be indexed into the feed and then 404 at serve time, because the
+        // http layer canonicalizes each enclosure and refuses anything outside the
+        // library root. Drop it here, loudly (Greptile).
+        .filter(|p| {
+            match p.canonicalize() {
+                Ok(real) if real.starts_with(library_root) => true,
+                Ok(real) => {
+                    tracing::warn!(track = %p.display(), target = %real.display(), "skipping an MP3 track that links outside the library");
+                    false
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, track = %p.display(), "skipping an unreadable MP3 track");
+                    false
+                }
+            }
+        })
         .collect()
 }
 
@@ -794,23 +813,82 @@ enum BookSource {
 }
 
 impl BookSource {
-    /// The base name a slug is derived from (file stem, or folder name).
-    fn base_name(&self) -> String {
+    /// The base name a slug is derived from.
+    ///
+    /// For anything discoverable before recursive walking existed — a file at the
+    /// library root, or a book folder directly below it — this is exactly what it
+    /// always was: the file stem, or the folder name. That is deliberate and load
+    /// bearing. The slug becomes `book.id`, and a book's capability `feed_id` is
+    /// preserved per id across re-scans, so changing how an existing book's id is
+    /// derived would rotate its feed URL and silently break every subscriber.
+    ///
+    /// A book found *deeper* than that has never been indexed before, so its name
+    /// can be the better one: the path from the library root to its folder, joined
+    /// — `Jules Verne/The Mysterious Island/…m4b` → `Jules Verne - The Mysterious Island`. That reads well, and it
+    /// keeps two books of the same title under different authors from colliding
+    /// into `the-mysterious-island` and `-2`, whose assignment would depend on walk
+    /// order.
+    fn base_name(&self, library_root: &Path) -> String {
         match self {
-            BookSource::File(p) => file_stem(p),
-            // A folder name has no extension to strip; use it whole.
-            BookSource::Mp3Folder(d) => d
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "book".to_string()),
+            BookSource::File(p) => match nested_prefix(p.parent(), library_root) {
+                Some(name) => name,
+                None => file_stem(p),
+            },
+            BookSource::Mp3Folder(d) => match nested_prefix(Some(d), library_root) {
+                Some(name) => name,
+                // A folder name has no extension to strip; use it whole.
+                None => d
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "book".to_string()),
+            },
         }
     }
 }
 
-/// Audio extensions we recognize at the library level: Tier-1 (M4B/M4A/MP3) and
-/// Tier-2 (Ogg Vorbis/Opus/FLAC, Task 3.9). DRM inputs (AAX/AAXC/`.aa`/`.odm`)
-/// are deliberately absent and logged as skipped during discovery (PRD W5).
+/// The folder a nested book sits in, as its display title: `Jules Verne/The Mysterious
+/// Island/Jules Verne -   - The Mysterious Island.m4b` → `Some("The Mysterious Island")`.
+///
+/// A nested library names the book on the folder and treats the filename as a
+/// dumping ground for author, narrator and separators, so the folder is almost
+/// always the better title. `None` for a book at or directly below the root, whose
+/// title stays the file stem — those books may already be indexed, and a feed
+/// title that changes under a subscriber is a change worth not making by accident.
+/// A `.podspine.toml` `title` still wins over this.
+fn nested_title(source: &BookSource, library_root: &Path) -> Option<String> {
+    let BookSource::File(path) = source else {
+        // An MP3-folder book is already titled by its folder.
+        return None;
+    };
+    let dir = path.parent()?;
+    // Only for a book below the first level: `<root>/<author>/<title>/…`.
+    nested_prefix(Some(dir), library_root)?;
+    dir.file_name().map(|s| s.to_string_lossy().into_owned())
+}
+
+/// The joined path from `library_root` to a book folder, for a book nested deeper
+/// than one level: `<root>/Jules Verne/The Mysterious Island` → `Some("Jules Verne - The Mysterious Island")`.
+///
+/// `None` for a book at or directly below the root — those keep their historical
+/// name (see [`BookSource::base_name`]) — and for anything outside the root.
+fn nested_prefix(book_dir: Option<&Path>, library_root: &Path) -> Option<String> {
+    let rel = book_dir?.strip_prefix(library_root).ok()?;
+    let parts: Vec<String> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    (parts.len() > 1).then(|| parts.join(" - "))
+}
+
+/// Audio extensions Podspine ingests: Tier-1 (M4B/M4A/MP3) and Tier-2 (Ogg
+/// Vorbis/Opus/FLAC, Task 3.9). DRM inputs (AAX/AAXC/`.aa`/`.odm`) are
+/// deliberately absent and logged as skipped during discovery (PRD W5).
 const AUDIO_EXTENSIONS: &[&str] = &["m4b", "m4a", "mp3", "ogg", "oga", "opus", "flac"];
+
+/// How far below the library root the walk descends before giving up. Deep
+/// enough for `shelf/author/series/title/`, shallow enough that a symlink the loop
+/// guard somehow misses can't spin.
+const MAX_LIBRARY_DEPTH: usize = 8;
 
 /// Resolve + parse a book's `.podspine.toml` (Sprint 6.4). A missing sidecar
 /// yields the empty default; a bad sidecar or a server-global key that doesn't
@@ -839,30 +917,130 @@ fn resolve_book_overrides(source: &Path, library_root: &Path) -> BookOverrides {
 /// episodes under `<data_dir>/books/<slug>/`. One independent book per top-level
 /// audio file or per-book subfolder. Slugs are collision-free and deterministic
 /// across re-scans; a single failing book is logged and skipped, never fatal.
+/// Collapse any set of index rows that share one source to a single row, keeping
+/// the **earliest-created** row (the feed subscribers have held longest) and
+/// deleting the rest with their extracted output.
+///
+/// This is the floor the rest of the identity logic stands on: **one source, one
+/// book row, one feed.** Nothing the current scanner writes creates a second row
+/// for one source — the source→id reuse map in [`scan_library`] sees to that — but
+/// a database written by an earlier build, or edited by hand, can hold them, and
+/// neither reuse nor orphan pruning would ever reconcile it: the map keeps one id
+/// arbitrarily, and both rows survive pruning because their shared source still
+/// exists. The book would stay listed under two capability URLs forever. Running
+/// this first makes the reuse map unambiguous and heals such a database in one
+/// reconcile.
+///
+/// A row whose source is *gone* is left for [`prune_orphans`] — grouping only
+/// canonicalizable paths also means an unmounted library (every source missing)
+/// collapses nothing. Best-effort: a failed lookup leaves the index untouched.
+fn collapse_duplicate_source_rows(index: &Index, data_dir: &Path) {
+    let Ok(identities) = index.book_source_identities() else {
+        return;
+    };
+    // `book_source_identities` is ordered oldest-first (created_at asc), so the
+    // FIRST row seen for a source is the earliest-created — the feed subscribers
+    // have held longest — and is the one to keep. Sorting by id instead would drop
+    // an established `foo-2` in favour of a `foo` a later bug duplicated, deleting
+    // the very feed people use (Greptile).
+    let mut kept_for_source: HashMap<PathBuf, String> = HashMap::new();
+    for (id, source_path, _created_at) in identities {
+        // A gone source is orphan-pruning's job; grouping only canonicalizable
+        // paths also means an unmounted library collapses nothing.
+        let Ok(real) = Path::new(&source_path).canonicalize() else {
+            continue;
+        };
+        match kept_for_source.get(&real) {
+            None => {
+                kept_for_source.insert(real, id);
+            }
+            Some(kept) => {
+                let book_out = data_dir.join("books").join(&id);
+                if book_out.exists()
+                    && let Err(err) = std::fs::remove_dir_all(&book_out)
+                {
+                    tracing::warn!(error = %err, dir = %book_out.display(), "could not remove a duplicate book's output");
+                }
+                match index.delete_book(&id) {
+                    Ok(_) => {
+                        tracing::warn!(id = %id, kept = %kept, "removed a duplicate feed row for one source (kept the earliest)")
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, id = %id, "could not remove a duplicate feed row")
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn scan_library(
     library: &Path,
     data_dir: &Path,
     index: &Index,
     opts: ScanOptions,
 ) -> ScanSummary {
-    let sources = discover(library);
     // Canonical library root, for resolving per-book `.podspine.toml` sidecars
-    // (Sprint 6.4) — matched against each book's canonical source path.
+    // (Sprint 6.4) — matched against each book's canonical source path — and for
+    // naming books found below the top level.
     let library_root = library
         .canonicalize()
         .unwrap_or_else(|_| library.to_path_buf());
+    let sources = discover(&library_root, data_dir);
+
+    // Enforce one row per source BEFORE the reuse map is read, so the map cannot
+    // inherit a duplicate (invariant A — see the function's doc).
+    collapse_duplicate_source_rows(index, data_dir);
+
+    // Every already-indexed book, keyed by its (canonical) source path. A source
+    // that is already indexed keeps whatever id it has — including a `-2` suffix it
+    // once earned — instead of being re-derived from its name. Without this, a book
+    // that was suffixed because a now-pruned stale row occupied its base id would,
+    // on the next scan, ALSO be indexed under the freed base id: one audiobook
+    // under two capability feeds (Greptile). Reuse makes the id stable per source.
+    let existing_by_source: HashMap<PathBuf, String> = index
+        .list_books()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|b| (PathBuf::from(b.source_path), b.id))
+        .collect();
 
     let mut seen = HashSet::new();
     let mut summary = ScanSummary::default();
     for source in sources {
-        // Reserve a slug for every candidate in deterministic order so a book's
-        // slug is stable across re-scans regardless of siblings' outcomes.
-        let slug = unique_slug(&slugify(&source.base_name()), &mut seen);
         let source_path = match &source {
             BookSource::File(p) => p.as_path(),
             BookSource::Mp3Folder(d) => d.as_path(),
         };
-        let overrides = resolve_book_overrides(source_path, &library_root);
+        // If this exact source is already indexed, keep its id — that is what makes
+        // a feed URL stable across scans, and what stops a once-suffixed book from
+        // being re-indexed under a since-freed base id. Otherwise reserve a slug in
+        // deterministic order, never one a different still-present book holds.
+        let slug = match source_path
+            .canonicalize()
+            .ok()
+            .and_then(|c| existing_by_source.get(&c))
+        {
+            Some(id) => {
+                seen.insert(id.clone());
+                id.clone()
+            }
+            None => assign_slug(
+                &slugify(&source.base_name(&library_root)),
+                source_path,
+                index,
+                &mut seen,
+            ),
+        };
+        let mut overrides = resolve_book_overrides(source_path, &library_root);
+        // A nested book's filename is usually `Author -   - Title.m4b`; its folder
+        // is just `Title`. Seed the title from the folder unless the book's own
+        // `.podspine.toml` says otherwise — an explicit title always wins.
+        if overrides.title.is_none()
+            && let Some(title) = nested_title(&source, &library_root)
+        {
+            overrides.title = Some(title);
+        }
         // `disabled` (a `.podspine.toml` troubleshooting knob): drop the book from
         // every surface — prune it if it was previously indexed, and skip.
         if overrides.disabled == Some(true) {
@@ -887,7 +1065,7 @@ pub fn scan_library(
                 }
             }
             BookSource::Mp3Folder(dir) => {
-                match scan_mp3_folder(&dir, &slug, data_dir, index, &overrides) {
+                match scan_mp3_folder(&dir, &slug, data_dir, index, &overrides, &library_root) {
                     Ok(book) => {
                         summary.indexed += 1;
                         tracing::info!(slug = %book.slug, title = %book.title, "indexed MP3-folder book");
@@ -1027,90 +1205,315 @@ fn watch_loop(
 
 /// Discover book sources one level under `library`, in a deterministic
 /// (path-sorted) order so slug disambiguation is stable across re-scans.
-fn discover(library: &Path) -> Vec<BookSource> {
-    let mut entries = match std::fs::read_dir(library) {
+fn discover(library: &Path, data_dir: &Path) -> Vec<BookSource> {
+    // Podspine's own output must never be walked. A `--data-dir` nested inside the
+    // library (a perfectly reasonable `-v /books:/library -e DATA_DIR=/library/.podspine`)
+    // holds extracted episodes, which a recursive walk would otherwise index as
+    // books and then re-split — feeding its own output back in.
+    let data_root = data_dir.canonicalize().ok();
+    // Containment is judged against the canonical root, but the walk descends the
+    // path as given, so discovered sources keep the caller's spelling.
+    let root = library
+        .canonicalize()
+        .unwrap_or_else(|_| library.to_path_buf());
+    let mut sources = Vec::new();
+    let mut visited = HashSet::new();
+    walk_library(
+        library,
+        0,
+        &root,
+        data_root.as_deref(),
+        &mut visited,
+        &mut sources,
+    );
+    sources
+}
+
+/// One level of the library walk.
+///
+/// At every level: files are books in their own right, and a subdirectory is
+/// either a book (it holds audio *directly*) or a container to walk — an author,
+/// a series, a shelf. That is what makes an `Author/Title/book.m4b` library work
+/// without rearranging it, which is the layout Audiobookshelf, Plex and Jellyfin
+/// all produce.
+///
+/// A directory that classifies as a book is **not** descended into: the first
+/// level holding audio wins. (Consequence, documented: a multi-disc book laid out
+/// as `Title/CD1/*.mp3` + `Title/CD2/*.mp3` becomes two books, since `Title/`
+/// itself holds no audio.)
+fn walk_library(
+    dir: &Path,
+    depth: usize,
+    library_root: &Path,
+    data_root: Option<&Path>,
+    visited: &mut HashSet<PathBuf>,
+    out: &mut Vec<BookSource>,
+) {
+    if depth > MAX_LIBRARY_DEPTH {
+        tracing::warn!(
+            dir = %dir.display(),
+            max = MAX_LIBRARY_DEPTH,
+            "library nesting deeper than the walk limit — not descending further"
+        );
+        return;
+    }
+    // Canonicalize for the loop guard: a symlink pointing back up the tree (or at
+    // a sibling already walked) would otherwise recurse until the depth cap, and
+    // index the same book twice on the way.
+    let real = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    if data_root.is_some_and(|d| real.starts_with(d)) {
+        return;
+    }
+    // `is_dir` follows symlinks, so a link inside the library pointing at audio
+    // elsewhere on the host would be walked and indexed — and then be unplayable,
+    // because the serve layer canonicalizes an episode's source and refuses
+    // anything outside the library root (TAD §7). A feed whose audio 404s is worse
+    // than a book that never appears, so the walk refuses to leave the tree.
+    if depth > 0 && !real.starts_with(library_root) {
+        tracing::warn!(
+            dir = %dir.display(),
+            target = %real.display(),
+            "skipping a link that leaves the library root"
+        );
+        return;
+    }
+    if !visited.insert(real) {
+        return;
+    }
+
+    let mut entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries.flatten().map(|e| e.path()).collect::<Vec<_>>(),
         Err(err) => {
-            tracing::error!(error = %err, library = %library.display(), "cannot read library");
-            return Vec::new();
+            // The root failing is an operator error worth shouting about; a
+            // subdirectory failing (permissions, a race with a move) is one book
+            // lost, not a broken scan.
+            if depth == 0 {
+                tracing::error!(error = %err, library = %dir.display(), "cannot read library");
+            } else {
+                tracing::warn!(error = %err, dir = %dir.display(), "cannot read directory — skipping");
+            }
+            return;
         }
     };
+    // Sorted, so slug assignment (and therefore collision suffixes) is identical
+    // on every scan regardless of what the filesystem hands back.
     entries.sort();
 
-    let mut sources = Vec::new();
+    // Below the root, a directory that holds audio IS a book (or several) and is
+    // not descended into: the first level with audio wins. That keeps a book's own
+    // `extras/` or `bonus/` folder from being ingested as another book. The cost,
+    // documented: a mixed `Author/{loose.m4b, Title/…}` yields only `loose.m4b`.
+    if depth > 0 {
+        let books: Vec<BookSource> = classify_dir(dir)
+            .into_iter()
+            .filter(|src| source_is_inside(src, library_root))
+            .collect();
+        if !books.is_empty() {
+            out.extend(books);
+            return;
+        }
+    }
+
+    // The root, or a container. Files and subdirectories are emitted in one
+    // path-sorted pass, which is exactly the order discovery has always produced.
+    // It matters: the order decides which of two same-named books gets the bare
+    // slug and which gets the `-2` suffix, and that slug is the book id whose
+    // capability feed id is preserved across re-scans. Emitting all files ahead of
+    // all directories would swap `Dracula.m4b` and `Dracula/` — handing each subscriber
+    // the other audiobook under the URL they already have.
+    //
+    // A root file is a book in its own right (never grouped: several loose `.mp3`
+    // at the root are separate books, not one book's tracks), again as before.
     for path in entries {
         if path.is_file() {
+            if depth > 0 {
+                continue;
+            }
             if is_drm(&path) {
                 tracing::warn!(
                     path = %path.display(),
                     "skipping DRM-protected file (Podspine ships no circumvention)"
                 );
             } else if is_audio(&path) {
-                sources.push(BookSource::File(path));
+                let src = BookSource::File(path);
+                if source_is_inside(&src, library_root) {
+                    out.push(src);
+                }
             }
-        } else if path.is_dir()
-            && let Some(src) = classify_dir(&path)
-        {
-            sources.push(src);
+        } else if path.is_dir() && !is_ignored_dir(&path) {
+            walk_library(&path, depth + 1, library_root, data_root, visited, out);
         }
     }
-    sources
+}
+
+/// Whether a discovered source really lives inside the library.
+///
+/// A symlinked *file* escapes the directory guard in [`walk_library`], and would
+/// be indexed into a feed the serve layer then refuses to play. Rejected sources
+/// are logged, not silently dropped: a book missing from the UI with nothing in
+/// the log is the worst version of this.
+fn source_is_inside(src: &BookSource, library_root: &Path) -> bool {
+    let path = match src {
+        BookSource::File(p) => p.as_path(),
+        BookSource::Mp3Folder(d) => d.as_path(),
+    };
+    match path.canonicalize() {
+        Ok(real) if real.starts_with(library_root) => true,
+        Ok(real) => {
+            tracing::warn!(
+                path = %path.display(),
+                target = %real.display(),
+                "skipping a link that leaves the library root"
+            );
+            false
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, path = %path.display(), "skipping an unreadable source");
+            false
+        }
+    }
+}
+
+/// Directories the walk never enters: dotfiles (`.stfolder`, `.git`, …) and the
+/// thumbnail caches NAS software scatters through a share. None of them hold
+/// audiobooks, and walking them is pure cost on a large library.
+fn is_ignored_dir(dir: &Path) -> bool {
+    dir.file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(|name| name.starts_with('.') || name == "@eaDir" || name == "lost+found")
 }
 
 /// Classify a per-book subfolder: prefer a splittable `.m4b`/`.m4a`; a lone
 /// `.mp3` is a single-file book; several `.mp3`s are a multi-track folder
 /// (Task 3.3). A folder with no audio yields nothing.
-fn classify_dir(dir: &Path) -> Option<BookSource> {
-    let entries = std::fs::read_dir(dir).ok()?;
+fn classify_dir(dir: &Path) -> Vec<BookSource> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
     let mut m4x = Vec::new();
     let mut mp3 = Vec::new();
+    // Tier-2 containers (Ogg/Opus/FLAC): a lone one is a book in its own folder,
+    // exactly as it would be at the library root. A folder holding several is not
+    // a Tier-2 equivalent of an MP3 folder — that path only reads `.mp3` tracks —
+    // so it stays unclassified rather than being half-ingested.
+    let mut tier2 = Vec::new();
     for path in entries.flatten().map(|e| e.path()) {
         if !path.is_file() {
+            continue;
+        }
+        // DRM is refused wherever it turns up in the tree, loudly (PRD W5).
+        if is_drm(&path) {
+            tracing::warn!(
+                path = %path.display(),
+                "skipping DRM-protected file (Podspine ships no circumvention)"
+            );
+            continue;
+        }
+        if !is_audio(&path) {
             continue;
         }
         match ext_lower(&path).as_deref() {
             Some("m4b") | Some("m4a") => m4x.push(path),
             Some("mp3") => mp3.push(path),
-            _ => {}
+            // Everything else `is_audio` admits is Tier-2.
+            _ => tier2.push(path),
         }
     }
     m4x.sort();
     mp3.sort();
+    tier2.sort();
 
-    if let Some(f) = m4x.into_iter().next() {
-        Some(BookSource::File(f))
+    if !m4x.is_empty() {
+        // One `.m4b`/`.m4a` is one whole book, so a folder holding several holds
+        // several books — an author folder of single-file audiobooks, typically.
+        // (`.mp3` is the opposite: several of those are usually one book's tracks.)
+        m4x.into_iter().map(BookSource::File).collect()
     } else if mp3.len() == 1 {
-        Some(BookSource::File(mp3.into_iter().next().unwrap()))
+        vec![BookSource::File(mp3.into_iter().next().unwrap())]
     } else if !mp3.is_empty() {
-        Some(BookSource::Mp3Folder(dir.to_path_buf()))
+        vec![BookSource::Mp3Folder(dir.to_path_buf())]
+    } else if tier2.len() == 1 {
+        vec![BookSource::File(tier2.into_iter().next().unwrap())]
     } else {
-        None
+        if tier2.len() > 1 {
+            tracing::warn!(
+                dir = %dir.display(),
+                count = tier2.len(),
+                "several Ogg/Opus/FLAC files in one folder — skipped (only .mp3 folders are ingested as a book's tracks); give each book its own folder, or add a .cue"
+            );
+        }
+        Vec::new()
     }
 }
 
 /// Reserve `base` if free, else `base-2`, `base-3`, … Inserts the chosen slug
 /// into `seen` and returns it.
-fn unique_slug(base: &str, seen: &mut HashSet<String>) -> String {
-    if seen.insert(base.to_string()) {
-        return base.to_string();
-    }
-    let mut n = 2;
+/// Choose this source's slug, which becomes its `book.id`.
+///
+/// Two constraints, both about not stealing an identity:
+///
+/// - unique within this scan, so two same-named books get `x` and `x-2`;
+/// - **never a slug the index already holds for a different source that still
+///   exists.** `upsert_book` preserves a book's capability `feed_id` per id, so
+///   handing an existing id to another file keeps the subscriber's URL alive and
+///   swaps the audiobook underneath it. That is the one failure this crate must
+///   never produce, and dedup within a single scan cannot see it: the colliding
+///   book may not be discovered until later in the same walk, or may not be
+///   rediscovered at all.
+///
+/// A row whose source no longer exists is fair game — that is a moved or renamed
+/// library, and the stale row is pruned in the same reconcile.
+fn assign_slug(base: &str, source: &Path, index: &Index, seen: &mut HashSet<String>) -> String {
+    let mut n = 1;
     loop {
-        let candidate = format!("{base}-{n}");
-        if seen.insert(candidate.clone()) {
+        let candidate = if n == 1 {
+            base.to_string()
+        } else {
+            format!("{base}-{n}")
+        };
+        // A candidate refused because someone else owns it is NOT consumed: the
+        // rightful owner is often discovered later in the same walk and must still
+        // be able to claim it. Consuming it here would push that book onto a fresh
+        // id — a new capability feed, and a stale row still serving the old one.
+        if !seen.contains(&candidate) && !owns_a_different_source(index, &candidate, source) {
+            seen.insert(candidate.clone());
             return candidate;
         }
         n += 1;
     }
 }
 
-/// Whether a path has a recognized top-level audio extension.
-fn is_audio(p: &Path) -> bool {
-    ext_lower(p)
-        .map(|e| AUDIO_EXTENSIONS.contains(&e.as_str()))
-        .unwrap_or(false)
+/// Whether `slug` is an indexed book built from a *different* file than `source`.
+///
+/// Existence of that book's file is deliberately NOT consulted. An earlier version
+/// freed the id when the stored source was gone (to let a moved book reclaim it),
+/// but that reopened the exact theft this guard exists to stop: a newcomer sorting
+/// before a moved book's new location would inherit the vacated id — and its
+/// preserved capability feed — while the moved book was pushed onto a fresh feed
+/// (Greptile). There is no content identity to tell "the moved book" from "a
+/// different book of the same name" apart, so the safe rule is uniform: a live
+/// index row owns its id until [`prune_orphans`] retires it, one reconcile later.
+/// A book therefore keeps its feed across an in-place re-ingest (same path) but not
+/// across a move — the same feed-rotates-on-rename contract the flat scanner had.
+///
+/// Index errors count as "not owned": a failed lookup must not rename every book.
+fn owns_a_different_source(index: &Index, slug: &str, source: &Path) -> bool {
+    let Ok(Some(existing)) = index.get_book(slug) else {
+        return false;
+    };
+    // Compare canonically where both resolve (the stored path is canonical, a
+    // discovered one need not be — `/tmp` is a symlink to `/private/var` on macOS);
+    // fall back to the raw strings when the stored file is gone.
+    match (
+        Path::new(&existing.source_path).canonicalize(),
+        source.canonicalize(),
+    ) {
+        (Ok(indexed), Ok(discovered)) => indexed != discovered,
+        _ => existing.source_path != source.to_string_lossy(),
+    }
 }
 
+/// Whether a path has a recognized top-level audio extension.
 /// A path's extension, lowercased.
 fn ext_lower(p: &Path) -> Option<String> {
     p.extension()
@@ -1204,6 +1607,13 @@ fn cover_ext(codec: Option<&str>) -> &'static str {
         Some("png") => "png",
         _ => "jpg", // mjpeg/mjpg/jpeg and any unknown codec
     }
+}
+
+/// Whether a path is an audio file Podspine can ingest.
+fn is_audio(p: &Path) -> bool {
+    ext_lower(p)
+        .map(|e| AUDIO_EXTENSIONS.contains(&e.as_str()))
+        .unwrap_or(false)
 }
 
 /// Whether a path has a DRM extension we refuse to ingest.
@@ -1307,8 +1717,15 @@ mod tests {
         let index = Index::open_in_memory().unwrap();
         let data = dir.join("data");
 
-        let err = scan_mp3_folder(&dir, "book-id", &data, &index, &BookOverrides::default())
-            .expect_err("a folder with no mp3s must not scan");
+        let err = scan_mp3_folder(
+            &dir,
+            "book-id",
+            &data,
+            &index,
+            &BookOverrides::default(),
+            &dir,
+        )
+        .expect_err("a folder with no mp3s must not scan");
 
         assert!(matches!(err, ScanError::EmptyFolder(_)), "got {err:?}");
     }
@@ -2401,12 +2818,745 @@ mod tests {
     }
 
     #[test]
-    fn unique_slug_disambiguates_collisions() {
+    fn assign_slug_disambiguates_collisions() {
+        // With an empty index, assignment is pure within-scan deduplication.
+        let index = Index::open_in_memory().unwrap();
+        let path = Path::new("/library/whatever.m4b");
         let mut seen = HashSet::new();
-        assert_eq!(unique_slug("dune", &mut seen), "dune");
-        assert_eq!(unique_slug("dune", &mut seen), "dune-2");
-        assert_eq!(unique_slug("dune", &mut seen), "dune-3");
-        assert_eq!(unique_slug("other", &mut seen), "other");
+        let mut next = |base: &str| assign_slug(base, path, &index, &mut seen);
+        assert_eq!(next("dracula"), "dracula");
+        assert_eq!(next("dracula"), "dracula-2");
+        assert_eq!(next("dracula"), "dracula-3");
+        assert_eq!(next("other"), "other");
+    }
+
+    // ---- recursive library discovery ----
+
+    /// End to end on the layout Audiobookshelf produces: real files, real ffprobe,
+    /// real index rows — the case that returned `indexed=0` before this walk.
+    #[test]
+    fn scan_library_indexes_an_author_title_tree() {
+        if !ffmpeg_available() {
+            skip!("ffmpeg not available");
+        }
+        let root = scratch("scan-nested");
+        let mk = |rel: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            synth_encoded(
+                path.parent().unwrap(),
+                path.file_name().unwrap().to_str().unwrap(),
+                &["-c:a", "aac"],
+                4,
+            )
+        };
+        if mk("Jules Verne/The Mysterious Island/Jules Verne - The Mysterious Island.m4b").is_none()
+        {
+            skip!("no aac encoder");
+        }
+        mk("Jules Verne/Journey to the Centre of the Earth/jttcote.m4b").unwrap();
+        mk("Mary Shelley/Frankenstein/frankenstein.m4b").unwrap();
+        // A sibling that is not audio, and a book past nothing at all.
+        std::fs::write(
+            root.join("Jules Verne/The Mysterious Island/metadata.json"),
+            b"{}",
+        )
+        .unwrap();
+
+        let data = root.join("data");
+        let index = Index::open_in_memory().unwrap();
+        let summary = scan_library(&root, &data, &index, ScanOptions::default());
+
+        assert_eq!(summary.indexed, 3, "every nested book is indexed");
+        let mut slugs: Vec<String> = index
+            .list_books()
+            .unwrap()
+            .into_iter()
+            .map(|b| b.slug)
+            .collect();
+        slugs.sort();
+        assert_eq!(
+            slugs,
+            vec![
+                "jules-verne-journey-to-the-centre-of-the-earth",
+                "jules-verne-the-mysterious-island",
+                "mary-shelley-frankenstein"
+            ]
+        );
+        // Titles come from the book folder, not from `Jules Verne -   - The
+        // Mysterious Island`.
+        let mut titles: Vec<String> = index
+            .list_books()
+            .unwrap()
+            .into_iter()
+            .map(|b| b.title)
+            .collect();
+        titles.sort();
+        assert_eq!(
+            titles,
+            vec![
+                "Frankenstein",
+                "Journey to the Centre of the Earth",
+                "The Mysterious Island"
+            ]
+        );
+        // Each book has episodes, and its source is the file inside the tree.
+        // Compare canonically: the scanner stores a canonicalized source path, and
+        // `/tmp` is a symlink on macOS (`/private/var/…`) while Windows canonical
+        // paths carry a `\\?\` verbatim prefix.
+        let root_canonical = root.canonicalize().unwrap();
+        for book in index.list_books().unwrap() {
+            assert!(
+                Path::new(&book.source_path).starts_with(&root_canonical),
+                "{}",
+                book.source_path
+            );
+            assert!(!index.episodes_for_book(&book.id).unwrap().is_empty());
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn discover_walks_author_title_libraries() {
+        // The layout Audiobookshelf, Plex and Jellyfin all produce, and the one a
+        // large library is least likely to rearrange.
+        let root = scratch("discover-nested");
+        touch(
+            &root.join("Jules Verne/The Mysterious Island/Jules Verne - The Mysterious Island.m4b"),
+        );
+        touch(&root.join("Jules Verne/The Mysterious Island/metadata.json")); // ignored sibling
+        touch(&root.join("Jules Verne/Journey to the Centre of the Earth/jttcote.m4b"));
+        touch(&root.join("Mary Shelley/Frankenstein/01.mp3"));
+        touch(&root.join("Mary Shelley/Frankenstein/02.mp3"));
+        // Deeper still: shelf -> author -> series -> title.
+        touch(&root.join("Shelf/Homer/The Epic Cycle/The Odyssey/odyssey.m4b"));
+
+        let found = discover(&root, &root.join("data"));
+        assert_eq!(
+            found,
+            vec![
+                // Path-sorted: "Journey…" before "The Mysterious Island".
+                BookSource::File(
+                    root.join("Jules Verne/Journey to the Centre of the Earth/jttcote.m4b")
+                ),
+                BookSource::File(root.join(
+                    "Jules Verne/The Mysterious Island/Jules Verne - The Mysterious Island.m4b"
+                )),
+                BookSource::Mp3Folder(root.join("Mary Shelley/Frankenstein")),
+                BookSource::File(root.join("Shelf/Homer/The Epic Cycle/The Odyssey/odyssey.m4b")),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_nested_book_is_named_by_its_path_but_a_shallow_one_is_not() {
+        let root = scratch("discover-naming");
+        touch(&root.join("Top Book.m4b"));
+        touch(&root.join("a-folder-book/inner-name.m4b"));
+        touch(&root.join("Jules Verne/The Mysterious Island/ugly - - stem.m4b"));
+        touch(&root.join("tracks/01.mp3"));
+        touch(&root.join("tracks/02.mp3"));
+        touch(&root.join("Mary Shelley/Frankenstein/01.mp3"));
+        touch(&root.join("Mary Shelley/Frankenstein/02.mp3"));
+
+        let name = |src: &BookSource| slugify(&src.base_name(&root));
+        let found = discover(&root, &root.join("data"));
+        let names: Vec<String> = found.iter().map(name).collect();
+        // Files and directories interleaved, path-sorted, capitals first — the
+        // order discovery has always produced (see
+        // `root_files_and_directories_keep_their_historical_order`).
+        assert_eq!(
+            names,
+            vec![
+                // Nested: named by the path, not by an unhelpful file stem.
+                "jules-verne-the-mysterious-island",
+                "mary-shelley-frankenstein",
+                // Unchanged: a root file keeps its stem...
+                "top-book",
+                // ...and a book directly below the root keeps its FILE stem, not
+                // its folder name. Changing this would re-key the book and rotate
+                // its capability feed id.
+                "inner-name",
+                // An MP3 folder directly below the root keeps its folder name.
+                "tracks",
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The order books are discovered in decides which of two same-named books
+    /// gets the bare slug and which gets `-2`. That slug is the book id, and a
+    /// book's capability feed id is preserved per id across re-scans — so a
+    /// reordering hands each subscriber the *other* audiobook under the URL they
+    /// already have. Root files and directories must stay interleaved by name.
+    /// A newly discovered file must not take the id of a book that already exists,
+    /// because `upsert_book` preserves the capability `feed_id` per id: the URL
+    /// would keep working and start serving a different audiobook. This is the
+    /// case a folder of several `.m4b` files opened up — its second file was never
+    /// discovered before, and its stem can collide with an existing book.
+    /// A database that already holds two rows for one source (an older build, a
+    /// manual edit) must heal to a single row — otherwise the book stays under two
+    /// capability feeds across every future reconcile, since both survive pruning.
+    #[test]
+    fn duplicate_source_rows_collapse_to_one() {
+        let root = scratch("collapse-dups");
+        let data = root.join("data");
+        let source = root.join("book.m4b");
+        touch(&source);
+        let source_str = source
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let index = Index::open_in_memory().unwrap();
+        let row = |id: &str, feed: &str| BookRow {
+            id: id.into(),
+            slug: id.into(),
+            feed_id: feed.into(),
+            title: "Book".into(),
+            author: None,
+            cover_path: None,
+            source_path: source_str.clone(),
+            source_mtime: 1,
+            status: "ready".into(),
+            storage_mode: String::new(),
+            default_cover_url: None,
+            force_embedded: false,
+            transcode: "off".into(),
+        };
+        // The ESTABLISHED feed is the suffixed `book-2` (indexed first, so earlier
+        // created_at); the later duplicate is the base `book`. The survivor must be
+        // chosen by age, not by id — an id sort would delete the very feed
+        // subscribers use (Greptile). A few ms between inserts makes created_at
+        // distinct on any real clock.
+        index.upsert_book(&row("book-2", "cap-book-2")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        index.upsert_book(&row("book", "cap-book")).unwrap();
+        touch(&data.join("books/book-2/001.m4a"));
+        touch(&data.join("books/book/001.m4a"));
+
+        collapse_duplicate_source_rows(&index, &data);
+
+        let ids: Vec<String> = index
+            .list_books()
+            .unwrap()
+            .into_iter()
+            .map(|b| b.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["book-2"],
+            "the earliest-created row survives, whatever its id"
+        );
+        assert!(
+            data.join("books/book-2/001.m4a").exists(),
+            "survivor output kept"
+        );
+        assert!(
+            !data.join("books/book").exists(),
+            "later duplicate output reclaimed"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Two rows sharing a source whose file is GONE are prune_orphans' job, not
+    /// this one — and an unmounted library (every source missing) must collapse
+    /// nothing, so a mount blip can't wipe the index.
+    #[test]
+    fn collapse_leaves_gone_sources_for_pruning() {
+        let root = scratch("collapse-gone");
+        let data = root.join("data");
+        let index = Index::open_in_memory().unwrap();
+        let missing = root.join("not-here.m4b").to_string_lossy().into_owned();
+        for id in ["book", "book-2"] {
+            index
+                .upsert_book(&BookRow {
+                    id: id.into(),
+                    slug: id.into(),
+                    feed_id: format!("cap-{id}"),
+                    title: "Book".into(),
+                    author: None,
+                    cover_path: None,
+                    source_path: missing.clone(),
+                    source_mtime: 1,
+                    status: "ready".into(),
+                    storage_mode: String::new(),
+                    default_cover_url: None,
+                    force_embedded: false,
+                    transcode: "off".into(),
+                })
+                .unwrap();
+        }
+        collapse_duplicate_source_rows(&index, &data);
+        assert_eq!(
+            index.list_books().unwrap().len(),
+            2,
+            "a gone source is not collapsed — prune_orphans handles it"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The two-scan hazard: a newcomer suffixed because a stale row held its base
+    /// id must not, once that stale row is pruned, be re-indexed under the freed
+    /// base id on the next scan — that is one audiobook under two feeds. Reusing an
+    /// already-indexed source'"'"'s id closes it. Exercised through `reconcile`, which
+    /// is scan-then-prune, run twice.
+    #[test]
+    fn a_source_keeps_one_id_across_consecutive_reconciles() {
+        if !ffmpeg_available() {
+            skip!("ffmpeg not available");
+        }
+        let root = scratch("dup-feed");
+        let data = root.join("data");
+        let index = Index::open_in_memory().unwrap();
+
+        // A stale row already owns the base slug `foo`; its file does not exist.
+        index
+            .upsert_book(&BookRow {
+                id: "foo".into(),
+                slug: "foo".into(),
+                feed_id: "cap-foo-stale".into(),
+                title: "Stale".into(),
+                author: None,
+                cover_path: None,
+                source_path: root.join("gone.m4b").to_string_lossy().into_owned(),
+                source_mtime: 1,
+                status: "ready".into(),
+                storage_mode: String::new(),
+                default_cover_url: None,
+                force_embedded: false,
+                transcode: "off".into(),
+            })
+            .unwrap();
+
+        // A real newcomer whose stem slugifies to `foo`.
+        if synth_encoded(&root, "Foo.m4b", &["-c:a", "aac"], 4).is_none() {
+            skip!("no aac encoder");
+        }
+        let newcomer = root.join("Foo.m4b").canonicalize().unwrap();
+
+        // Reconcile #1: newcomer is suffixed to `foo-2`, stale `foo` is pruned.
+        reconcile(&root, &data, &index, ScanOptions::default());
+        // Reconcile #2: `foo` is free now, but the newcomer must keep `foo-2`.
+        reconcile(&root, &data, &index, ScanOptions::default());
+
+        let books = index.list_books().unwrap();
+        let for_newcomer: Vec<&BookRow> = books
+            .iter()
+            .filter(|b| {
+                Path::new(&b.source_path)
+                    .canonicalize()
+                    .map(|c| c == newcomer)
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(
+            for_newcomer.len(),
+            1,
+            "the source must be indexed exactly once, not once per freed id: {:?}",
+            books
+                .iter()
+                .map(|b| (&b.id, &b.source_path))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(for_newcomer[0].id, "foo-2", "and it keeps its stable id");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_new_file_cannot_take_a_live_books_slug() {
+        let root = scratch("slug-ownership");
+        let established = root.join("b.m4b");
+        touch(&established);
+        let newcomer = root.join("Shelf/b.m4b");
+        touch(&newcomer);
+
+        let index = Index::open_in_memory().unwrap();
+        index
+            .upsert_book(&BookRow {
+                id: "b".into(),
+                slug: "b".into(),
+                feed_id: "cap-b".into(),
+                title: "B".into(),
+                author: None,
+                cover_path: None,
+                source_path: established
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                source_mtime: 1,
+                status: "ready".into(),
+                storage_mode: String::new(),
+                default_cover_url: None,
+                force_embedded: false,
+                transcode: "off".into(),
+            })
+            .unwrap();
+
+        // The newcomer is refused the slug even though it is processed first.
+        let mut seen = HashSet::new();
+        assert_eq!(assign_slug("b", &newcomer, &index, &mut seen), "b-2");
+        // And the book that owns it still gets it.
+        assert_eq!(assign_slug("b", &established, &index, &mut seen), "b");
+
+        // Even when the owner's file is gone (a move), the live index row still
+        // holds the id — a newcomer must NOT inherit its capability feed. The row
+        // is retired by `prune_orphans` in the same reconcile, freeing the id for a
+        // LATER scan; within this one, the newcomer stays on `b-2`.
+        std::fs::remove_file(&established).unwrap();
+        let mut seen = HashSet::new();
+        assert_eq!(assign_slug("b", &newcomer, &index, &mut seen), "b-2");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_mp3_track_that_links_outside_the_library_is_dropped() {
+        // The folder is inside the library, but a track within it symlinks out.
+        // `source_is_inside` only vetted the folder, so the track has to be caught
+        // where the tracks are gathered, or it 404s at serve time.
+        let outside = scratch("mp3-outside");
+        std::fs::write(outside.join("external.mp3"), b"x").unwrap();
+
+        let root = scratch("mp3-escape");
+        let folder = root.join("A Book");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("01.mp3"), b"x").unwrap();
+        std::os::unix::fs::symlink(outside.join("external.mp3"), folder.join("02.mp3")).unwrap();
+
+        let real_root = root.canonicalize().unwrap();
+        let tracks = collect_mp3s(&folder.canonicalize().unwrap(), &real_root);
+        let names: Vec<String> = tracks
+            .iter()
+            .map(|t| t.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["01.mp3"], "the escaping track must be dropped");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_broken_link_is_skipped_rather_than_indexed() {
+        // `canonicalize` fails on a dangling link, which must not be treated as
+        // "inside the library" — nor panic the scan.
+        let root = scratch("discover-broken-link");
+        touch(&root.join("Author/Real/real.m4b"));
+        let dangling_dir = root.join("Author/Dangling");
+        std::fs::create_dir_all(&dangling_dir).unwrap();
+        std::os::unix::fs::symlink(
+            root.join("nothing-here.m4b"),
+            dangling_dir.join("dangling.m4b"),
+        )
+        .unwrap();
+
+        let found = discover(&root, &root.join("data"));
+        assert_eq!(
+            found,
+            vec![BookSource::File(root.join("Author/Real/real.m4b"))]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_directory_costs_one_book_not_the_scan() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("discover-unreadable");
+        touch(&root.join("Author/Readable/ok.m4b"));
+        let locked = root.join("Author/Locked");
+        touch(&locked.join("hidden.m4b"));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let found = discover(&root, &root.join("data"));
+        // Running as root defeats the permission bits; skip rather than fail.
+        if std::fs::read_dir(&locked).is_ok() {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let _ = std::fs::remove_dir_all(&root);
+            skip!("running as root, permissions are not enforced");
+        }
+        assert_eq!(
+            found,
+            vec![BookSource::File(root.join("Author/Readable/ok.m4b"))],
+            "an unreadable directory must not abort the walk"
+        );
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn root_files_and_directories_keep_their_historical_order() {
+        let root = scratch("discover-order");
+        touch(&root.join("Dracula.m4b"));
+        touch(&root.join("Dracula/inner.m4b"));
+        touch(&root.join("apple.m4b"));
+        touch(&root.join("Beta/b.m4b"));
+
+        let found = discover(&root, &root.join("data"));
+        assert_eq!(
+            found,
+            vec![
+                // Path-sorted, files and directories together: "Beta" < "Dracula"
+                // < "Dracula.m4b" < "apple.m4b".
+                BookSource::File(root.join("Beta/b.m4b")),
+                BookSource::File(root.join("Dracula/inner.m4b")),
+                BookSource::File(root.join("Dracula.m4b")),
+                BookSource::File(root.join("apple.m4b")),
+            ],
+            "directories must not be pushed behind every root file"
+        );
+
+        let index = Index::open_in_memory().unwrap();
+        let mut seen = HashSet::new();
+        let slugs: Vec<String> = found
+            .iter()
+            .map(|s| {
+                let p = match s {
+                    BookSource::File(p) => p.as_path(),
+                    BookSource::Mp3Folder(d) => d.as_path(),
+                };
+                assign_slug(&slugify(&s.base_name(&root)), p, &index, &mut seen)
+            })
+            .collect();
+        // `Dracula/inner.m4b` keeps `inner`; the folder book and the root file do not
+        // trade ids.
+        assert_eq!(slugs, vec!["b", "inner", "dracula", "apple"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn loose_mp3s_at_the_root_stay_separate_books() {
+        // The root is not a book folder: several loose `.mp3` there are several
+        // single-file books, not one book whose tracks are the whole library.
+        let root = scratch("discover-root-mp3");
+        touch(&root.join("01 - First Book.mp3"));
+        touch(&root.join("02 - Second Book.mp3"));
+
+        let found = discover(&root, &root.join("data"));
+        assert_eq!(
+            found,
+            vec![
+                BookSource::File(root.join("01 - First Book.mp3")),
+                BookSource::File(root.join("02 - Second Book.mp3")),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_that_leave_the_library_are_not_indexed() {
+        // The serve layer canonicalizes an episode's source and refuses anything
+        // outside the library root, so indexing these would publish feeds whose
+        // audio 404s. Both a linked directory and a linked file must be refused.
+        let outside = scratch("discover-outside");
+        touch(&outside.join("Elsewhere/external.m4b"));
+        touch(&outside.join("loose-external.m4b"));
+
+        let root = scratch("discover-escape");
+        touch(&root.join("Author/Real Book/real.m4b"));
+        std::os::unix::fs::symlink(outside.join("Elsewhere"), root.join("linked-dir")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.join("loose-external.m4b"),
+            root.join("Author/linked-file.m4b"),
+        )
+        .unwrap();
+
+        let found = discover(&root, &root.join("data"));
+        assert_eq!(
+            found,
+            vec![BookSource::File(root.join("Author/Real Book/real.m4b"))],
+            "nothing outside the library root may be indexed"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_pointing_within_the_library_is_still_followed() {
+        // The guard is containment, not "no symlinks": a link that stays inside
+        // the library is legitimate (a shelf of favourites, say).
+        let root = scratch("discover-inside-link");
+        touch(&root.join("Author/Real Book/real.m4b"));
+        std::os::unix::fs::symlink(root.join("Author"), root.join("Shelf")).unwrap();
+
+        let found = discover(&root, &root.join("data"));
+        // Once, not twice: the visited-set collapses the two routes to one book.
+        assert_eq!(found.len(), 1, "{found:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_nested_book_is_titled_by_its_folder_not_its_filename() {
+        let root = scratch("nested-title");
+        let island =
+            BookSource::File(root.join(
+                "Jules Verne/The Mysterious Island/Jules Verne -   - The Mysterious Island.m4b",
+            ));
+        assert_eq!(
+            nested_title(&island, &root).as_deref(),
+            Some("The Mysterious Island")
+        );
+
+        // Deeper still: the book's own folder, not the series above it.
+        let deep = BookSource::File(root.join("Homer/The Epic Cycle/#1 - The Odyssey/x.m4b"));
+        assert_eq!(
+            nested_title(&deep, &root).as_deref(),
+            Some("#1 - The Odyssey")
+        );
+
+        // Unchanged where a book may already be indexed: a root file and a book
+        // directly below the root keep the file stem they have always had.
+        assert_eq!(
+            nested_title(&BookSource::File(root.join("Top.m4b")), &root),
+            None
+        );
+        assert_eq!(
+            nested_title(&BookSource::File(root.join("a-folder/inner.m4b")), &root),
+            None
+        );
+        // An MP3-folder book is already named by its folder.
+        assert_eq!(
+            nested_title(&BookSource::Mp3Folder(root.join("Author/Tracks")), &root),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn same_title_under_two_authors_does_not_collide() {
+        let root = scratch("discover-collision");
+        touch(&root.join("Author One/Dracula/dracula.m4b"));
+        touch(&root.join("Author Two/Dracula/dracula.m4b"));
+
+        let index = Index::open_in_memory().unwrap();
+        let mut seen = HashSet::new();
+        let slugs: Vec<String> = discover(&root, &root.join("data"))
+            .iter()
+            .map(|s| {
+                let p = match s {
+                    BookSource::File(p) => p.as_path(),
+                    BookSource::Mp3Folder(d) => d.as_path(),
+                };
+                assign_slug(&slugify(&s.base_name(&root)), p, &index, &mut seen)
+            })
+            .collect();
+        // Not `dracula` and `dracula-2`, whose assignment would hinge on walk order.
+        assert_eq!(slugs, vec!["author-one-dracula", "author-two-dracula"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_walk_never_enters_the_data_dir() {
+        // A data dir inside the library is legitimate. Its extracted episodes are
+        // audio files in numbered folders, so a naive walk would index podspine's
+        // own output as books and re-split it.
+        let root = scratch("discover-datadir");
+        // Deliberately NOT a dot-directory: those are skipped by name, which would
+        // let this test pass without the data-dir guard ever running.
+        let data = root.join("podspine-data");
+        touch(&root.join("Author/Title/book.m4b"));
+        touch(&data.join("books/author-title/001.m4a"));
+        touch(&data.join("books/author-title/002.m4a"));
+
+        let found = discover(&root, &data);
+        assert_eq!(
+            found,
+            vec![BookSource::File(root.join("Author/Title/book.m4b"))],
+            "extracted episodes must never be discovered as books"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn housekeeping_directories_are_skipped() {
+        let root = scratch("discover-ignored");
+        touch(&root.join("Author/Title/book.m4b"));
+        touch(&root.join("@eaDir/Title/thumb.m4a")); // Synology thumbnail cache
+        touch(&root.join(".stfolder/Title/sync.m4b")); // Syncthing marker
+        touch(&root.join("lost+found/Title/orphan.m4b"));
+
+        let found = discover(&root, &root.join("data"));
+        assert_eq!(
+            found,
+            vec![BookSource::File(root.join("Author/Title/book.m4b"))]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_walk_stops_at_the_depth_limit() {
+        let root = scratch("discover-depth");
+        let mut deep = root.clone();
+        for i in 0..(MAX_LIBRARY_DEPTH + 3) {
+            deep = deep.join(format!("level{i}"));
+        }
+        touch(&deep.join("too-deep.m4b"));
+        touch(&root.join("Author/Title/reachable.m4b"));
+
+        let found = discover(&root, &root.join("data"));
+        assert_eq!(
+            found,
+            vec![BookSource::File(root.join("Author/Title/reachable.m4b"))],
+            "a book past the depth limit is skipped, and the walk still terminates"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_loop_terminates_and_indexes_each_book_once() {
+        let root = scratch("discover-loop");
+        touch(&root.join("Author/Title/book.m4b"));
+        // A classic: a folder that links back to the library root.
+        std::os::unix::fs::symlink(&root, root.join("Author/back-to-root")).unwrap();
+
+        let found = discover(&root, &root.join("data"));
+        assert_eq!(
+            found,
+            vec![BookSource::File(root.join("Author/Title/book.m4b"))],
+            "the loop guard must not let the same book in twice"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_lone_tier2_file_in_its_own_folder_is_a_book() {
+        let root = scratch("discover-tier2");
+        touch(&root.join("Author/A FLAC Book/book.flac"));
+        touch(&root.join("Author/An Opus Book/book.opus"));
+        // Several Tier-2 files is NOT an MP3-folder equivalent: that path reads
+        // only `.mp3`, so half-ingesting these would be worse than skipping them.
+        touch(&root.join("Author/Multi FLAC/01.flac"));
+        touch(&root.join("Author/Multi FLAC/02.flac"));
+
+        let found = discover(&root, &root.join("data"));
+        assert_eq!(
+            found,
+            vec![
+                BookSource::File(root.join("Author/A FLAC Book/book.flac")),
+                BookSource::File(root.join("Author/An Opus Book/book.opus")),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_drm_file_nested_in_the_tree_is_still_refused() {
+        let root = scratch("discover-nested-drm");
+        touch(&root.join("Author/Title/book.aax"));
+        touch(&root.join("Author/Other/book.m4b"));
+
+        let found = discover(&root, &root.join("data"));
+        assert_eq!(
+            found,
+            vec![BookSource::File(root.join("Author/Other/book.m4b"))]
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2421,7 +3571,7 @@ mod tests {
         touch(&root.join("mp3-multi/02.mp3")); // several mp3s -> folder book
         touch(&root.join("empty-folder/readme.txt")); // no audio -> ignored
 
-        let found = discover(&root);
+        let found = discover(&root, &root.join("data"));
         // Path-sorted: "Top Book.m4b" < "a-m4b-book" < "mp3-multi" < "mp3-single".
         assert_eq!(
             found,
@@ -2442,27 +3592,27 @@ mod tests {
         }
         // Two books that slugify identically, in separate folders. The folder
         // names must differ by more than case so they stay distinct on
-        // case-insensitive filesystems (Windows/macOS) — `Dune` and `Dune!`
-        // both slugify to "dune" but are two real directories everywhere.
+        // case-insensitive filesystems (Windows/macOS) — `Dracula` and
+        // `Dracula!` both slugify to "dracula" but are two real directories.
         let root = scratch("dup-lib");
         let b1 = synth(
             &{
-                let d = root.join("Dune");
+                let d = root.join("Dracula");
                 std::fs::create_dir_all(&d).unwrap();
                 d
             },
             false,
         );
-        std::fs::rename(&b1, root.join("Dune/Dune.m4a")).unwrap();
+        std::fs::rename(&b1, root.join("Dracula/Dracula.m4a")).unwrap();
         let b2 = synth(
             &{
-                let d = root.join("Dune!");
+                let d = root.join("Dracula!");
                 std::fs::create_dir_all(&d).unwrap();
                 d
             },
             false,
         );
-        std::fs::rename(&b2, root.join("Dune!/Dune.m4a")).unwrap();
+        std::fs::rename(&b2, root.join("Dracula!/Dracula.m4a")).unwrap();
 
         let data = root.join("data");
         let index = Index::open_in_memory().unwrap();
@@ -2474,7 +3624,7 @@ mod tests {
         assert_eq!(books.len(), 2, "no clobber: two distinct rows");
         let slugs: HashSet<_> = books.iter().map(|b| b.slug.clone()).collect();
         assert!(
-            slugs.contains("dune") && slugs.contains("dune-2"),
+            slugs.contains("dracula") && slugs.contains("dracula-2"),
             "got {slugs:?}"
         );
 

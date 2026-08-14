@@ -53,7 +53,8 @@ CREATE TABLE IF NOT EXISTS book (
     storage_mode TEXT NOT NULL DEFAULT '',
     default_cover_url TEXT,
     force_embedded INTEGER NOT NULL DEFAULT 0,
-    transcode    TEXT NOT NULL DEFAULT ''
+    transcode    TEXT NOT NULL DEFAULT '',
+    created_at   INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS episode (
     guid          TEXT PRIMARY KEY,
@@ -282,6 +283,33 @@ impl Index {
                 [],
             )?;
         }
+        // `book.created_at` (first-seen time, epoch millis). Its only use is
+        // picking the survivor when healing a database that holds two rows for one
+        // source: the earliest-created row is the feed subscribers have held
+        // longest (`collapse_duplicate_source_rows`).
+        //
+        // Pre-existing rows are back-filled from `rowid`, NOT a flat 0. rowid is
+        // SQLite's monotonic insertion counter, so it reproduces the order rows
+        // were first written — which is exactly "created_at" for rows we didn't
+        // stamp. A flat 0 would tie every migrated row, and a database that already
+        // held a duplicate (an established suffixed `book-2` plus a later base
+        // `book`) would then fall back to id order and delete the established feed
+        // (Greptile). rowid keeps them distinct and correctly ordered. rowid values
+        // are tiny next to the epoch-millis stamps new rows get, so a migrated row
+        // always sorts before any row written afterwards — still correct, since it
+        // is genuinely older.
+        let has_book_created_at: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('book') WHERE name = 'created_at'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_book_created_at == 0 {
+            conn.execute(
+                "ALTER TABLE book ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+            conn.execute("UPDATE book SET created_at = rowid", [])?;
+        }
         Ok(())
     }
 
@@ -294,14 +322,17 @@ impl Index {
     pub fn upsert_book(&self, b: &BookRow) -> Result<(), IndexError> {
         self.conn.execute(
             "INSERT INTO book
-               (id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status, storage_mode, default_cover_url, force_embedded, transcode)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+               (id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status, storage_mode, default_cover_url, force_embedded, transcode, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(id) DO UPDATE SET
                slug=excluded.slug, title=excluded.title, author=excluded.author,
                cover_path=excluded.cover_path, source_path=excluded.source_path,
                source_mtime=excluded.source_mtime, status=excluded.status,
                storage_mode=excluded.storage_mode, default_cover_url=excluded.default_cover_url,
                force_embedded=excluded.force_embedded, transcode=excluded.transcode",
+            // created_at is set on first insert and deliberately absent from the
+            // UPDATE set, so a re-scan preserves a book's first-seen time — the same
+            // way feed_id is preserved.
             params![
                 b.id,
                 b.slug,
@@ -316,6 +347,7 @@ impl Index {
                 b.default_cover_url,
                 b.force_embedded,
                 b.transcode,
+                now_epoch_millis(),
             ],
         )?;
         Ok(())
@@ -386,6 +418,18 @@ impl Index {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// `(id, source_path, created_at)` for every book — the minimum the scanner
+    /// needs to collapse duplicate-source rows to their earliest-created survivor,
+    /// without pulling every full [`BookRow`]. Ordered oldest-first, id-tiebroken,
+    /// so a caller keeping the first of a source-group keeps the established feed.
+    pub fn book_source_identities(&self) -> Result<Vec<(String, String, i64)>, IndexError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, source_path, created_at FROM book ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// Episodes for a book, ordered by chapter index (chapter 1 first).
     pub fn episodes_for_book(&self, book_id: &str) -> Result<Vec<EpisodeRow>, IndexError> {
         let mut stmt = self.conn.prepare(
@@ -443,6 +487,16 @@ impl Index {
             )
             .optional()?)
     }
+}
+
+/// Wall-clock **milliseconds** since the Unix epoch, for a book's first-seen time.
+/// Milliseconds (not seconds) so two books indexed close together still order
+/// distinctly. A clock before 1970 (unset RTC) clamps to 0 rather than panicking.
+fn now_epoch_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn book_from_row(row: &Row) -> rusqlite::Result<BookRow> {
@@ -671,11 +725,71 @@ mod tests {
             book.transcode, "",
             "migrated rows default to an empty transcode mode (pre-5.2, not transcoded)"
         );
+        let (_, _, created_at) = idx
+            .book_source_identities()
+            .unwrap()
+            .into_iter()
+            .find(|(id, _, _)| id == "b1")
+            .unwrap();
+        assert_eq!(
+            created_at, 1,
+            "a migrated row is back-filled from its rowid (the only book, so rowid 1)"
+        );
 
         // Idempotent: reopening an already-migrated DB is a no-op.
         drop(idx);
         assert!(Index::open(&db).is_ok());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migration_backfills_created_at_from_insertion_order() {
+        // Greptile's case: a pre-`created_at` database that already holds an
+        // established suffixed row (`book-2`, inserted first) and a later base-id
+        // duplicate (`book`) for ONE source. Back-filling both to a flat 0 would
+        // tie them and let survivor-selection fall back to id order, deleting the
+        // established feed. rowid preserves insertion order, so `book-2` keeps the
+        // earlier `created_at` and `book_source_identities` returns it first — which
+        // is the row the heal keeps.
+        let dir = std::env::temp_dir().join("podspine-index-createdat-order");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("old.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE book (
+                    id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, feed_id TEXT NOT NULL UNIQUE,
+                    title TEXT NOT NULL, author TEXT, cover_path TEXT, source_path TEXT NOT NULL,
+                    source_mtime INTEGER NOT NULL, status TEXT NOT NULL);",
+            )
+            .unwrap();
+            // Established row FIRST (smaller rowid), duplicate SECOND — same source.
+            conn.execute(
+                "INSERT INTO book VALUES ('book-2','book-2','cap-established','Book',NULL,NULL,'/lib/book.m4b',1,'ready')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO book VALUES ('book','book','cap-duplicate','Book',NULL,NULL,'/lib/book.m4b',1,'ready')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let idx = Index::open(&db).unwrap();
+        let ids: Vec<String> = idx
+            .book_source_identities()
+            .unwrap()
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["book-2", "book"],
+            "the established (earlier-inserted) row must sort first, not the base id"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

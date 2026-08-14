@@ -142,7 +142,9 @@ separate from the feed server. See **[metrics](docs/DEPLOYMENT.md#metrics-promet
 ## Supported formats
 
 Point Podspine at a folder; each audiobook becomes its own feed. A book can be a
-single file or a per-book subfolder.
+single file or a per-book subfolder, **at any depth** — an
+`Author/Title/book.m4b` library (what Audiobookshelf, Plex and Jellyfin produce)
+is scanned as-is, series folders and all. Nothing needs rearranging.
 
 | Tier | Formats | Chapter source |
 |---|---|---|
