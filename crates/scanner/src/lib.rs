@@ -27,7 +27,7 @@
 //! recorded; nothing is copied under `<data_dir>`. Only chaptered books, whose
 //! episodes are sub-ranges of a container, are extracted (`full`/`saver`).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -931,6 +931,19 @@ pub fn scan_library(
         .unwrap_or_else(|_| library.to_path_buf());
     let sources = discover(&library_root, data_dir);
 
+    // Every already-indexed book, keyed by its (canonical) source path. A source
+    // that is already indexed keeps whatever id it has — including a `-2` suffix it
+    // once earned — instead of being re-derived from its name. Without this, a book
+    // that was suffixed because a now-pruned stale row occupied its base id would,
+    // on the next scan, ALSO be indexed under the freed base id: one audiobook
+    // under two capability feeds (Greptile). Reuse makes the id stable per source.
+    let existing_by_source: HashMap<PathBuf, String> = index
+        .list_books()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|b| (PathBuf::from(b.source_path), b.id))
+        .collect();
+
     let mut seen = HashSet::new();
     let mut summary = ScanSummary::default();
     for source in sources {
@@ -938,15 +951,26 @@ pub fn scan_library(
             BookSource::File(p) => p.as_path(),
             BookSource::Mp3Folder(d) => d.as_path(),
         };
-        // Reserve a slug for every candidate in deterministic order so a book's
-        // slug is stable across re-scans regardless of siblings' outcomes — and
-        // never one a different, still-present book already holds.
-        let slug = assign_slug(
-            &slugify(&source.base_name(&library_root)),
-            source_path,
-            index,
-            &mut seen,
-        );
+        // If this exact source is already indexed, keep its id — that is what makes
+        // a feed URL stable across scans, and what stops a once-suffixed book from
+        // being re-indexed under a since-freed base id. Otherwise reserve a slug in
+        // deterministic order, never one a different still-present book holds.
+        let slug = match source_path
+            .canonicalize()
+            .ok()
+            .and_then(|c| existing_by_source.get(&c))
+        {
+            Some(id) => {
+                seen.insert(id.clone());
+                id.clone()
+            }
+            None => assign_slug(
+                &slugify(&source.base_name(&library_root)),
+                source_path,
+                index,
+                &mut seen,
+            ),
+        };
         let mut overrides = resolve_book_overrides(source_path, &library_root);
         // A nested book's filename is usually `Author -   - Title.m4b`; its folder
         // is just `Title`. Seed the title from the folder unless the book's own
@@ -2910,6 +2934,73 @@ mod tests {
     /// would keep working and start serving a different audiobook. This is the
     /// case a folder of several `.m4b` files opened up — its second file was never
     /// discovered before, and its stem can collide with an existing book.
+    /// The two-scan hazard: a newcomer suffixed because a stale row held its base
+    /// id must not, once that stale row is pruned, be re-indexed under the freed
+    /// base id on the next scan — that is one audiobook under two feeds. Reusing an
+    /// already-indexed source'"'"'s id closes it. Exercised through `reconcile`, which
+    /// is scan-then-prune, run twice.
+    #[test]
+    fn a_source_keeps_one_id_across_consecutive_reconciles() {
+        if !ffmpeg_available() {
+            skip!("ffmpeg not available");
+        }
+        let root = scratch("dup-feed");
+        let data = root.join("data");
+        let index = Index::open_in_memory().unwrap();
+
+        // A stale row already owns the base slug `foo`; its file does not exist.
+        index
+            .upsert_book(&BookRow {
+                id: "foo".into(),
+                slug: "foo".into(),
+                feed_id: "cap-foo-stale".into(),
+                title: "Stale".into(),
+                author: None,
+                cover_path: None,
+                source_path: root.join("gone.m4b").to_string_lossy().into_owned(),
+                source_mtime: 1,
+                status: "ready".into(),
+                storage_mode: String::new(),
+                default_cover_url: None,
+                force_embedded: false,
+                transcode: "off".into(),
+            })
+            .unwrap();
+
+        // A real newcomer whose stem slugifies to `foo`.
+        if synth_encoded(&root, "Foo.m4b", &["-c:a", "aac"], 4).is_none() {
+            skip!("no aac encoder");
+        }
+        let newcomer = root.join("Foo.m4b").canonicalize().unwrap();
+
+        // Reconcile #1: newcomer is suffixed to `foo-2`, stale `foo` is pruned.
+        reconcile(&root, &data, &index, ScanOptions::default());
+        // Reconcile #2: `foo` is free now, but the newcomer must keep `foo-2`.
+        reconcile(&root, &data, &index, ScanOptions::default());
+
+        let books = index.list_books().unwrap();
+        let for_newcomer: Vec<&BookRow> = books
+            .iter()
+            .filter(|b| {
+                Path::new(&b.source_path)
+                    .canonicalize()
+                    .map(|c| c == newcomer)
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(
+            for_newcomer.len(),
+            1,
+            "the source must be indexed exactly once, not once per freed id: {:?}",
+            books
+                .iter()
+                .map(|b| (&b.id, &b.source_path))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(for_newcomer[0].id, "foo-2", "and it keeps its stable id");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn a_new_file_cannot_take_a_live_books_slug() {
         let root = scratch("slug-ownership");
