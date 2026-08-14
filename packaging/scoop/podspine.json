@@ -1,5 +1,5 @@
 {
-    "version": "1.5.0",
+    "version": "1.6.0",
     "description": "Self-hosted server that turns audiobooks into per-chapter podcast feeds",
     "homepage": "https://github.com/schubydoo/podspine",
     "license": "AGPL-3.0-only",
@@ -9,8 +9,8 @@
     },
     "architecture": {
         "64bit": {
-            "url": "https://github.com/schubydoo/podspine/releases/download/v1.5.0/podspine-v1.5.0-windows-amd64.exe#/podspine.exe",
-            "hash": "d0c20f237e89013a5192fd110f0e2c6b87299d50512dd96d4d12c90d45d52274"
+            "url": "https://github.com/schubydoo/podspine/releases/download/v1.6.0/podspine-v1.6.0-windows-amd64.exe#/podspine.exe",
+            "hash": "0b50a91c46b65d8c9c323fc12b17229cec58c805e3ac1bd6d73673f1944f90c9"
         }
     },
     "bin": "podspine.exe",
