@@ -154,12 +154,12 @@ Point `--library` at the top of your collection. Podspine walks it and treats th
 library/
 ├── Standalone Book.m4b                     # a loose file
 ├── Another Book/book.m4b                   # a book in its own folder
-├── Andy Weir/
-│   ├── Artemis/Andy Weir - Artemis.m4b     # author → title
-│   └── Project Hail Mary/phm.m4b
-└── Cixin Liu/
-    └── Remembrance of Earth's Past/        # author → series → title
-        └── 1 - The Three-Body Problem/tbp.m4b
+├── Jules Verne/
+│   ├── The Mysterious Island/verne - island.m4b   # author → title
+│   └── Journey to the Centre of the Earth/jttcote.m4b
+└── Homer/
+    └── The Epic Cycle/                     # author → series → title
+        └── 1 - The Odyssey/odyssey.m4b
 ```
 
 - **A folder holding several `.m4b`/`.m4a` files is several books** — one file is
@@ -169,9 +169,10 @@ library/
   book's own `extras/` folder is never ingested as another book. The trade: in a
   mixed `Author/{loose.m4b, Title/…}`, only `loose.m4b` is found — give each book
   its own folder.
-- **Nested books are named by their folder.** `Andy Weir/Artemis/Andy Weir -   -
-  Artemis.m4b` is titled *Artemis*, not the filename, and gets the slug
-  `andy-weir-artemis` so two authors can both have a *Dune*. Books at the top level
+- **Nested books are named by their folder.** `Jules Verne/The Mysterious
+  Island/Jules Verne -   - The Mysterious Island.m4b` is titled *The Mysterious
+  Island*, not the filename, and gets the slug `jules-verne-the-mysterious-island`
+  so two authors can both have a *Dracula*. Books at the top level
   (or one folder below it) keep the names they already had — their slug is their
   id, and changing it would rotate a book's capability feed URL out from under
   anyone subscribed to it.

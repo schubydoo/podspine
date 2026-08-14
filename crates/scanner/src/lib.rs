@@ -805,9 +805,10 @@ impl BookSource {
     ///
     /// A book found *deeper* than that has never been indexed before, so its name
     /// can be the better one: the path from the library root to its folder, joined
-    /// — `Andy Weir/Artemis/…m4b` → `Andy Weir - Artemis`. That reads well, and it
+    /// — `Jules Verne/The Mysterious Island/…m4b` → `Jules Verne - The Mysterious Island`. That reads well, and it
     /// keeps two books of the same title under different authors from colliding
-    /// into `artemis` and `artemis-2`, whose assignment would depend on walk order.
+    /// into `the-mysterious-island` and `-2`, whose assignment would depend on walk
+    /// order.
     fn base_name(&self, library_root: &Path) -> String {
         match self {
             BookSource::File(p) => match nested_prefix(p.parent(), library_root) {
@@ -826,8 +827,8 @@ impl BookSource {
     }
 }
 
-/// The folder a nested book sits in, as its display title: `Andy Weir/Artemis/Andy
-/// Weir -   - Artemis.m4b` → `Some("Artemis")`.
+/// The folder a nested book sits in, as its display title: `Jules Verne/The Mysterious
+/// Island/Jules Verne -   - The Mysterious Island.m4b` → `Some("The Mysterious Island")`.
 ///
 /// A nested library names the book on the folder and treats the filename as a
 /// dumping ground for author, narrator and separators, so the folder is almost
@@ -847,7 +848,7 @@ fn nested_title(source: &BookSource, library_root: &Path) -> Option<String> {
 }
 
 /// The joined path from `library_root` to a book folder, for a book nested deeper
-/// than one level: `<root>/Andy Weir/Artemis` → `Some("Andy Weir - Artemis")`.
+/// than one level: `<root>/Jules Verne/The Mysterious Island` → `Some("Jules Verne - The Mysterious Island")`.
 ///
 /// `None` for a book at or directly below the root — those keep their historical
 /// name (see [`BookSource::base_name`]) — and for anything outside the root.
@@ -1208,7 +1209,7 @@ fn walk_library(
     // It matters: the order decides which of two same-named books gets the bare
     // slug and which gets the `-2` suffix, and that slug is the book id whose
     // capability feed id is preserved across re-scans. Emitting all files ahead of
-    // all directories would swap `Dune.m4b` and `Dune/` — handing each subscriber
+    // all directories would swap `Dracula.m4b` and `Dracula/` — handing each subscriber
     // the other audiobook under the URL they already have.
     //
     // A root file is a book in its own right (never grouped: several loose `.mp3`
@@ -2651,9 +2652,9 @@ mod tests {
     #[test]
     fn unique_slug_disambiguates_collisions() {
         let mut seen = HashSet::new();
-        assert_eq!(unique_slug("dune", &mut seen), "dune");
-        assert_eq!(unique_slug("dune", &mut seen), "dune-2");
-        assert_eq!(unique_slug("dune", &mut seen), "dune-3");
+        assert_eq!(unique_slug("dracula", &mut seen), "dracula");
+        assert_eq!(unique_slug("dracula", &mut seen), "dracula-2");
+        assert_eq!(unique_slug("dracula", &mut seen), "dracula-3");
         assert_eq!(unique_slug("other", &mut seen), "other");
     }
 
@@ -2677,13 +2678,18 @@ mod tests {
                 4,
             )
         };
-        if mk("Andy Weir/Artemis/Andy Weir - Artemis.m4b").is_none() {
+        if mk("Jules Verne/The Mysterious Island/Jules Verne - The Mysterious Island.m4b").is_none()
+        {
             skip!("no aac encoder");
         }
-        mk("Andy Weir/Project Hail Mary/phm.m4b").unwrap();
-        mk("Cixin Liu/The Three-Body Problem/tbp.m4b").unwrap();
+        mk("Jules Verne/Journey to the Centre of the Earth/jttcote.m4b").unwrap();
+        mk("Mary Shelley/Frankenstein/frankenstein.m4b").unwrap();
         // A sibling that is not audio, and a book past nothing at all.
-        std::fs::write(root.join("Andy Weir/Artemis/metadata.json"), b"{}").unwrap();
+        std::fs::write(
+            root.join("Jules Verne/The Mysterious Island/metadata.json"),
+            b"{}",
+        )
+        .unwrap();
 
         let data = root.join("data");
         let index = Index::open_in_memory().unwrap();
@@ -2700,12 +2706,13 @@ mod tests {
         assert_eq!(
             slugs,
             vec![
-                "andy-weir-artemis",
-                "andy-weir-project-hail-mary",
-                "cixin-liu-the-three-body-problem"
+                "jules-verne-journey-to-the-centre-of-the-earth",
+                "jules-verne-the-mysterious-island",
+                "mary-shelley-frankenstein"
             ]
         );
-        // Titles come from the book folder, not from `Andy Weir -   - Artemis`.
+        // Titles come from the book folder, not from `Jules Verne -   - The
+        // Mysterious Island`.
         let mut titles: Vec<String> = index
             .list_books()
             .unwrap()
@@ -2715,7 +2722,11 @@ mod tests {
         titles.sort();
         assert_eq!(
             titles,
-            vec!["Artemis", "Project Hail Mary", "The Three-Body Problem"]
+            vec![
+                "Frankenstein",
+                "Journey to the Centre of the Earth",
+                "The Mysterious Island"
+            ]
         );
         // Each book has episodes, and its source is the file inside the tree.
         // Compare canonically: the scanner stores a canonicalized source path, and
@@ -2738,24 +2749,29 @@ mod tests {
         // The layout Audiobookshelf, Plex and Jellyfin all produce, and the one a
         // large library is least likely to rearrange.
         let root = scratch("discover-nested");
-        touch(&root.join("Andy Weir/Artemis/Andy Weir - Artemis.m4b"));
-        touch(&root.join("Andy Weir/Artemis/metadata.json")); // ignored sibling
-        touch(&root.join("Andy Weir/Project Hail Mary/phm.m4b"));
-        touch(&root.join("Cixin Liu/The Three-Body Problem/01.mp3"));
-        touch(&root.join("Cixin Liu/The Three-Body Problem/02.mp3"));
+        touch(
+            &root.join("Jules Verne/The Mysterious Island/Jules Verne - The Mysterious Island.m4b"),
+        );
+        touch(&root.join("Jules Verne/The Mysterious Island/metadata.json")); // ignored sibling
+        touch(&root.join("Jules Verne/Journey to the Centre of the Earth/jttcote.m4b"));
+        touch(&root.join("Mary Shelley/Frankenstein/01.mp3"));
+        touch(&root.join("Mary Shelley/Frankenstein/02.mp3"));
         // Deeper still: shelf -> author -> series -> title.
-        touch(&root.join("Shelf/Dennis E. Taylor/Bobiverse/We Are Legion/wal.m4b"));
+        touch(&root.join("Shelf/Homer/The Epic Cycle/The Odyssey/odyssey.m4b"));
 
         let found = discover(&root, &root.join("data"));
         assert_eq!(
             found,
             vec![
-                BookSource::File(root.join("Andy Weir/Artemis/Andy Weir - Artemis.m4b")),
-                BookSource::File(root.join("Andy Weir/Project Hail Mary/phm.m4b")),
-                BookSource::Mp3Folder(root.join("Cixin Liu/The Three-Body Problem")),
+                // Path-sorted: "Journey…" before "The Mysterious Island".
                 BookSource::File(
-                    root.join("Shelf/Dennis E. Taylor/Bobiverse/We Are Legion/wal.m4b")
+                    root.join("Jules Verne/Journey to the Centre of the Earth/jttcote.m4b")
                 ),
+                BookSource::File(root.join(
+                    "Jules Verne/The Mysterious Island/Jules Verne - The Mysterious Island.m4b"
+                )),
+                BookSource::Mp3Folder(root.join("Mary Shelley/Frankenstein")),
+                BookSource::File(root.join("Shelf/Homer/The Epic Cycle/The Odyssey/odyssey.m4b")),
             ]
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -2766,11 +2782,11 @@ mod tests {
         let root = scratch("discover-naming");
         touch(&root.join("Top Book.m4b"));
         touch(&root.join("a-folder-book/inner-name.m4b"));
-        touch(&root.join("Andy Weir/Artemis/ugly - - stem.m4b"));
+        touch(&root.join("Jules Verne/The Mysterious Island/ugly - - stem.m4b"));
         touch(&root.join("tracks/01.mp3"));
         touch(&root.join("tracks/02.mp3"));
-        touch(&root.join("Cixin Liu/Three Body/01.mp3"));
-        touch(&root.join("Cixin Liu/Three Body/02.mp3"));
+        touch(&root.join("Mary Shelley/Frankenstein/01.mp3"));
+        touch(&root.join("Mary Shelley/Frankenstein/02.mp3"));
 
         let name = |src: &BookSource| slugify(&src.base_name(&root));
         let found = discover(&root, &root.join("data"));
@@ -2782,8 +2798,8 @@ mod tests {
             names,
             vec![
                 // Nested: named by the path, not by an unhelpful file stem.
-                "andy-weir-artemis",
-                "cixin-liu-three-body",
+                "jules-verne-the-mysterious-island",
+                "mary-shelley-frankenstein",
                 // Unchanged: a root file keeps its stem...
                 "top-book",
                 // ...and a book directly below the root keeps its FILE stem, not
@@ -2805,8 +2821,8 @@ mod tests {
     #[test]
     fn root_files_and_directories_keep_their_historical_order() {
         let root = scratch("discover-order");
-        touch(&root.join("Dune.m4b"));
-        touch(&root.join("Dune/inner.m4b"));
+        touch(&root.join("Dracula.m4b"));
+        touch(&root.join("Dracula/inner.m4b"));
         touch(&root.join("apple.m4b"));
         touch(&root.join("Beta/b.m4b"));
 
@@ -2814,11 +2830,11 @@ mod tests {
         assert_eq!(
             found,
             vec![
-                // Path-sorted, files and directories together: "Beta" < "Dune" <
-                // "Dune.m4b" < "apple.m4b".
+                // Path-sorted, files and directories together: "Beta" < "Dracula"
+                // < "Dracula.m4b" < "apple.m4b".
                 BookSource::File(root.join("Beta/b.m4b")),
-                BookSource::File(root.join("Dune/inner.m4b")),
-                BookSource::File(root.join("Dune.m4b")),
+                BookSource::File(root.join("Dracula/inner.m4b")),
+                BookSource::File(root.join("Dracula.m4b")),
                 BookSource::File(root.join("apple.m4b")),
             ],
             "directories must not be pushed behind every root file"
@@ -2829,9 +2845,9 @@ mod tests {
             .iter()
             .map(|s| unique_slug(&slugify(&s.base_name(&root)), &mut seen))
             .collect();
-        // `Dune/inner.m4b` keeps `inner`; the folder book and the root file do not
+        // `Dracula/inner.m4b` keeps `inner`; the folder book and the root file do not
         // trade ids.
-        assert_eq!(slugs, vec!["b", "inner", "dune", "apple"]);
+        assert_eq!(slugs, vec!["b", "inner", "dracula", "apple"]);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2901,16 +2917,20 @@ mod tests {
     #[test]
     fn a_nested_book_is_titled_by_its_folder_not_its_filename() {
         let root = scratch("nested-title");
-        let artemis = BookSource::File(root.join("Andy Weir/Artemis/Andy Weir -   - Artemis.m4b"));
-        assert_eq!(nested_title(&artemis, &root).as_deref(), Some("Artemis"));
+        let island =
+            BookSource::File(root.join(
+                "Jules Verne/The Mysterious Island/Jules Verne -   - The Mysterious Island.m4b",
+            ));
+        assert_eq!(
+            nested_title(&island, &root).as_deref(),
+            Some("The Mysterious Island")
+        );
 
         // Deeper still: the book's own folder, not the series above it.
-        let deep = BookSource::File(
-            root.join("Cixin Liu/Remembrance of Earth's Past/#1 - The Three-Body Problem/x.m4b"),
-        );
+        let deep = BookSource::File(root.join("Homer/The Epic Cycle/#1 - The Odyssey/x.m4b"));
         assert_eq!(
             nested_title(&deep, &root).as_deref(),
-            Some("#1 - The Three-Body Problem")
+            Some("#1 - The Odyssey")
         );
 
         // Unchanged where a book may already be indexed: a root file and a book
@@ -2934,16 +2954,16 @@ mod tests {
     #[test]
     fn same_title_under_two_authors_does_not_collide() {
         let root = scratch("discover-collision");
-        touch(&root.join("Author One/Dune/dune.m4b"));
-        touch(&root.join("Author Two/Dune/dune.m4b"));
+        touch(&root.join("Author One/Dracula/dracula.m4b"));
+        touch(&root.join("Author Two/Dracula/dracula.m4b"));
 
         let mut seen = HashSet::new();
         let slugs: Vec<String> = discover(&root, &root.join("data"))
             .iter()
             .map(|s| unique_slug(&slugify(&s.base_name(&root)), &mut seen))
             .collect();
-        // Not `dune` and `dune-2`, whose assignment would hinge on walk order.
-        assert_eq!(slugs, vec!["author-one-dune", "author-two-dune"]);
+        // Not `dracula` and `dracula-2`, whose assignment would hinge on walk order.
+        assert_eq!(slugs, vec!["author-one-dracula", "author-two-dracula"]);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3087,27 +3107,27 @@ mod tests {
         }
         // Two books that slugify identically, in separate folders. The folder
         // names must differ by more than case so they stay distinct on
-        // case-insensitive filesystems (Windows/macOS) — `Dune` and `Dune!`
-        // both slugify to "dune" but are two real directories everywhere.
+        // case-insensitive filesystems (Windows/macOS) — `Dracula` and
+        // `Dracula!` both slugify to "dracula" but are two real directories.
         let root = scratch("dup-lib");
         let b1 = synth(
             &{
-                let d = root.join("Dune");
+                let d = root.join("Dracula");
                 std::fs::create_dir_all(&d).unwrap();
                 d
             },
             false,
         );
-        std::fs::rename(&b1, root.join("Dune/Dune.m4a")).unwrap();
+        std::fs::rename(&b1, root.join("Dracula/Dracula.m4a")).unwrap();
         let b2 = synth(
             &{
-                let d = root.join("Dune!");
+                let d = root.join("Dracula!");
                 std::fs::create_dir_all(&d).unwrap();
                 d
             },
             false,
         );
-        std::fs::rename(&b2, root.join("Dune!/Dune.m4a")).unwrap();
+        std::fs::rename(&b2, root.join("Dracula!/Dracula.m4a")).unwrap();
 
         let data = root.join("data");
         let index = Index::open_in_memory().unwrap();
@@ -3119,7 +3139,7 @@ mod tests {
         assert_eq!(books.len(), 2, "no clobber: two distinct rows");
         let slugs: HashSet<_> = books.iter().map(|b| b.slug.clone()).collect();
         assert!(
-            slugs.contains("dune") && slugs.contains("dune-2"),
+            slugs.contains("dracula") && slugs.contains("dracula-2"),
             "got {slugs:?}"
         );
 
