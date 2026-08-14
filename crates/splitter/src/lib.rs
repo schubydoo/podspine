@@ -1059,6 +1059,70 @@ mod tests {
     }
 
     #[test]
+    fn an_unusable_output_directory_is_an_error_not_a_panic() {
+        // No ffmpeg needed: `create_dir_all` fails before anything is spawned
+        // (the "directory" is a regular file's child).
+        let dir = std::env::temp_dir().join("podspine-transcode-baddir");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocker = dir.join("not-a-directory");
+        std::fs::write(&blocker, b"x").unwrap();
+
+        let err = transcode_whole(
+            Path::new("in.flac"),
+            &blocker.join("books"),
+            0,
+            "m4a",
+            10.0,
+            Encoding::Aac,
+        )
+        .expect_err("an unusable out_dir must fail");
+        assert!(matches!(err, SplitError::CreateDir { .. }), "{err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_blocked_rename_is_reported_and_never_leaves_a_half_published_file() {
+        if !have_ffmpeg() {
+            eprintln!("skipping: ffmpeg not available");
+            return;
+        }
+        // A directory sitting where the episode must land blocks the atomic
+        // rename. The encode itself succeeds, so this exercises the publish step.
+        let dir = std::env::temp_dir().join("podspine-blocked-rename");
+        let _ = std::fs::remove_dir_all(&dir);
+        let out = dir.join("out");
+        std::fs::create_dir_all(out.join("001.m4a")).unwrap();
+        let input = dir.join("in.m4a");
+        let ok = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=3",
+                "-c:a",
+                "aac",
+            ])
+            .arg(&input)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "ffmpeg synth failed");
+
+        let err = transcode_whole(&input, &out, 0, "m4a", 3.0, Encoding::Aac)
+            .expect_err("the blocked rename must surface");
+        assert!(matches!(err, SplitError::Publish { idx: 0, .. }), "{err:?}");
+        assert!(
+            out.join("001.m4a").is_dir(),
+            "the blocker is left exactly as it was"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_failed_encode_leaves_the_published_episode_untouched() {
         if !have_ffmpeg() {
             eprintln!("skipping: ffmpeg not available");
