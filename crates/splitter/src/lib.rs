@@ -730,6 +730,26 @@ fn fmt_secs(v: f64) -> String {
 mod tests {
     use super::*;
 
+    /// Skip the rest of a test that this machine cannot run — no ffmpeg, or no
+    /// encoder for the format the test needs.
+    ///
+    /// The `eprintln!` and the `return` live here, once, instead of at every call
+    /// site. Wherever ffmpeg IS installed — CI, most dev machines — they cannot
+    /// execute, and 62 copies of them dominated the uncovered-line count (35 of the
+    /// 56 lines in PR 152's diff).
+    ///
+    /// Measured, not assumed: llvm-cov attributes a macro body to each **expansion**,
+    /// not to the definition, so a call site still reports one unreachable line —
+    /// one instead of two, which took 63 lines off the report (scanner 158 → 105
+    /// misses, splitter 45 → 35). One line per skip is the floor for deciding at
+    /// runtime; something has to stand for "this didn't run".
+    macro_rules! skip {
+        ($($why:tt)*) => {{
+            eprintln!("skipping: {}", format_args!($($why)*));
+            return;
+        }};
+    }
+
     fn have_ffmpeg() -> bool {
         Command::new("ffmpeg")
             .arg("-version")
@@ -955,8 +975,7 @@ mod tests {
                 .unwrap_or(false)
         }
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         // A real-time, unbounded encode that never terminates on its own; the
         // per-child timeout must kill it. Uses a deliberately tiny timeout via a
@@ -1016,8 +1035,7 @@ mod tests {
     #[test]
     fn split_maps_a_nonzero_ffmpeg_exit_to_a_split_error() {
         if !have_ffmpeg() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         // A positive-duration cut on a non-audio input: ffmpeg fails to read it
         // and exits non-zero, exercising run_ffmpeg's failure path + the mapping.
@@ -1084,8 +1102,7 @@ mod tests {
     #[test]
     fn a_blocked_rename_is_reported_and_never_leaves_a_half_published_file() {
         if !have_ffmpeg() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         // A directory sitting where the episode must land blocks the atomic
         // rename. The encode itself succeeds, so this exercises the publish step.
@@ -1125,8 +1142,7 @@ mod tests {
     #[test]
     fn a_failed_encode_leaves_the_published_episode_untouched() {
         if !have_ffmpeg() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         // The re-ingest hazard: an episode is already published and being served
         // when a new encode of it fails. The old bytes — and the byte_length the
@@ -1160,8 +1176,7 @@ mod tests {
     #[test]
     fn a_finished_encode_only_appears_at_the_final_path() {
         if !have_ffmpeg() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         let dir = std::env::temp_dir().join("podspine-atomic-ok");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1203,8 +1218,7 @@ mod tests {
     #[test]
     fn split_chapter_maps_a_nonzero_ffmpeg_exit_to_an_error() {
         if !have_ffmpeg() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         // `split_chapter` (the saver/regen entry point) on a non-audio input:
         // ffmpeg exits non-zero → the error arm, carrying the chapter index.
@@ -1227,8 +1241,7 @@ mod tests {
     #[test]
     fn remux_faststart_produces_a_deterministic_faststart_file() {
         if !have_ffmpeg() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         let dir = std::env::temp_dir().join("podspine-remux-ft");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1253,8 +1266,7 @@ mod tests {
             .map(|s| s.success())
             .unwrap_or(false);
         if !ok {
-            eprintln!("skipping: no aac encoder");
-            return;
+            skip!("no aac encoder");
         }
 
         let out = dir.join("out");
@@ -1292,8 +1304,7 @@ mod tests {
     #[test]
     fn remux_maps_a_nonzero_ffmpeg_exit_to_a_split_error() {
         if !have_ffmpeg() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         // A non-audio input makes ffmpeg exit non-zero → the remux error arm.
         let dir = std::env::temp_dir().join("podspine-remux-fail");
@@ -1338,8 +1349,7 @@ mod tests {
     #[test]
     fn extract_cover_maps_a_nonzero_ffmpeg_exit_to_a_cover_error() {
         if !have_ffmpeg() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         // No video stream to map -> ffmpeg exits non-zero -> CoverError::Ffmpeg.
         let dir = std::env::temp_dir().join("podspine-cover-fail");

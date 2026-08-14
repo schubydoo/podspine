@@ -1262,6 +1262,26 @@ mod tests {
     use super::*;
     use std::process::Command;
 
+    /// Skip the rest of a test that this machine cannot run — no ffmpeg, or no
+    /// encoder for the format the test needs.
+    ///
+    /// The `eprintln!` and the `return` live here, once, instead of at every call
+    /// site. Wherever ffmpeg IS installed — CI, most dev machines — they cannot
+    /// execute, and 62 copies of them dominated the uncovered-line count (35 of the
+    /// 56 lines in PR 152's diff).
+    ///
+    /// Measured, not assumed: llvm-cov attributes a macro body to each **expansion**,
+    /// not to the definition, so a call site still reports one unreachable line —
+    /// one instead of two, which took 63 lines off the report (scanner 158 → 105
+    /// misses, splitter 45 → 35). One line per skip is the floor for deciding at
+    /// runtime; something has to stand for "this didn't run".
+    macro_rules! skip {
+        ($($why:tt)*) => {{
+            eprintln!("skipping: {}", format_args!($($why)*));
+            return;
+        }};
+    }
+
     fn ffmpeg_available() -> bool {
         Command::new("ffmpeg")
             .arg("-version")
@@ -1389,8 +1409,7 @@ mod tests {
     #[test]
     fn mp3_folder_serves_tracks_in_place_in_track_order() {
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         let root = scratch("mp3-order");
         let book = root.join("A Folder Book");
@@ -1399,8 +1418,7 @@ mod tests {
         let b = synth_mp3(&book, "a-second.mp3", Some(2), 4);
         let c = synth_mp3(&book, "m-third.mp3", Some(3), 2);
         if a.is_none() || b.is_none() || c.is_none() {
-            eprintln!("skipping: ffmpeg has no libmp3lame encoder");
-            return;
+            skip!("ffmpeg has no libmp3lame encoder");
         }
 
         let data = root.join("data");
@@ -1455,8 +1473,7 @@ mod tests {
     #[test]
     fn mp3_folder_falls_back_to_filename_order_on_missing_track() {
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         let root = scratch("mp3-fallback");
         let book = root.join("Mixed Book");
@@ -1464,8 +1481,7 @@ mod tests {
         let a = synth_mp3(&book, "01-intro.mp3", None, 2);
         let b = synth_mp3(&book, "02-body.mp3", Some(5), 4);
         if a.is_none() || b.is_none() {
-            eprintln!("skipping: ffmpeg has no libmp3lame encoder");
-            return;
+            skip!("ffmpeg has no libmp3lame encoder");
         }
 
         let data = root.join("data");
@@ -1487,8 +1503,7 @@ mod tests {
     #[test]
     fn cue_sidecar_overrides_embedded_chapters() {
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         // synth() embeds THREE 10s chapters. A sibling .cue defines only TWO
         // chapters (0–5s, 5–30s), which must win.
@@ -1536,8 +1551,7 @@ mod tests {
     #[test]
     fn saver_mode_records_real_sizes_and_starts_but_deletes_the_files() {
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         let dir = scratch("saver-mode");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1600,8 +1614,7 @@ mod tests {
     #[test]
     fn saver_reingests_migrated_rows_with_zero_start_sec() {
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         let dir = scratch("saver-migrated");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1755,13 +1768,11 @@ mod tests {
     #[test]
     fn flac_with_cue_transcodes_to_aac_when_enabled() {
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         let dir = scratch("flac-transcode-aac");
         let Some(flac) = synth_encoded(&dir, "book.flac", &["-c:a", "flac"], 20) else {
-            eprintln!("skipping: no flac encoder");
-            return;
+            skip!("no flac encoder");
         };
         std::fs::write(
             flac.with_extension("cue"),
@@ -1816,13 +1827,11 @@ mod tests {
     #[test]
     fn chapterless_flac_transcodes_into_the_data_dir_instead_of_serving_in_place() {
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         let dir = scratch("flac-transcode-whole");
         let Some(flac) = synth_encoded(&dir, "whole.flac", &["-c:a", "flac"], 8) else {
-            eprintln!("skipping: no flac encoder");
-            return;
+            skip!("no flac encoder");
         };
         let data = dir.join("data");
         let index = Index::open_in_memory().unwrap();
@@ -1861,18 +1870,14 @@ mod tests {
     #[test]
     fn flac_transcodes_to_mp3_when_that_target_is_chosen() {
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         let dir = scratch("flac-transcode-mp3");
         let Some(flac) = synth_encoded(&dir, "book.flac", &["-c:a", "flac"], 6) else {
-            eprintln!("skipping: no flac encoder");
-            return;
+            skip!("no flac encoder");
         };
         if synth_encoded(&dir, "probe.mp3", &["-c:a", "libmp3lame"], 1).is_none() {
-            eprintln!("skipping: no libmp3lame encoder");
-            let _ = std::fs::remove_dir_all(&dir);
-            return;
+            skip!("no libmp3lame encoder");
         }
         let data = dir.join("data");
         let index = Index::open_in_memory().unwrap();
@@ -1913,13 +1918,11 @@ mod tests {
     #[test]
     fn a_transcoded_saver_book_keeps_its_episodes_on_disk() {
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         let dir = scratch("flac-transcode-saver");
         let Some(flac) = synth_encoded(&dir, "book.flac", &["-c:a", "flac"], 12) else {
-            eprintln!("skipping: no flac encoder");
-            return;
+            skip!("no flac encoder");
         };
         std::fs::write(
             flac.with_extension("cue"),
@@ -1996,13 +1999,11 @@ mod tests {
     #[test]
     fn switching_the_transcode_target_reclaims_the_previous_container() {
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         let dir = scratch("flac-transcode-reclaim");
         let Some(flac) = synth_encoded(&dir, "book.flac", &["-c:a", "flac"], 12) else {
-            eprintln!("skipping: no flac encoder");
-            return;
+            skip!("no flac encoder");
         };
         std::fs::write(
             flac.with_extension("cue"),
@@ -2069,13 +2070,11 @@ mod tests {
     #[test]
     fn a_failed_reingest_leaves_the_previous_episodes_in_place() {
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         let dir = scratch("flac-transcode-failed-reingest");
         let Some(flac) = synth_encoded(&dir, "book.flac", &["-c:a", "flac"], 12) else {
-            eprintln!("skipping: no flac encoder");
-            return;
+            skip!("no flac encoder");
         };
         std::fs::write(
             flac.with_extension("cue"),
@@ -2145,13 +2144,11 @@ mod tests {
     #[test]
     fn a_pre_transcode_row_is_not_reingested_but_a_stale_mode_is() {
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         let dir = scratch("flac-transcode-upgrade");
         let Some(flac) = synth_encoded(&dir, "book.flac", &["-c:a", "flac"], 12) else {
-            eprintln!("skipping: no flac encoder");
-            return;
+            skip!("no flac encoder");
         };
         // Chaptered, so the episodes are extracted under the data dir — a
         // chapterless book is served in place and `file_path` is the library file.
@@ -2221,13 +2218,11 @@ mod tests {
     #[test]
     fn toggling_transcode_reingests_a_flac_book() {
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         let dir = scratch("flac-transcode-toggle");
         let Some(flac) = synth_encoded(&dir, "book.flac", &["-c:a", "flac"], 8) else {
-            eprintln!("skipping: no flac encoder");
-            return;
+            skip!("no flac encoder");
         };
         let data = dir.join("data");
         let index = Index::open_in_memory().unwrap();
@@ -2291,14 +2286,12 @@ mod tests {
     #[test]
     fn flac_with_cue_splits_by_sidecar_no_reencode() {
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         let dir = scratch("flac-cue");
         // FLAC has no titled embedded chapters, so it leans on a .cue (PRD S7).
         let Some(flac) = synth_encoded(&dir, "book.flac", &["-c:a", "flac"], 20) else {
-            eprintln!("skipping: no flac encoder");
-            return;
+            skip!("no flac encoder");
         };
         std::fs::write(
             flac.with_extension("cue"),
@@ -2327,13 +2320,11 @@ mod tests {
     #[test]
     fn flac_without_cue_degrades_to_single_episode() {
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         let dir = scratch("flac-plain");
         let Some(flac) = synth_encoded(&dir, "plain.flac", &["-c:a", "flac"], 8) else {
-            eprintln!("skipping: no flac encoder");
-            return;
+            skip!("no flac encoder");
         };
         let data = dir.join("data");
         let index = Index::open_in_memory().unwrap();
@@ -2354,15 +2345,13 @@ mod tests {
     #[test]
     fn opus_single_file_served_in_place() {
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         let dir = scratch("opus");
         let flac = synth_encoded(&dir, "b.opus", &["-c:a", "libopus"], 6)
             .or_else(|| synth_encoded(&dir, "b.opus", &["-c:a", "opus", "-strict", "-2"], 6));
         let Some(opus) = flac else {
-            eprintln!("skipping: no opus encoder");
-            return;
+            skip!("no opus encoder");
         };
         let data = dir.join("data");
         let index = Index::open_in_memory().unwrap();
@@ -2395,8 +2384,7 @@ mod tests {
     #[test]
     fn scans_and_extracts_an_embedded_cover() {
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         let dir = scratch("cover");
         let input = synth_with_cover(&dir);
@@ -2450,8 +2438,7 @@ mod tests {
     #[test]
     fn library_scan_disambiguates_same_named_books() {
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         // Two books that slugify identically, in separate folders. The folder
         // names must differ by more than case so they stay distinct on
@@ -2497,8 +2484,7 @@ mod tests {
     #[test]
     fn library_scan_skips_bad_books_without_aborting() {
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         let root = scratch("mixed-lib");
         synth(&root, true); // chapters.m4a at the top level (the good book)
@@ -2546,8 +2532,7 @@ mod tests {
     #[test]
     fn scans_chapters_into_the_index_and_is_idempotent() {
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         let dir = scratch("chapters");
         let input = synth(&dir, true);
@@ -2585,8 +2570,7 @@ mod tests {
     #[test]
     fn non_faststart_single_file_is_flagged_and_optionally_remuxed() {
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         let dir = scratch("faststart");
         // ffmpeg's mp4 muxer writes `moov` at the END by default → non-faststart.
@@ -2663,8 +2647,7 @@ mod tests {
     #[test]
     fn faststart_single_file_is_never_remuxed() {
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         let dir = scratch("faststart-ok");
         std::fs::create_dir_all(&dir).unwrap();
@@ -2688,8 +2671,7 @@ mod tests {
             .map(|s| s.success())
             .unwrap_or(false);
         if !ok {
-            eprintln!("skipping: no aac encoder");
-            return;
+            skip!("no aac encoder");
         }
         assert!(!needs_faststart(&input), "precondition: file is faststart");
 
@@ -2721,8 +2703,7 @@ mod tests {
     #[test]
     fn toggling_remux_flag_reingests_the_episode() {
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         let dir = scratch("faststart-toggle");
         let input = synth(&dir, false); // non-faststart m4a
@@ -2784,8 +2765,7 @@ mod tests {
     #[test]
     fn per_book_toml_overrides_apply_at_ingest() {
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         let root = scratch("perbook");
         let input = synth(&root, false); // flat.m4a (top-level single-file book)
@@ -2817,8 +2797,7 @@ mod tests {
     #[test]
     fn editing_sidecar_reingests_without_touching_audio() {
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         let root = scratch("perbook-edit");
         let input = synth(&root, false);
@@ -2857,8 +2836,7 @@ mod tests {
     #[test]
     fn toggling_only_force_embedded_reingests() {
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         let root = scratch("perbook-fe");
         let input = synth(&root, false);
@@ -2889,8 +2867,7 @@ mod tests {
     #[test]
     fn per_book_disabled_skips_and_prunes() {
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         let root = scratch("perbook-disabled");
         let input = synth(&root, false);
@@ -2918,8 +2895,7 @@ mod tests {
     #[test]
     fn per_book_full_override_beats_global_saver() {
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         let root = scratch("perbook-full");
         let input = synth(&root, true); // chaptered, so storage_mode matters
@@ -2957,8 +2933,7 @@ mod tests {
     #[test]
     fn sidecar_global_key_is_ignored_and_a_typo_is_non_fatal() {
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         // A server-global key in a sidecar is ignored (warned); the per-book key
         // still applies.
@@ -3002,8 +2977,7 @@ mod tests {
     #[test]
     fn mp3_folder_with_no_probeable_tracks_is_skipped() {
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         let root = scratch("mp3-unprobeable");
         let book = root.join("Broken");
@@ -3023,8 +2997,7 @@ mod tests {
     #[test]
     fn library_watcher_indexes_a_book_added_after_startup() {
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         let root = scratch("watcher-lib");
         let data = scratch("watcher-data");
@@ -3071,8 +3044,7 @@ mod tests {
     #[test]
     fn chapterless_file_becomes_a_single_episode() {
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         let dir = scratch("flat");
         let input = synth(&dir, false);
@@ -3103,16 +3075,14 @@ mod tests {
     #[test]
     fn mp3_folder_rescan_is_idempotent_and_stays_in_place() {
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         let root = scratch("mp3-idem");
         let book = root.join("Idem Book");
         let a = synth_mp3(&book, "01.mp3", Some(1), 2);
         let b = synth_mp3(&book, "02.mp3", Some(2), 2);
         if a.is_none() || b.is_none() {
-            eprintln!("skipping: ffmpeg has no libmp3lame encoder");
-            return;
+            skip!("ffmpeg has no libmp3lame encoder");
         }
         let data = root.join("data");
         let index = Index::open_in_memory().unwrap();
@@ -3177,8 +3147,7 @@ mod tests {
     #[test]
     fn prune_orphans_removes_a_deleted_source_and_its_split_output() {
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         // Chaptered books (not whole-file) so each materializes a per-chapter
         // split dir under <data> — that's the "split output" prune must remove.
@@ -3212,8 +3181,7 @@ mod tests {
     #[test]
     fn prune_orphans_empty_root_guard_preserves_the_index() {
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         let (root, data, index) = two_book_library("prune-guard");
         scan_library(&root, &data, &index, ScanOptions::default());
@@ -3238,8 +3206,7 @@ mod tests {
     #[test]
     fn reconcile_indexes_new_books_and_prunes_deleted_ones() {
         if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not available");
-            return;
+            skip!("ffmpeg not available");
         }
         let (root, data, index) = two_book_library("reconcile");
 
