@@ -489,6 +489,19 @@ pub fn scan_book_as(
     // would 404 every request for the whole window, and would leave the book with
     // no playable episodes at all if the encode then failed. Once the rows are
     // written, whatever is left in another container is unreferenced.
+    //
+    // A residual window remains, deliberately unguarded: a request that snapshotted
+    // an episode row just before the upsert can reach its `File::open` just after
+    // the unlink, and gets a clean 404 (the http layer fails closed at three
+    // points; it never serves partial or wrong bytes). It is bounded by the few
+    // microseconds between that snapshot and the open, it can only fire on an
+    // ingest that actually CHANGED a book's container — a transcode flag or target
+    // flip, not a steady-state rescan, which deletes nothing — and on POSIX a
+    // reader that already opened the file keeps its inode regardless. Closing it
+    // would mean either holding the index lock across blocking file I/O, or a
+    // re-resolve-and-retry in the handler that no test can drive deterministically.
+    // Neither is worth it for one retryable 404 during an operator-triggered
+    // re-ingest.
     if serve_in_place {
         // Episodes stream from the library now, so any per-episode copy a pre-6.2
         // ingest — or a previous transcode — left under <data_dir> is dead weight.

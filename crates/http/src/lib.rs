@@ -393,6 +393,14 @@ async fn audio(
     Path((feed_id, number)): Path<(String, u32)>,
     range: Option<TypedHeader<Range>>,
 ) -> Result<impl IntoResponse, AppError> {
+    // The row is snapshotted under the index lock inside the resolver and the lock
+    // is released before any file I/O. A re-ingest that moves this book into
+    // another container (a transcode flag or target flip) can therefore replace the
+    // rows and sweep the old file between that snapshot and the `File::open` below.
+    // Every step from here fails closed, so the request 404s and the client
+    // retries — it can never be served partial or stale-length bytes. See the note
+    // at the sweep in `podspine_scanner::scan_book_as` for why that microsecond
+    // window is left unguarded.
     let target = resolve_audio_target(&state, &feed_id, number)?;
     // A missing file is regenerated on demand when the resolver supplied a `Regen`
     // (a `saver` chapter split, or a faststart remux of a whole-file episode);
