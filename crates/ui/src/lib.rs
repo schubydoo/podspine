@@ -353,10 +353,11 @@ pub fn subscribe_links(feed_url: &str) -> Vec<AppLink> {
 }
 
 /// The `/subscribe/{feed_id}` helper page: big per-app "Open in…" buttons (deep
-/// links), each app's QR code tucked behind its own `<details>` expand so only one
-/// code is ever scannable at a time (desktop→phone handoff), and a copy-the-URL
-/// fallback. This is what the book-page QR points at, so an iOS Camera scan lands
-/// on real app links instead of raw feed XML.
+/// links), each app's QR code tucked behind its own `<details>` expand — a shared
+/// `name` makes them an exclusive accordion, so only one code is ever on screen to
+/// scan (desktop→phone handoff) — and a copy-the-URL fallback. This is what the
+/// book-page QR points at, so an iOS Camera scan lands on real app links instead of
+/// raw feed XML.
 pub fn subscribe_page(book: &BookDetail) -> Markup {
     let apps = subscribe_links(&book.feed_url);
     page(
@@ -388,7 +389,13 @@ pub fn subscribe_page(book: &BookDetail) -> Markup {
                         ul.qraccordion {
                             @for app in &apps {
                                 li {
-                                    details.qrapp {
+                                    // Shared `name` makes these an exclusive accordion
+                                    // group (like radio buttons): opening one closes
+                                    // any other — enforcing one-code-on-screen without
+                                    // JS. Browsers without `<details name>` support just
+                                    // treat them as independent (still collapsed by
+                                    // default), so it degrades safely.
+                                    details.qrapp name="podcatcher-qr" {
                                         summary { (app.name) }
                                         figure.appqr role="img"
                                             aria-label=(format!("QR code to open in {}", app.name)) {
@@ -535,6 +542,9 @@ mod tests {
         assert!(html.matches("<details").count() >= 6);
         assert!(html.contains("<summary>Apple Podcasts</summary>"));
         assert!(html.contains("<summary>Overcast</summary>"));
+        // They share a `name`, forming an exclusive accordion (opening one closes
+        // the others) so no two QRs can be on screen at once — no JS.
+        assert!(html.matches("name=\"podcatcher-qr\"").count() >= 6);
         // The per-app deep link stays available inside each expanded section.
         assert!(html.contains(">Open in Apple Podcasts</a>"));
         // Manual paste fallback still present.
