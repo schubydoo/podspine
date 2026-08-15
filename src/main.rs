@@ -50,9 +50,51 @@ async fn main() -> Result<()> {
         transcode: config.transcode,
     };
 
-    // Initial reconcile: index new/changed books and prune ones deleted while the
-    // server was down.
-    reconcile(&config.library, &config.data_dir, &index, scan_opts);
+    let state = AppState::new(
+        index,
+        config.base_url.clone(),
+        &config.data_dir,
+        &config.library,
+        config.default_cover_url.clone(),
+        saver,
+        config.cache_size_bytes,
+        config.cache_ttl,
+    );
+
+    // First-run UX (issue 159): don't hold the HTTP port down behind the initial
+    // reconcile. A large first scan takes minutes to split, and anything in front
+    // of the server (a reverse proxy, a Funnel) returns 502 the whole time. Instead
+    // mark the state "scanning", run the initial reconcile on a background thread
+    // (its own WAL index connection, like the watcher), and flip to "ready" when it
+    // finishes. Until then `GET /` shows a "Scanning…" page and the capability
+    // routes answer 503 + Retry-After rather than a 502/404. A warm restart
+    // reaches ready almost immediately — the reconcile's idempotency early-returns.
+    state.set_ready(false);
+    {
+        let state = state.clone();
+        let library = config.library.clone();
+        let data_dir = config.data_dir.clone();
+        let db_path = db_path.clone();
+        std::thread::spawn(move || {
+            match Index::open(&db_path) {
+                Ok(index) => {
+                    let summary = reconcile(&library, &data_dir, &index, scan_opts);
+                    tracing::info!(
+                        indexed = summary.indexed,
+                        skipped = summary.skipped,
+                        pruned = summary.pruned,
+                        "initial scan complete"
+                    );
+                }
+                // Auto-refresh still runs, so a later library change recovers this;
+                // mark ready regardless so the server stops holding on "Scanning…".
+                Err(err) => {
+                    tracing::error!(error = %err, "initial scan could not open the index");
+                }
+            }
+            state.set_ready(true);
+        });
+    }
 
     // Auto-refresh: a background thread (its own WAL index connection) re-runs the
     // reconcile whenever the library changes, so feeds appear without a restart.
@@ -71,16 +113,6 @@ async fn main() -> Result<()> {
         });
     }
 
-    let state = AppState::new(
-        index,
-        config.base_url.clone(),
-        &config.data_dir,
-        &config.library,
-        config.default_cover_url.clone(),
-        saver,
-        config.cache_size_bytes,
-        config.cache_ttl,
-    );
     serve(config.bind, state).await.context("serving")?;
     Ok(())
 }
