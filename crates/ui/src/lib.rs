@@ -100,16 +100,20 @@ button.copy { padding:.55rem .9rem; border:0; border-radius:6px; font:inherit;
         background:var(--accent); color:var(--accent-text); text-decoration:none; font-weight:600; }
 .appbtn:hover { filter:brightness(1.08); }
 .qrpanel { margin-top:1.25rem; border:1px solid var(--border); border-radius:8px;
-        background:var(--surface); padding:.25rem 1rem; }
-.qrpanel summary { cursor:pointer; font-weight:600; padding:.75rem 0; }
-.qrhint { color:var(--muted); font-size:.9rem; margin:.25rem 0 1rem; }
-.qrgrid { list-style:none; margin:0; padding:0 0 .75rem; display:grid; gap:1rem;
-        grid-template-columns:repeat(auto-fill,minmax(140px,1fr)); }
-.qrcard { display:flex; flex-direction:column; align-items:center; gap:.4rem; }
-.qrname { font-size:.85rem; color:var(--muted); text-align:center; }
-.appqr { margin:0; }
-.appqr svg { width:120px; height:120px; display:block; background:#fff;
+        background:var(--surface); padding:.75rem 1rem 1rem; }
+.qrpanel h2 { margin:0; font-size:1.05rem; }
+.qrhint { color:var(--muted); font-size:.9rem; margin:.25rem 0 .75rem; }
+.qraccordion { list-style:none; margin:0; padding:0; display:grid; gap:.5rem; }
+.qraccordion li { margin:0; }
+/* One collapsible section per app: a collapsed section shows no scannable code, so
+   only the expanded app's QR is on screen — a phone camera can't lock onto a neighbour's. */
+.qrapp { border:1px solid var(--border); border-radius:8px; background:var(--bg); padding:0 1rem; }
+.qrapp summary { cursor:pointer; font-weight:600; padding:.75rem 0; }
+.qrapp[open] { padding-bottom:1rem; }
+.appqr { margin:.25rem 0 0; }
+.appqr svg { width:180px; height:180px; display:block; background:#fff;
         border:1px solid var(--border); border-radius:6px; }
+.qrapplink { margin:.6rem 0 0; }
 .manual { margin-top:1.75rem; padding:1rem 1.25rem; background:var(--surface);
         border:1px solid var(--border); border-radius:8px; }
 .manual h2 { margin-top:0; font-size:1.05rem; }
@@ -132,7 +136,6 @@ button.regen:hover { background:var(--danger); color:#fff; }
   main { padding:1.25rem 1rem; }
   .detail h1, .subscribe h1 { font-size:1.35rem; }
   .grid { gap:1rem; grid-template-columns:repeat(auto-fill,minmax(130px,1fr)); }
-  .qrgrid { grid-template-columns:repeat(auto-fill,minmax(120px,1fr)); }
 }
 "#;
 
@@ -350,9 +353,10 @@ pub fn subscribe_links(feed_url: &str) -> Vec<AppLink> {
 }
 
 /// The `/subscribe/{feed_id}` helper page: big per-app "Open in…" buttons (deep
-/// links), the per-app QR codes tucked behind a `<details>` expand (desktop→phone
-/// handoff), and a copy-the-URL fallback. This is what the book-page QR points at,
-/// so an iOS Camera scan lands on real app links instead of raw feed XML.
+/// links), each app's QR code tucked behind its own `<details>` expand so only one
+/// code is ever scannable at a time (desktop→phone handoff), and a copy-the-URL
+/// fallback. This is what the book-page QR points at, so an iOS Camera scan lands
+/// on real app links instead of raw feed XML.
 pub fn subscribe_page(book: &BookDetail) -> Markup {
     let apps = subscribe_links(&book.feed_url);
     page(
@@ -372,19 +376,25 @@ pub fn subscribe_page(book: &BookDetail) -> Markup {
                         }
                     }
 
-                    // QRs collapsed by default (6 codes is visually noisy) — a native
-                    // <details> keeps them one tap away and needs no JS. For the
-                    // desktop→phone case: scan a code to open that app on a phone.
-                    details.qrpanel {
-                        summary { "Scan a code from another device" }
-                        p.qrhint { "On a computer? Point your phone's camera at a code to open that app." }
-                        ul.qrgrid {
+                    // One collapsible <details> per app, not a grid of all codes at
+                    // once: with every QR on screen a phone camera readily locks onto
+                    // an adjacent app's code and opens the wrong app. A collapsed
+                    // section shows nothing scannable, so expanding one puts exactly
+                    // that app's code on screen. Native <details> — no JS. For the
+                    // desktop→phone case: expand an app and scan to open it on a phone.
+                    section.qrpanel {
+                        h2 { "Scan a code from another device" }
+                        p.qrhint { "On a computer? Expand an app and point your phone's camera at just that code." }
+                        ul.qraccordion {
                             @for app in &apps {
-                                li.qrcard {
-                                    span.qrname { (app.name) }
-                                    figure.appqr role="img"
-                                        aria-label=(format!("QR code to open in {}", app.name)) {
-                                        (PreEscaped(qr_svg_sized(&app.url, 120)))
+                                li {
+                                    details.qrapp {
+                                        summary { (app.name) }
+                                        figure.appqr role="img"
+                                            aria-label=(format!("QR code to open in {}", app.name)) {
+                                            (PreEscaped(qr_svg_sized(&app.url, 180)))
+                                        }
+                                        p.qrapplink { a href=(app.url) { "Open in " (app.name) } }
                                     }
                                 }
                             }
@@ -518,9 +528,15 @@ mod tests {
         );
         // Each app also renders a QR (>=6 apps -> >=6 inline SVGs)...
         assert!(html.matches("<svg").count() >= 6);
-        // ...but the QRs are collapsed behind a native <details> to cut clutter.
-        assert!(html.contains("<details"));
-        assert!(html.contains("<summary>Scan a code from another device</summary>"));
+        // ...each collapsed behind its OWN native <details> (issue 160): one QR per
+        // app, so a collapsed section shows nothing scannable and only the expanded
+        // app's code is on screen. >=6 apps -> >=6 <details>, each summarised by the
+        // app name rather than one shared "scan a code" panel.
+        assert!(html.matches("<details").count() >= 6);
+        assert!(html.contains("<summary>Apple Podcasts</summary>"));
+        assert!(html.contains("<summary>Overcast</summary>"));
+        // The per-app deep link stays available inside each expanded section.
+        assert!(html.contains(">Open in Apple Podcasts</a>"));
         // Manual paste fallback still present.
         assert!(html.contains("value=\"http://host:8080/feed/Xk9mQ2vP7nR4tB1cY6wZ8a.xml\""));
     }
