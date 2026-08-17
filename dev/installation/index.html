@@ -979,12 +979,12 @@ dependency:</p>
 </code></pre></div>
 <p>On NixOS, the flake also exposes a module — add Podspine as a service:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="p">{</span>
-<a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a>  inputs<span class="o">.</span>podspine<span class="o">.</span><span class="ss">url</span> <span class="o">=</span> <span class="s2">&quot;github:schubydoo/podspine&quot;</span><span class="p">;</span>
+<a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a>  inputs<span class="o">.</span>podspine<span class="o">.</span><span class="ss">url</span> <span class="o">=</span> <span class="s2">"github:schubydoo/podspine"</span><span class="p">;</span>
 <a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a>  <span class="c1"># in your configuration:</span>
 <a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a>  services<span class="o">.</span><span class="ss">podspine</span> <span class="o">=</span> <span class="p">{</span>
 <a id="__codelineno-9-5" name="__codelineno-9-5" href="#__codelineno-9-5"></a>    <span class="ss">enable</span> <span class="o">=</span> <span class="no">true</span><span class="p">;</span>
-<a id="__codelineno-9-6" name="__codelineno-9-6" href="#__codelineno-9-6"></a>    <span class="ss">library</span> <span class="o">=</span> <span class="s2">&quot;/srv/audiobooks&quot;</span><span class="p">;</span>
-<a id="__codelineno-9-7" name="__codelineno-9-7" href="#__codelineno-9-7"></a>    <span class="ss">baseUrl</span> <span class="o">=</span> <span class="s2">&quot;http://nas.lan:8080&quot;</span><span class="p">;</span>
+<a id="__codelineno-9-6" name="__codelineno-9-6" href="#__codelineno-9-6"></a>    <span class="ss">library</span> <span class="o">=</span> <span class="s2">"/srv/audiobooks"</span><span class="p">;</span>
+<a id="__codelineno-9-7" name="__codelineno-9-7" href="#__codelineno-9-7"></a>    <span class="ss">baseUrl</span> <span class="o">=</span> <span class="s2">"http://nas.lan:8080"</span><span class="p">;</span>
 <a id="__codelineno-9-8" name="__codelineno-9-8" href="#__codelineno-9-8"></a>  <span class="p">};</span>
 <a id="__codelineno-9-9" name="__codelineno-9-9" href="#__codelineno-9-9"></a><span class="p">}</span>
 </code></pre></div>
