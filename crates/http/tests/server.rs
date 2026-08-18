@@ -1601,3 +1601,85 @@ async fn transcoded_flac_book_serves_as_aac_and_is_never_evicted() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- first-run scan readiness (issue 159): no ffmpeg needed ----
+
+/// A bare state over an empty in-memory index, used to drive the readiness gate
+/// without synthesizing audio. Defaults to `ready`; the tests flip it explicitly.
+fn empty_state() -> AppState {
+    AppState::new(
+        Index::open_in_memory().unwrap(),
+        "http://test".to_string(),
+        Path::new("/tmp"),
+        Path::new("/tmp"),
+        None,
+        false,
+        None,
+        None,
+    )
+}
+
+#[tokio::test]
+async fn scanning_state_holds_the_browse_ui_and_503s_the_capability_routes() {
+    let state = empty_state();
+    state.set_ready(false); // initial scan still running
+
+    // GET / holds on the Scanning page instead of an empty grid.
+    let resp = router(state.clone())
+        .oneshot(Request::get("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = String::from_utf8(body_bytes(resp).await).unwrap();
+    assert!(html.contains("Scanning your library…"), "{html}");
+    assert!(!html.contains("No audiobooks found"), "{html}");
+
+    // The capability routes answer 503 + Retry-After (retry), never a 404 (gone).
+    for path in [
+        "/feed/Xk9mQ2vP7nR4tB1cY6wZ8a.xml",
+        "/audio/Xk9mQ2vP7nR4tB1cY6wZ8a/1",
+        "/cover/Xk9mQ2vP7nR4tB1cY6wZ8a",
+    ] {
+        let resp = router(state.clone())
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{path} should 503 while scanning"
+        );
+        assert!(
+            resp.headers().get(header::RETRY_AFTER).is_some(),
+            "{path} 503 must carry Retry-After"
+        );
+    }
+}
+
+#[tokio::test]
+async fn once_ready_the_browse_ui_serves_normally() {
+    let state = empty_state();
+    state.set_ready(false);
+    state.set_ready(true); // scan finished
+
+    // Empty library, but the real grid (not the Scanning page) — a normal 200.
+    let resp = router(state.clone())
+        .oneshot(Request::get("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = String::from_utf8(body_bytes(resp).await).unwrap();
+    assert!(html.contains("No audiobooks found"), "{html}");
+    assert!(!html.contains("Scanning your library…"), "{html}");
+
+    // A capability route now behaves as before: an unknown id is a genuine 404.
+    let resp = router(state)
+        .oneshot(
+            Request::get("/feed/Xk9mQ2vP7nR4tB1cY6wZ8a.xml")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}

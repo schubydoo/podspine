@@ -218,6 +218,37 @@ pub fn index_page(books: &[BookCard]) -> Markup {
     )
 }
 
+/// A holding page shown at `GET /` while the initial library scan runs (issue
+/// 159), so a first boot never surfaces a proxy 502 or a misleading empty grid.
+/// Self-refreshes via a `<meta http-equiv="refresh">` (no JavaScript), so it
+/// becomes the normal book list on its own once the scan finishes. It reuses the
+/// page shell but needs its own `<head>` (the refresh directive and a distinct
+/// title), so it is built directly rather than through [`page`].
+pub fn scanning_page() -> Markup {
+    html! {
+        (DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width, initial-scale=1";
+                meta http-equiv="refresh" content="5";
+                title { "Scanning… · Podspine" }
+                style { (PreEscaped(STYLE)) }
+            }
+            body {
+                header.site { h1 { a href="/" { "Podspine" } } }
+                main {
+                    p.empty { "Scanning your library…" }
+                    p.empty {
+                        "This can take a minute on first start while episodes are prepared. "
+                        "This page refreshes on its own — your books will appear here when it's done."
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// A book's detail page: cover, copy-feed-URL, scannable QR, and how-to panel.
 pub fn book_page(book: &BookDetail) -> Markup {
     // The QR encodes the /subscribe helper page, not the raw feed: a raw RSS URL
@@ -483,6 +514,16 @@ mod tests {
         assert!(html.contains("src=\"/cover/cap-dracula\""));
         assert!(html.contains("alt=\"Cover of Dracula\""));
         assert!(html.contains("aria-label=\"No cover art for Solaris\""));
+    }
+
+    #[test]
+    fn scanning_page_holds_and_self_refreshes() {
+        let html = scanning_page().into_string();
+        // A clear scanning state, not an empty book grid...
+        assert!(html.contains("Scanning your library…"));
+        assert!(!html.contains("No audiobooks found"));
+        // ...that reloads itself (no JS) so it flips to the list when the scan ends.
+        assert!(html.contains("<meta http-equiv=\"refresh\" content=\"5\">"));
     }
 
     #[test]

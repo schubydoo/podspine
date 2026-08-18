@@ -29,6 +29,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -49,7 +50,7 @@ use tower_http::trace::TraceLayer;
 use podspine_feed::{FeedBook, FeedEpisode, render_checked};
 use podspine_index::{BookRow, Index};
 use podspine_splitter::{ChapterCut, remux_faststart, split_chapter};
-use podspine_ui::{BookCard, BookDetail, book_page, index_page, subscribe_page};
+use podspine_ui::{BookCard, BookDetail, book_page, index_page, scanning_page, subscribe_page};
 
 /// Max concurrent in-flight requests before backpressure (DoS guard). Generous
 /// for a homelab tool; only bounds a pathological flood.
@@ -126,6 +127,14 @@ pub struct AppState {
     /// Per-chapter regeneration locks (single-flight): concurrent requests for
     /// the same uncached chapter run ffmpeg once, not N times.
     inflight: Arc<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>>,
+    /// `true` once the initial library scan has finished. Defaults to `true`, so a
+    /// state built for a test or an already-populated library serves normally; the
+    /// server binary flips it to `false` before it kicks off the background first
+    /// scan and back to `true` when that scan completes (issue 159). While it is
+    /// `false`, `GET /` serves a "Scanning…" holding page and the capability routes
+    /// (`/feed`, `/audio`, `/cover`) return 503 + `Retry-After` instead of a 502 or
+    /// a bare 404 — so a first boot reads as "starting up", not "broken".
+    ready: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -160,8 +169,35 @@ impl AppState {
             cache_size_bytes,
             cache_ttl,
             inflight: Arc::new(Mutex::new(HashMap::new())),
+            ready: Arc::new(AtomicBool::new(true)),
         }
     }
+
+    /// Flip the "initial scan finished" flag. The server binary sets it `false`
+    /// before spawning the background first scan and `true` when that scan returns
+    /// (issue 159); it's cloned into the scan task via [`Clone`]. See [`AppState`]'s
+    /// `ready` field for what the two states change.
+    pub fn set_ready(&self, ready: bool) {
+        self.ready.store(ready, Ordering::Release);
+    }
+
+    /// Whether the initial library scan has finished (see [`set_ready`]).
+    fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+}
+
+/// 503 + `Retry-After` for the capability routes while the initial scan is still
+/// running (issue 159). A podcatcher treats 503 as "retry shortly" and keeps the
+/// subscription; a 404 it can treat as "gone". Not routed through [`AppError`] so
+/// it isn't counted as a request failure — it's a readiness state, not an error.
+fn scanning_unavailable() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, "5")],
+        "Library is scanning; try again shortly.\n",
+    )
+        .into_response()
 }
 
 /// Build the router with all routes and middleware layers.
@@ -209,6 +245,11 @@ async fn feed(
     State(state): State<AppState>,
     Path(id_xml): Path<String>,
 ) -> Result<Response, AppError> {
+    // Before the first scan completes there is no feed to build yet: answer 503
+    // (retry shortly), never a 404 a podcatcher might treat as gone (issue 159).
+    if !state.is_ready() {
+        return Ok(scanning_unavailable());
+    }
     let feed_id = id_xml.strip_suffix(".xml").ok_or(AppError::NotFound)?;
     if !valid_feed_id(feed_id) {
         return Err(AppError::NotFound);
@@ -230,6 +271,11 @@ async fn feed(
 
 /// `GET /` — the browsable book grid.
 async fn index(State(state): State<AppState>) -> Result<Html<String>, AppError> {
+    // Until the initial scan finishes, hold on a "Scanning…" page rather than
+    // render an empty grid that reads as "no books / broken" (issue 159).
+    if !state.is_ready() {
+        return Ok(Html(scanning_page().into_string()));
+    }
     let books = {
         let index = state.index.lock().map_err(AppError::internal)?;
         index.list_books().map_err(AppError::internal)?
@@ -351,6 +397,10 @@ async fn cover(
     State(state): State<AppState>,
     Path(feed_id): Path<String>,
 ) -> Result<Response, AppError> {
+    // No covers extracted until the first scan finishes — 503 (retry), not 404.
+    if !state.is_ready() {
+        return Ok(scanning_unavailable());
+    }
     if !valid_feed_id(&feed_id) {
         return Err(AppError::NotFound);
     }
@@ -392,7 +442,12 @@ async fn audio(
     State(state): State<AppState>,
     Path((feed_id, number)): Path<(String, u32)>,
     range: Option<TypedHeader<Range>>,
-) -> Result<impl IntoResponse, AppError> {
+) -> Result<Response, AppError> {
+    // Episodes aren't materialized until the first scan finishes — 503 (retry),
+    // not 404, so a podcatcher polling an enclosure keeps trying (issue 159).
+    if !state.is_ready() {
+        return Ok(scanning_unavailable());
+    }
     // The row is snapshotted under the index lock inside the resolver and the lock
     // is released before any file I/O. A re-ingest that moves this book into
     // another container (a transcode flag or target flip) can therefore replace the
@@ -431,7 +486,7 @@ async fn audio(
     let range = range.map(|TypedHeader(range)| range);
     // Header parts apply on top of Ranged's response, so the 206/Content-Range
     // and the 200 full-body case both keep their status and gain Content-Type.
-    Ok(([(header::CONTENT_TYPE, mime)], Ranged::new(range, body)))
+    Ok(([(header::CONTENT_TYPE, mime)], Ranged::new(range, body)).into_response())
 }
 
 /// Build and self-check the feed XML for a capability `feed_id`. All public URLs

@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use podspine_config::{Config, StorageMode};
 use podspine_http::{AppState, serve};
 use podspine_index::Index;
-use podspine_scanner::{ScanOptions, reconcile, spawn_library_watcher};
+use podspine_scanner::{ScanOptions, spawn_library_watcher};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -50,27 +50,6 @@ async fn main() -> Result<()> {
         transcode: config.transcode,
     };
 
-    // Initial reconcile: index new/changed books and prune ones deleted while the
-    // server was down.
-    reconcile(&config.library, &config.data_dir, &index, scan_opts);
-
-    // Auto-refresh: a background thread (its own WAL index connection) re-runs the
-    // reconcile whenever the library changes, so feeds appear without a restart.
-    spawn_library_watcher(
-        config.library.clone(),
-        config.data_dir.clone(),
-        db_path,
-        scan_opts,
-    );
-
-    if let Some((listener, handle)) = metrics {
-        tokio::spawn(async move {
-            if let Err(err) = podspine_metrics::serve(listener, handle).await {
-                tracing::error!(error = %err, "metrics listener stopped");
-            }
-        });
-    }
-
     let state = AppState::new(
         index,
         config.base_url.clone(),
@@ -81,6 +60,41 @@ async fn main() -> Result<()> {
         config.cache_size_bytes,
         config.cache_ttl,
     );
+
+    // First-run UX (issue 159): don't hold the HTTP port down behind the initial
+    // reconcile. A large first scan takes minutes to split, and anything in front
+    // of the server (a reverse proxy, a Funnel) returns 502 the whole time. Instead
+    // mark the state "scanning" and hand the initial reconcile to the watcher's
+    // background thread, which registers the filesystem watch first, runs the
+    // reconcile, then flips the state to "ready" via the callback. Until then
+    // `GET /` shows a "Scanning…" page and the capability routes answer 503 +
+    // Retry-After rather than a 502/404. A warm restart reaches ready almost
+    // immediately — the reconcile's idempotency early-returns.
+    //
+    // Watch-before-scan (not scan-before-watch): a library change that lands during
+    // the initial scan is buffered and reconciled by the watcher rather than lost
+    // until the next event or a restart. The watcher owns the only index writer, so
+    // exactly one reconciler ever runs.
+    state.set_ready(false);
+    {
+        let state = state.clone();
+        spawn_library_watcher(
+            config.library.clone(),
+            config.data_dir.clone(),
+            db_path,
+            scan_opts,
+            move || state.set_ready(true),
+        );
+    }
+
+    if let Some((listener, handle)) = metrics {
+        tokio::spawn(async move {
+            if let Err(err) = podspine_metrics::serve(listener, handle).await {
+                tracing::error!(error = %err, "metrics listener stopped");
+            }
+        });
+    }
+
     serve(config.bind, state).await.context("serving")?;
     Ok(())
 }

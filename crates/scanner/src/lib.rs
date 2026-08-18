@@ -1149,10 +1149,19 @@ pub fn reconcile(library: &Path, data_dir: &Path, index: &Index, opts: ScanOptio
 /// as many) is coalesced into a single reconcile once things go quiet.
 const WATCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Spawn a background thread that watches `library` and [`reconcile`]s the index
-/// whenever it changes (debounced). The thread opens its **own** index
-/// connection on `db_path` — with WAL enabled, its rescans (including a long
-/// split of a newly-added book) don't block the server's feed/audio reads.
+/// Spawn a background thread that establishes the library watch, runs the
+/// **initial** reconcile, then [`reconcile`]s again whenever the library changes
+/// (debounced). The thread opens its **own** index connection on `db_path` — with
+/// WAL enabled, its rescans (including a long split of a newly-added book) don't
+/// block the server's feed/audio reads.
+///
+/// The watch is registered *before* the initial reconcile, so a change that lands
+/// during the first scan is buffered in the channel and picked up by the loop
+/// rather than missed until the next event or a restart (issue 159).
+/// `on_initial_scan` fires once the initial reconcile returns — the server uses it
+/// to leave its "Scanning…" holding state and start serving feeds. It runs even if
+/// the index can't be opened or the watch can't be established, so the server
+/// never hangs on "Scanning…".
 ///
 /// Returns immediately; the watcher runs for the process lifetime. A setup
 /// failure (or the watch ending) is logged and simply disables auto-refresh —
@@ -1162,9 +1171,10 @@ pub fn spawn_library_watcher(
     data_dir: PathBuf,
     db_path: PathBuf,
     opts: ScanOptions,
+    on_initial_scan: impl FnOnce() + Send + 'static,
 ) {
     std::thread::spawn(move || {
-        if let Err(err) = watch_loop(&library, &data_dir, &db_path, opts) {
+        if let Err(err) = watch_loop(&library, &data_dir, &db_path, opts, on_initial_scan) {
             tracing::error!(error = %err, "library watcher stopped — auto-refresh disabled");
         }
     });
@@ -1175,19 +1185,65 @@ fn watch_loop(
     data_dir: &Path,
     db_path: &Path,
     opts: ScanOptions,
+    on_initial_scan: impl FnOnce(),
 ) -> Result<(), Box<dyn std::error::Error>> {
     use notify::{RecursiveMode, Watcher};
 
-    let index = Index::open(db_path)?;
+    let index = match Index::open(db_path) {
+        Ok(index) => index,
+        // No index → no scan and no watch. Flip readiness anyway so the server
+        // stops holding "Scanning…" (it serves whatever is already indexed), then
+        // surface the failure.
+        Err(err) => {
+            on_initial_scan();
+            return Err(err.into());
+        }
+    };
+
     let (tx, rx) = std::sync::mpsc::channel();
-    let mut watcher = notify::recommended_watcher(move |res| {
+    // Bring the watch up BEFORE the initial reconcile: a change that lands during
+    // the scan's directory walk is then buffered in `rx` and picked up by the loop
+    // below, instead of being missed until the next event or a restart (issue 159).
+    let watcher = notify::recommended_watcher(move |res| {
         let _ = tx.send(res);
-    })?;
-    watcher.watch(library, RecursiveMode::Recursive)?;
-    tracing::info!(library = %library.display(), "watching library for changes");
+    })
+    .and_then(|mut watcher| {
+        watcher.watch(library, RecursiveMode::Recursive)?;
+        Ok(watcher)
+    });
+    let watcher = match watcher {
+        Ok(watcher) => {
+            tracing::info!(library = %library.display(), "watching library for changes");
+            Some(watcher)
+        }
+        // Couldn't establish the watch (e.g. the inotify watch limit). Still run the
+        // initial scan and mark ready below — the server must not hang on
+        // "Scanning…" — we just lose auto-refresh.
+        Err(err) => {
+            tracing::error!(error = %err, "could not watch the library — auto-refresh disabled");
+            None
+        }
+    };
+
+    // Initial reconcile: index new/changed books and prune ones removed while the
+    // server was down. Runs after the watch is live so no in-window change is lost.
+    let s = reconcile(library, data_dir, &index, opts);
+    tracing::info!(
+        indexed = s.indexed,
+        skipped = s.skipped,
+        pruned = s.pruned,
+        "initial scan complete"
+    );
+    // The first scan is done: the server leaves its "Scanning…" holding state.
+    on_initial_scan();
+
+    // Nothing to loop on if the watch never came up.
+    let Some(_watcher) = watcher else {
+        return Ok(());
+    };
 
     // Block for an event, then drain the burst until it's quiet for the debounce
-    // window, then reconcile once. `watcher` stays alive in scope, so `rx` never
+    // window, then reconcile once. `_watcher` stays alive in scope, so `rx` never
     // disconnects and the loop runs for the process lifetime.
     while rx.recv().is_ok() {
         while rx.recv_timeout(WATCH_DEBOUNCE).is_ok() {}
@@ -4162,6 +4218,7 @@ mod tests {
             data.clone(),
             db_path.clone(),
             ScanOptions::default(),
+            || {},
         );
         // Let the watcher establish its filesystem watch before we add a file.
         std::thread::sleep(std::time::Duration::from_millis(300));
