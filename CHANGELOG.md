@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.7.0 (2026-08-18)
+
+### Features
+
+- On the `/subscribe` page, put each podcatcher's QR code behind its own collapsible section (an exclusive `<details>` accordion, no JavaScript), so only the app you expand is on screen to scan and a phone camera can't lock onto a neighbouring app's code ([#162](https://github.com/schubydoo/podspine/pull/162))
+- Bind the HTTP port immediately and run the initial library scan in the background, so a first boot serves a self-refreshing "Scanning…" page at `/` and 503 + `Retry-After` on the `/feed`, `/audio` and `/cover` routes instead of leaving a proxy or Funnel to return 502 for the minutes the first scan takes ([#161](https://github.com/schubydoo/podspine/pull/161))
+- Follow the operating system's light/dark preference automatically: a `prefers-color-scheme: dark` override of the existing CSS variables (plus `color-scheme: light dark` so native controls adapt) gives the whole UI an AA-contrast dark palette with no JavaScript, while the QR codes keep their scannable white background ([#172](https://github.com/schubydoo/podspine/pull/172))
+- Add a light/dark theme picker to the header: it still defaults to following the operating system, but a visitor can now choose Auto, Light, or Dark and the choice persists in a first-party `theme` cookie the server reads to render the right theme — no JavaScript, no flash of the wrong theme ([#176](https://github.com/schubydoo/podspine/pull/176))
+
+### Fixes
+
+- Cache cover images: `/cover` now sends an `ETag` (a hash of the image bytes) and `Cache-Control`, and honours `If-None-Match` with a bodyless `304`, so a browser stops re-downloading every cover on each page refresh — a real speed-up over slow links like Tailscale where the grid was pulling several MB of images every time ([#174](https://github.com/schubydoo/podspine/pull/174))
+- Document that the first scan can take a while: the README and docs quick-start now explain that the initial run splits chaptered books into per-chapter episodes (whole-file books stream in place), so a large chaptered library takes minutes, shows a self-refreshing "Scanning…" page meanwhile, and answers 503 + Retry-After on feed/audio until it finishes — while a warm restart stays fast ([#175](https://github.com/schubydoo/podspine/pull/175))
+- Stop the library watcher from re-scanning every few seconds while another app streams the files: watch events are now filtered to real library changes — reads (atime bumps) are ignored, as are podspine's own split output under the data dir and the dir names discovery already skips (dotdirs, `@eaDir`, `lost+found`) — so an unrelated trickle of events no longer defeats the debounce ([#173](https://github.com/schubydoo/podspine/pull/173))
+
 ## 1.6.0 (2026-08-14)
 
 ### Features
