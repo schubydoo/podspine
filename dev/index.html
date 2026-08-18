@@ -748,6 +748,16 @@ Just a feed URL.</p>
 </code></pre></div>
 <p>Then open <a href="http://localhost:8080">http://localhost:8080</a> to browse your books, copy feed URLs, or scan a
 book's QR code to open its one-tap <a href="importing/">subscribe page</a>.</p>
+<div class="admonition note">
+<p class="admonition-title">The first scan can take a while</p>
+<p>On first start Podspine processes your whole library — <strong>chaptered</strong> books are
+split into per-chapter episodes (whole-file books, like MP3 folders, stream in
+place), so a large chaptered library can take minutes. While it runs, the browse
+page shows a self-refreshing <strong>"Scanning…"</strong> message (it isn't broken — it turns
+into your book grid when the scan finishes), and feed/audio requests answer <code>503</code>
+with <code>Retry-After</code> so podcatchers simply retry. A restart with an already-populated
+<code>/data</code> volume is fast — it only processes what's new or changed.</p>
+</div>
 <div class="admonition tip">
 <p class="admonition-title">Set <code>PODSPINE_BASE_URL</code></p>
 <p>Point it at the address podcast apps will actually reach (your LAN IP or public
