@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use podspine_config::{Config, StorageMode};
 use podspine_http::{AppState, serve};
 use podspine_index::Index;
-use podspine_scanner::{ScanOptions, reconcile, spawn_library_watcher};
+use podspine_scanner::{ScanOptions, spawn_library_watcher};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -64,45 +64,27 @@ async fn main() -> Result<()> {
     // First-run UX (issue 159): don't hold the HTTP port down behind the initial
     // reconcile. A large first scan takes minutes to split, and anything in front
     // of the server (a reverse proxy, a Funnel) returns 502 the whole time. Instead
-    // mark the state "scanning", run the initial reconcile on a background thread
-    // (its own WAL index connection, like the watcher), and flip to "ready" when it
-    // finishes. Until then `GET /` shows a "Scanning…" page and the capability
-    // routes answer 503 + Retry-After rather than a 502/404. A warm restart
-    // reaches ready almost immediately — the reconcile's idempotency early-returns.
+    // mark the state "scanning" and hand the initial reconcile to the watcher's
+    // background thread, which registers the filesystem watch first, runs the
+    // reconcile, then flips the state to "ready" via the callback. Until then
+    // `GET /` shows a "Scanning…" page and the capability routes answer 503 +
+    // Retry-After rather than a 502/404. A warm restart reaches ready almost
+    // immediately — the reconcile's idempotency early-returns.
     //
-    // The watcher is started from this same thread *after* the initial reconcile,
-    // preserving the original scan→watch ordering: exactly one reconciler runs at a
-    // time, and there's no startup race between the initial scan and the watcher.
+    // Watch-before-scan (not scan-before-watch): a library change that lands during
+    // the initial scan is buffered and reconciled by the watcher rather than lost
+    // until the next event or a restart. The watcher owns the only index writer, so
+    // exactly one reconciler ever runs.
     state.set_ready(false);
     {
         let state = state.clone();
-        let library = config.library.clone();
-        let data_dir = config.data_dir.clone();
-        std::thread::spawn(move || {
-            match Index::open(&db_path) {
-                Ok(index) => {
-                    let summary = reconcile(&library, &data_dir, &index, scan_opts);
-                    tracing::info!(
-                        indexed = summary.indexed,
-                        skipped = summary.skipped,
-                        pruned = summary.pruned,
-                        "initial scan complete"
-                    );
-                }
-                // The watcher below still runs, so a later library change recovers
-                // this; mark ready regardless so the server stops holding "Scanning…".
-                Err(err) => {
-                    tracing::error!(error = %err, "initial scan could not open the index");
-                }
-            }
-            state.set_ready(true);
-
-            // Auto-refresh: a background thread (its own WAL index connection)
-            // re-runs the reconcile whenever the library changes, so feeds appear
-            // without a restart. Started after the initial scan so the two never
-            // reconcile concurrently.
-            spawn_library_watcher(library, data_dir, db_path, scan_opts);
-        });
+        spawn_library_watcher(
+            config.library.clone(),
+            config.data_dir.clone(),
+            db_path,
+            scan_opts,
+            move || state.set_ready(true),
+        );
     }
 
     if let Some((listener, handle)) = metrics {
