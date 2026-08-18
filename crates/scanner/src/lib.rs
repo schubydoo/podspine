@@ -1201,10 +1201,32 @@ fn watch_loop(
     };
 
     let (tx, rx) = std::sync::mpsc::channel();
+    // Filter events at the source so an unrelated write can't spin the watcher into
+    // a rescan-every-few-seconds loop: ignore reads (another app streaming the
+    // files bumps atime but changes nothing), our own split output under `data_dir`
+    // (writing an episode there would otherwise self-trigger a rescan forever), and
+    // the dir names discovery never walks (dotdirs, `@eaDir`, `lost+found` — NAS
+    // junk / thumbnail caches). Only a real library change reaches the debounced
+    // reconcile below; an irrelevant trickle no longer defeats the debounce.
+    let library_root = library.to_path_buf();
+    let data_dir_owned = data_dir.to_path_buf();
+    let data_canon = data_dir.canonicalize().ok();
     // Bring the watch up BEFORE the initial reconcile: a change that lands during
     // the scan's directory walk is then buffered in `rx` and picked up by the loop
     // below, instead of being missed until the next event or a restart (issue 159).
-    let watcher = notify::recommended_watcher(move |res| {
+    let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        // Drop irrelevant events; forward everything else (incl. errors, so the
+        // loop still sees a watch failure).
+        if let Ok(event) = &res
+            && !watch_event_is_relevant(
+                event,
+                &library_root,
+                &data_dir_owned,
+                data_canon.as_deref(),
+            )
+        {
+            return;
+        }
         let _ = tx.send(res);
     })
     .and_then(|mut watcher| {
@@ -1257,6 +1279,54 @@ fn watch_loop(
         );
     }
     Ok(())
+}
+
+/// Whether a watch event should trigger a reconcile. Reads (open/close/access,
+/// including the atime bumps another app makes while streaming the files) never
+/// change content, so they're dropped; otherwise the event is relevant if *any* of
+/// its paths is a real library path (notify batches related paths, e.g. a rename's
+/// from+to). An event with no paths (a rescan hint) is treated as relevant — we
+/// can't judge it, so err toward reconciling.
+fn watch_event_is_relevant(
+    event: &notify::Event,
+    library_root: &Path,
+    data_dir: &Path,
+    data_canon: Option<&Path>,
+) -> bool {
+    if matches!(event.kind, notify::EventKind::Access(_)) {
+        return false;
+    }
+    if event.paths.is_empty() {
+        return true;
+    }
+    event
+        .paths
+        .iter()
+        .any(|p| watch_path_is_relevant(p, library_root, data_dir, data_canon))
+}
+
+/// Whether a changed path is a real library source rather than something the walk
+/// ignores. Mirrors discovery so the watch and the walk agree: skip podspine's own
+/// output under `data_dir` (a nested `--data-dir` writing an episode must not read
+/// as a library change) and any path with an ignored component — dotdirs,
+/// `@eaDir`, `lost+found` — below the library root. Purely lexical (no fs calls):
+/// a `Remove` event's path is already gone, and this runs in the hot event handler.
+fn watch_path_is_relevant(
+    path: &Path,
+    library_root: &Path,
+    data_dir: &Path,
+    data_canon: Option<&Path>,
+) -> bool {
+    if path.starts_with(data_dir) || data_canon.is_some_and(|d| path.starts_with(d)) {
+        return false;
+    }
+    // Only inspect components *below* the root, so a library that itself lives under
+    // a dot-path (e.g. `…/.local/share/books`) isn't wholly ignored.
+    let rel = path.strip_prefix(library_root).unwrap_or(path);
+    !rel.components().any(|c| match c {
+        std::path::Component::Normal(name) => name.to_str().is_some_and(is_ignored_name),
+        _ => false,
+    })
 }
 
 /// Discover book sources one level under `library`, in a deterministic
@@ -1436,7 +1506,14 @@ fn source_is_inside(src: &BookSource, library_root: &Path) -> bool {
 fn is_ignored_dir(dir: &Path) -> bool {
     dir.file_name()
         .and_then(|s| s.to_str())
-        .is_some_and(|name| name.starts_with('.') || name == "@eaDir" || name == "lost+found")
+        .is_some_and(is_ignored_name)
+}
+
+/// The single ignore rule shared by the walk ([`is_ignored_dir`]) and the
+/// watch-event filter ([`watch_path_is_relevant`]), so the two never disagree on
+/// what to skip: dotfiles/dotdirs and the NAS junk caches `@eaDir` / `lost+found`.
+fn is_ignored_name(name: &str) -> bool {
+    name.starts_with('.') || name == "@eaDir" || name == "lost+found"
 }
 
 /// Classify a per-book subfolder: prefer a splittable `.m4b`/`.m4a`; a lone
@@ -4246,6 +4323,83 @@ mod tests {
         // already wipes these unique paths at the START of the next run, so nothing
         // leaks across runs; the parked thread sees no further events and dies with
         // the process.
+    }
+
+    #[test]
+    fn watch_filter_ignores_output_and_junk_keeps_real_changes() {
+        let lib = Path::new("/lib");
+        let data = Path::new("/lib/.podspine"); // a nested --data-dir
+        // Our own split output under the data dir — ignored (else it self-triggers).
+        assert!(!watch_path_is_relevant(
+            Path::new("/lib/.podspine/BookX/001.m4a"),
+            lib,
+            data,
+            None
+        ));
+        // NAS junk / thumbnail caches — ignored anywhere below the root.
+        assert!(!watch_path_is_relevant(
+            Path::new("/lib/Author/@eaDir/thumb.jpg"),
+            lib,
+            data,
+            None
+        ));
+        assert!(!watch_path_is_relevant(
+            Path::new("/lib/.stfolder/x"),
+            lib,
+            data,
+            None
+        ));
+        assert!(!watch_path_is_relevant(
+            Path::new("/lib/lost+found/y"),
+            lib,
+            data,
+            None
+        ));
+        // A real book file — relevant.
+        assert!(watch_path_is_relevant(
+            Path::new("/lib/Author/Title/book.m4b"),
+            lib,
+            data,
+            None
+        ));
+        // A library that itself lives under a dot-path is NOT wholly ignored.
+        let dotlib = Path::new("/home/u/.local/books");
+        assert!(watch_path_is_relevant(
+            Path::new("/home/u/.local/books/Author/Title/book.m4b"),
+            dotlib,
+            Path::new("/data"),
+            None
+        ));
+    }
+
+    #[test]
+    fn watch_filter_drops_reads_but_keeps_writes() {
+        use notify::EventKind;
+        use notify::event::{AccessKind, ModifyKind};
+        let lib = Path::new("/lib");
+        let data = Path::new("/data");
+        let paths = || vec![PathBuf::from("/lib/Author/Title/book.m4b")];
+        // A read (another app streaming) — dropped.
+        let read = notify::Event {
+            kind: EventKind::Access(AccessKind::Any),
+            paths: paths(),
+            attrs: Default::default(),
+        };
+        assert!(!watch_event_is_relevant(&read, lib, data, None));
+        // A write to a real book file — relevant.
+        let write = notify::Event {
+            kind: EventKind::Modify(ModifyKind::Any),
+            paths: paths(),
+            attrs: Default::default(),
+        };
+        assert!(watch_event_is_relevant(&write, lib, data, None));
+        // A pathless rescan hint errs toward reconciling.
+        let hint = notify::Event {
+            kind: EventKind::Other,
+            paths: vec![],
+            attrs: Default::default(),
+        };
+        assert!(watch_event_is_relevant(&hint, lib, data, None));
     }
 
     #[test]

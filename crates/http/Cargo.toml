@@ -22,6 +22,7 @@ podspine-splitter = { path = "../splitter" }
 podspine-ui = { path = "../ui" }
 podspine-metrics = { path = "../metrics" }
 tracing = { workspace = true }
+blake3 = { workspace = true }
 
 [dev-dependencies]
 podspine-scanner = { path = "../scanner" }
