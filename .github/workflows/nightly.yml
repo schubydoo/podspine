@@ -31,9 +31,12 @@ concurrency:
 
 jobs:
   binaries:
-    # Scheduled runs only on the canonical repo (a fork won't build nightlies on a
-    # cron it never asked for); a manual dispatch is allowed anywhere.
-    if: ${{ github.event_name == 'workflow_dispatch' || github.repository == 'schubydoo/podspine' }}
+    # Canonical repo AND the `main` ref only. `:nightly` is contracted to be the tip
+    # of main, so a dispatch on a feature branch or tag (workflow_dispatch lets you
+    # pick any ref) must not publish its build under that tag; a scheduled run's ref
+    # is already refs/heads/main. This also keeps forks from building nightlies on a
+    # cron they never asked for.
+    if: ${{ github.repository == 'schubydoo/podspine' && github.ref == 'refs/heads/main' }}
     name: Build ${{ matrix.name }} binary (musl)
     runs-on: ubuntu-latest
     strategy:
