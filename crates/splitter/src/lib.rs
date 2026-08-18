@@ -497,17 +497,51 @@ pub fn split_book_encoded(
             .expect("a failed result exists in this branch"));
     }
 
-    // Phase 2 — every chapter produced: publish each `.part` into place, in order,
-    // and reassemble the episodes in chapter order.
+    // Phase 2 — every chapter produced: publish each `.part` into place.
+    let parts: Vec<ProducedPart> = produced
+        .into_iter()
+        .map(|r| r.expect("all parts are Ok in this branch"))
+        .collect();
+    let part_paths: Vec<PathBuf> = parts.iter().map(|p| p.part.clone()).collect();
+
+    // A same-dir rename is atomic and, in practice, only fails when a directory sits
+    // at the target (the "blocked rename" case). Check EVERY target before renaming
+    // any, so a late block can't leave earlier chapters published over the index's
+    // now-stale enclosure lengths. If any is blocked, publish nothing and delete all
+    // the produced parts — the previously-served episodes stay intact.
+    for ch in chapters {
+        let out_path = out_path_for(ch);
+        if out_path.is_dir() {
+            for leftover in &part_paths {
+                let _ = fs::remove_file(leftover);
+            }
+            return Err(SplitError::Publish {
+                idx: ch.idx,
+                path: out_path,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "a directory is at the episode path",
+                ),
+            });
+        }
+    }
+
+    // Targets are clear: publish each part in chapter order. A rename that still
+    // fails here is a catastrophic I/O error (e.g. the disk filled between producing
+    // the parts and this rename); delete the parts not yet published so nothing is
+    // left half-done, then error. Renames that already succeeded can't be rolled
+    // back — POSIX has no cross-file rename transaction — but the next scan re-splits.
     let mut episodes = Vec::with_capacity(n);
-    for (ch, r) in chapters.iter().zip(produced) {
-        let produced = r.expect("all parts are Ok in this branch");
-        episodes.push(publish_part(
-            produced,
-            out_path_for(ch),
-            ch.idx,
-            ch.end_sec - ch.start_sec,
-        )?);
+    for (i, (ch, part)) in chapters.iter().zip(parts).enumerate() {
+        match publish_part(part, out_path_for(ch), ch.idx, ch.end_sec - ch.start_sec) {
+            Ok(ep) => episodes.push(ep),
+            Err(err) => {
+                for leftover in &part_paths[i..] {
+                    let _ = fs::remove_file(leftover);
+                }
+                return Err(err);
+            }
+        }
     }
     Ok(episodes)
 }
@@ -1311,6 +1345,75 @@ mod tests {
         assert!(
             leftovers.is_empty(),
             "produced parts must be cleaned up: {leftovers:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_blocked_publish_target_publishes_none_of_a_multi_chapter_split() {
+        if !have_ffmpeg() {
+            skip!("ffmpeg not available");
+        }
+        // Both chapters produce fine, but a directory sits where chapter 2's episode
+        // must land, so its publish (rename) can't happen. The pre-check must catch
+        // that before publishing chapter 1 — nothing half-published, no parts left.
+        let dir = std::env::temp_dir().join("podspine-atomic-block");
+        let _ = std::fs::remove_dir_all(&dir);
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let input = dir.join("book.m4a");
+        let ok = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=10",
+                "-c:a",
+                "aac",
+            ])
+            .arg(&input)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "ffmpeg synth failed");
+
+        // A directory blocks chapter 2's target; chapter 1 has an old published file.
+        std::fs::create_dir_all(out.join("002.m4a")).unwrap();
+        let published = out.join("001.m4a");
+        std::fs::write(&published, b"old episode 1").unwrap();
+        let before = std::fs::read(&published).unwrap();
+
+        let cuts = [
+            ChapterCut {
+                idx: 0,
+                start_sec: 0.0,
+                end_sec: 3.0,
+            },
+            ChapterCut {
+                idx: 1,
+                start_sec: 3.0,
+                end_sec: 6.0,
+            },
+        ];
+        let err = split_book(&input, &out, &cuts, "m4a").expect_err("blocked target must fail");
+        assert!(matches!(err, SplitError::Publish { idx: 1, .. }), "{err:?}");
+
+        // Chapter 1's old file is untouched (nothing was published)...
+        assert_eq!(std::fs::read(&published).unwrap(), before);
+        // ...the blocker is left exactly as it was...
+        assert!(out.join("002.m4a").is_dir());
+        // ...and no `.part` files are left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&out)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".part"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "parts must be cleaned up: {leftovers:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
