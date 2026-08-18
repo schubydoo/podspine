@@ -25,8 +25,11 @@ permissions:
   contents: read
 
 concurrency:
-  # A newer nightly supersedes an in-flight one — cancel the stale build.
-  group: nightly
+  # Scope by ref, not a bare "nightly": concurrency is evaluated BEFORE the job's
+  # ref guard, so a shared group would let an off-main dispatch cancel a running
+  # main nightly and then skip — killing the image with nothing to replace it.
+  # Per-ref, a newer main build still supersedes an in-flight main build.
+  group: nightly-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
