@@ -1851,3 +1851,82 @@ async fn set_theme_redirects_back_even_when_ui_origin_differs() {
         "/book/dracula"
     );
 }
+
+#[tokio::test]
+async fn cover_thumbnail_is_generated_on_demand_and_refreshes_when_stale() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+    let dir = std::env::temp_dir().join("podspine-http-thumb");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let data = dir.join("data");
+
+    let index = Index::open_in_memory().unwrap();
+    let input = synth_with_cover(&dir);
+    let book = scan_book(&input, &data, &index).unwrap();
+    let feed_id = book.feed_id.clone();
+    let cover = PathBuf::from(book.cover_path.clone().expect("cover extracted"));
+    let thumb = cover.with_file_name("cover_thumb.jpg");
+    // Thumbnails are made on demand, not at ingest.
+    assert!(
+        !thumb.exists(),
+        "the scan must not pre-generate a thumbnail"
+    );
+
+    let state = AppState::new(
+        index,
+        "http://test".to_string(),
+        &data,
+        &dir,
+        None,
+        false,
+        None,
+        None,
+    );
+    let app = router(state);
+
+    let get_thumb = || {
+        app.clone().oneshot(
+            Request::get(format!("/cover/{feed_id}/thumb"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+    };
+
+    // First request generates the thumbnail, caches it to disk, and serves JPEG.
+    let resp = get_thumb().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get(header::CONTENT_TYPE).unwrap(),
+        "image/jpeg"
+    );
+    assert!(
+        resp.headers().get(header::ETAG).is_some(),
+        "thumb is cacheable"
+    );
+    assert!(!body_bytes(resp).await.is_empty(), "thumbnail bytes served");
+    assert!(thumb.exists(), "first request caches the thumbnail to disk");
+
+    // A re-extracted cover (newer mtime) makes the cached thumb stale — the next
+    // request regenerates it so the thumbnail is at least as new as the cover again.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let cover_bytes = std::fs::read(&cover).unwrap();
+    std::fs::write(&cover, &cover_bytes).unwrap(); // rewrite bumps the cover's mtime
+    let cover_mtime = std::fs::metadata(&cover).unwrap().modified().unwrap();
+    assert!(
+        std::fs::metadata(&thumb).unwrap().modified().unwrap() < cover_mtime,
+        "precondition: the cached thumb is now older than the cover"
+    );
+
+    let resp = get_thumb().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let _ = body_bytes(resp).await;
+    assert!(
+        std::fs::metadata(&thumb).unwrap().modified().unwrap() >= cover_mtime,
+        "a stale thumbnail is regenerated on the next request"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

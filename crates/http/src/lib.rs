@@ -49,7 +49,7 @@ use tower_http::trace::TraceLayer;
 
 use podspine_feed::{FeedBook, FeedEpisode, render_checked};
 use podspine_index::{BookRow, Index};
-use podspine_splitter::{ChapterCut, remux_faststart, split_chapter};
+use podspine_splitter::{ChapterCut, extract_cover_thumb, remux_faststart, split_chapter};
 use podspine_ui::{
     BookCard, BookDetail, Theme, book_page, index_page, scanning_page, subscribe_page,
 };
@@ -247,6 +247,7 @@ pub fn router(state: AppState) -> Router {
         .route("/theme/{mode}", post(set_theme))
         .route("/subscribe/{feed_id}", get(subscribe))
         .route("/cover/{feed_id}", get(cover))
+        .route("/cover/{feed_id}/thumb", get(cover_thumb))
         .route("/feed/{feed_id}", get(feed))
         .route("/audio/{feed_id}/{number}", get(audio))
         .layer(TraceLayer::new_for_http())
@@ -497,42 +498,142 @@ async fn cover(
     if !valid_feed_id(&feed_id) {
         return Err(AppError::NotFound);
     }
-    let cover_path = {
-        let index = state.index.lock().map_err(AppError::internal)?;
-        index
-            .get_book_by_feed_id(&feed_id)
-            .map_err(AppError::internal)?
-            .ok_or(AppError::NotFound)?
-            .cover_path
-            .ok_or(AppError::NotFound)?
-    };
+    let cover_path = book_cover_path(&state, &feed_id)?;
+    let canonical = resolve_under_data_dir(&cover_path, &state.data_dir, &feed_id)?;
+    serve_image(&canonical, &headers).await
+}
 
-    let canonical = PathBuf::from(&cover_path)
+/// `GET /cover/{feed_id}/thumb` — a small `cover_thumb.jpg` for the browse UI grid
+/// (the RSS feed and `/cover` keep the full-res image). The thumbnail is generated
+/// **on demand** from the full cover the first time it's requested and cached in the
+/// data dir, then served as a file thereafter — so existing books get a thumbnail on
+/// first view without a re-ingest, and a re-extracted cover refreshes it (the
+/// generator re-runs when the thumb is missing or older than the cover). If
+/// generation fails, it falls back to the full cover rather than 404ing.
+async fn cover_thumb(
+    State(state): State<AppState>,
+    Path(feed_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    if !state.is_ready() {
+        return Ok(scanning_unavailable());
+    }
+    if !valid_feed_id(&feed_id) {
+        return Err(AppError::NotFound);
+    }
+    let cover_path = book_cover_path(&state, &feed_id)?;
+    // The full cover is the source of truth (must exist, under the data dir).
+    let cover = resolve_under_data_dir(&cover_path, &state.data_dir, &feed_id)?;
+    let thumb = cover.with_file_name("cover_thumb.jpg");
+
+    match ensure_thumb(&state, &cover, &thumb).await {
+        Ok(()) => serve_image(&thumb, &headers).await,
+        // Generation failed — serve the full cover so a book with art never 404s.
+        Err(_) => serve_image(&cover, &headers).await,
+    }
+}
+
+/// Ensure the cover thumbnail at `thumb` exists and is current, (re)generating it
+/// from `cover` when it's missing or older than the cover — so a re-extracted cover
+/// refreshes the thumbnail on the next view, with no re-ingest and no persisted
+/// thumbnail at scan time. Single-flighted per path like [`ensure_cached`] so
+/// concurrent first-requests run ffmpeg once; the blocking work runs off the async
+/// runtime.
+async fn ensure_thumb(state: &AppState, cover: &FsPath, thumb: &FsPath) -> Result<(), AppError> {
+    let lock = {
+        let mut map = state.inflight.lock().map_err(AppError::internal)?;
+        map.entry(thumb.to_path_buf())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    let _guard = lock.lock().await;
+
+    let outcome = async {
+        // A concurrent request may have produced a fresh thumb while we waited.
+        if thumb_is_fresh(thumb, cover) {
+            return Ok(());
+        }
+        let cover = cover.to_path_buf();
+        let out_dir = cover
+            .parent()
+            .map(|p| p.to_path_buf())
+            .ok_or(AppError::NotFound)?;
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            extract_cover_thumb(&cover, &out_dir).map_err(std::io::Error::other)?;
+            Ok(())
+        })
+        .await
+        .map_err(AppError::internal)?
+        .map_err(AppError::internal)?;
+        Ok(())
+    }
+    .await;
+
+    // Drop the single-flight entry (see [`ensure_cached`] for why this is race-free).
+    if let Ok(mut map) = state.inflight.lock() {
+        map.remove(thumb);
+    }
+    outcome
+}
+
+/// Whether the thumbnail exists and is at least as new as the cover it derives from.
+/// A missing thumb, or one older than the cover (a re-extraction bumped the cover's
+/// mtime), is stale and must be regenerated.
+fn thumb_is_fresh(thumb: &FsPath, cover: &FsPath) -> bool {
+    match (
+        std::fs::metadata(thumb).and_then(|m| m.modified()),
+        std::fs::metadata(cover).and_then(|m| m.modified()),
+    ) {
+        (Ok(thumb_mtime), Ok(cover_mtime)) => thumb_mtime >= cover_mtime,
+        _ => false,
+    }
+}
+
+/// The book's stored (full) cover path, or `NotFound` when the book/cover is absent.
+fn book_cover_path(state: &AppState, feed_id: &str) -> Result<String, AppError> {
+    let index = state.index.lock().map_err(AppError::internal)?;
+    index
+        .get_book_by_feed_id(feed_id)
+        .map_err(AppError::internal)?
+        .ok_or(AppError::NotFound)?
+        .cover_path
+        .ok_or(AppError::NotFound)
+}
+
+/// Canonicalize a stored image path and confirm it stays under the data dir (a
+/// resolved path that escapes it is rejected as `NotFound`, never served). Fails
+/// with `NotFound` when the file doesn't exist — which the thumbnail handler relies
+/// on to fall back to the full cover.
+fn resolve_under_data_dir(
+    path: &str,
+    data_dir: &FsPath,
+    feed_id: &str,
+) -> Result<PathBuf, AppError> {
+    let canonical = PathBuf::from(path)
         .canonicalize()
         .map_err(|_| AppError::NotFound)?;
-    if !canonical.starts_with(&state.data_dir) {
+    if !canonical.starts_with(data_dir) {
         tracing::warn!(feed_id, "resolved cover path escaped the data dir");
         return Err(AppError::NotFound);
     }
+    Ok(canonical)
+}
 
-    // Read the bytes first, then derive the ETag from *those exact bytes* (blake3).
-    // A validator built from stat() metadata could advertise the old file's tag
-    // against new bytes if a rescan overwrites the cover between the stat and the
-    // read (TOCTOU), and whole-second mtime wouldn't change for a same-length,
-    // same-second replacement. A content hash matches whatever is served, always.
-    let bytes = tokio::fs::read(&canonical)
+/// Serve an on-disk image with content-addressed caching: an `ETag` (a blake3 hash
+/// of the served bytes) + `Cache-Control`, and a bodyless `304` on a matching
+/// `If-None-Match`, so a browser revalidates cheaply instead of re-downloading the
+/// image on every page refresh. `canonical` is already resolved and confirmed under
+/// the data dir. The ETag is over the exact bytes (not stat metadata), so it can't
+/// advertise a stale validator against a cover that was re-extracted between a stat
+/// and the read.
+async fn serve_image(canonical: &FsPath, headers: &HeaderMap) -> Result<Response, AppError> {
+    let bytes = tokio::fs::read(canonical)
         .await
         .map_err(|_| AppError::NotFound)?;
     let etag = format!("\"{}\"", blake3::hash(&bytes).to_hex());
     let etag_value = HeaderValue::from_str(&etag).map_err(AppError::internal)?;
-    // Short max-age so a refresh burst skips the network entirely, while a covered
-    // book that gets re-extracted goes stale for at most that window.
     let cache_control = HeaderValue::from_static("public, max-age=300");
 
-    // If-None-Match: honour a matching tag (weak `W/` prefix, comma list, or `*`)
-    // with a 304 so the client keeps its cached image and no body is sent. We still
-    // read the file to hash it, but skip re-sending the (multi-MB) body — the
-    // network transfer was the cost over a slow link, not the local disk read.
     let unchanged = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
@@ -549,7 +650,8 @@ async fn cover(
         return Ok(resp);
     }
 
-    let mut resp = ([(header::CONTENT_TYPE, image_mime(&cover_path))], bytes).into_response();
+    let mime = image_mime(&canonical.to_string_lossy());
+    let mut resp = ([(header::CONTENT_TYPE, mime)], bytes).into_response();
     let h = resp.headers_mut();
     h.insert(header::ETAG, etag_value);
     h.insert(header::CACHE_CONTROL, cache_control);
