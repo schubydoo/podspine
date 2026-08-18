@@ -331,7 +331,10 @@ pub fn scanning_page(theme: Theme) -> Markup {
                 style { (PreEscaped(STYLE)) }
             }
             body {
-                header.site { h1 { a href="/" { "Podspine" } } }
+                header.site {
+                    h1 { a href="/" { "Podspine" } }
+                    (theme_picker(theme))
+                }
                 main {
                     p.empty { "Scanning your library…" }
                     p.empty {
@@ -621,6 +624,11 @@ mod tests {
         assert!(!html.contains("No audiobooks found"));
         // ...that reloads itself (no JS) so it flips to the list when the scan ends.
         assert!(html.contains("<meta http-equiv=\"refresh\" content=\"5\">"));
+        // The theme picker is available here too, not only after readiness.
+        assert!(
+            html.contains("themepicker"),
+            "scanning page carries the picker"
+        );
     }
 
     #[test]
