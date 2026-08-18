@@ -53,29 +53,50 @@ pub struct BookDetail {
 /// Shared styles + a page shell. Inlined so the binary needs no static assets.
 /// The palette is chosen for WCAG AA contrast (NFR-C3): `#18181b` text on white
 /// (~16:1), `#52525b` muted (~7:1), and white on the `#1d4ed8` accent (~5.3:1).
-/// Everything is driven through the `--*` custom properties, so the dark palette
-/// below is just an OS-preference override of those same variables — no per-rule
-/// duplication. `color-scheme` lets native controls/scrollbars follow suit.
+/// Everything is driven through the `--*` custom properties, so a theme is just an
+/// override of those same variables — no per-rule duplication. The default (no
+/// `data-theme`) follows the OS via `prefers-color-scheme`; an explicit choice from
+/// the header picker sets `<html data-theme="light|dark">` (persisted in a cookie,
+/// read server-side) which wins over the media query. `color-scheme` keeps native
+/// controls/scrollbars in step. AA-contrast dark palette — `#f4f4f5` text on
+/// `#18181b` (~16:1), `#a1a1aa` muted (~7:1), `#0b1120` on the lighter `#60a5fa`
+/// accent (~7:1). The QR SVGs keep their own white background (`.appqr svg`) so a
+/// phone can still scan in dark mode.
 const STYLE: &str = r#"
 :root { color-scheme: light dark;
         --bg:#ffffff; --surface:#f4f4f5; --border:#d4d4d8; --text:#18181b;
         --muted:#52525b; --accent:#1d4ed8; --accent-text:#ffffff; --danger:#b91c1c; }
-/* Auto dark mode: follows the OS setting, no JS, no toggle. AA-contrast dark
-   palette — `#f4f4f5` text on `#18181b` (~16:1), `#a1a1aa` muted (~7:1), and
-   `#0b1120` text on the lighter `#60a5fa` accent (~7:1). The QR SVGs keep their
-   own white background (set inline on `.appqr svg`) so a phone can still scan. */
+/* Explicit "Light" from the picker: pin the scheme so native controls don't follow
+   a dark OS; the light palette above already applies. */
+:root[data-theme="light"] { color-scheme: light; }
+/* The dark palette lives in two selectors so it applies both for an explicit "Dark"
+   choice and for the OS default when the visitor hasn't chosen (:not([data-theme])). */
+:root[data-theme="dark"] { color-scheme: dark;
+        --bg:#18181b; --surface:#27272a; --border:#3f3f46; --text:#f4f4f5;
+        --muted:#a1a1aa; --accent:#60a5fa; --accent-text:#0b1120; --danger:#f87171; }
 @media (prefers-color-scheme: dark) {
-  :root { --bg:#18181b; --surface:#27272a; --border:#3f3f46; --text:#f4f4f5;
-          --muted:#a1a1aa; --accent:#60a5fa; --accent-text:#0b1120; --danger:#f87171; }
+  :root:not([data-theme]) { --bg:#18181b; --surface:#27272a; --border:#3f3f46;
+        --text:#f4f4f5; --muted:#a1a1aa; --accent:#60a5fa; --accent-text:#0b1120;
+        --danger:#f87171; }
 }
 * { box-sizing:border-box; }
 body { margin:0; font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
        color:var(--text); background:var(--bg); }
 a { color:var(--accent); }
 :focus-visible { outline:3px solid var(--accent); outline-offset:2px; border-radius:4px; }
-header.site { padding:1rem 1.25rem; border-bottom:1px solid var(--border); }
+header.site { padding:1rem 1.25rem; border-bottom:1px solid var(--border);
+        display:flex; align-items:center; justify-content:space-between; gap:1rem; }
 header.site h1 { margin:0; font-size:1.25rem; }
 header.site a { text-decoration:none; color:var(--text); }
+/* Theme picker: a no-JS segmented control (a form of submit buttons). The active
+   theme is marked with aria-pressed, which also styles it. */
+.themepicker { display:inline-flex; margin:0; border:1px solid var(--border);
+        border-radius:6px; overflow:hidden; }
+.themepicker button { font:inherit; font-size:.8rem; padding:.35rem .7rem; border:0;
+        border-left:1px solid var(--border); background:var(--surface); color:var(--text);
+        cursor:pointer; }
+.themepicker button:first-child { border-left:0; }
+.themepicker button[aria-pressed="true"] { background:var(--accent); color:var(--accent-text); }
 main { max-width:960px; margin:0 auto; padding:1.5rem 1.25rem; }
 .grid { list-style:none; margin:0; padding:0; display:grid; gap:1.25rem;
         grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); }
@@ -164,11 +185,69 @@ document.addEventListener('click', function (e) {
 });
 "#;
 
-/// Wrap page `body` content in the full HTML document shell.
-fn page(title: &str, body: Markup) -> Markup {
+/// The visitor's chosen colour theme, decoded from the `theme` cookie. `System`
+/// (the default, no cookie) follows the OS via `prefers-color-scheme`; `Light` and
+/// `Dark` force it. Rendered as the `data-theme` attribute the CSS keys off.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Theme {
+    /// Follow the operating system (no `data-theme` attribute).
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl Theme {
+    /// Decode a `theme` cookie / picker `mode` value; anything else is `System`
+    /// (so a stale or garbage cookie safely falls back to following the OS).
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "light" => Theme::Light,
+            "dark" => Theme::Dark,
+            _ => Theme::System,
+        }
+    }
+
+    /// The `data-theme` attribute value, or `None` for `System` (no attribute → the
+    /// `prefers-color-scheme` media query applies).
+    fn attr(self) -> Option<&'static str> {
+        match self {
+            Theme::System => None,
+            Theme::Light => Some("light"),
+            Theme::Dark => Some("dark"),
+        }
+    }
+
+    /// The value to persist in the `theme` cookie, or `None` for `System` (which
+    /// clears the cookie so the browser reverts to the OS preference).
+    pub fn cookie_value(self) -> Option<&'static str> {
+        self.attr()
+    }
+}
+
+/// The no-JS theme picker: a small form of submit buttons in the header. Each
+/// button's `formaction` posts to `/theme/{mode}`; the server sets the cookie and
+/// redirects back. The active theme is marked with `aria-pressed` (also styled).
+fn theme_picker(current: Theme) -> Markup {
+    html! {
+        form.themepicker method="post" aria-label="Colour theme" {
+            @for &(mode, value, label) in &[
+                (Theme::System, "system", "Auto"),
+                (Theme::Light, "light", "Light"),
+                (Theme::Dark, "dark", "Dark"),
+            ] {
+                button formaction=(format!("/theme/{value}"))
+                    aria-pressed=(mode == current) { (label) }
+            }
+        }
+    }
+}
+
+/// Wrap page `body` content in the full HTML document shell for the given `theme`.
+fn page(title: &str, theme: Theme, body: Markup) -> Markup {
     html! {
         (DOCTYPE)
-        html lang="en" {
+        html lang="en" data-theme=[theme.attr()] {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
@@ -176,7 +255,10 @@ fn page(title: &str, body: Markup) -> Markup {
                 style { (PreEscaped(STYLE)) }
             }
             body {
-                header.site { h1 { a href="/" { "Podspine" } } }
+                header.site {
+                    h1 { a href="/" { "Podspine" } }
+                    (theme_picker(theme))
+                }
                 (body)
             }
         }
@@ -205,9 +287,10 @@ fn cover(id: &str, title: &str, has_cover: bool, class: &str) -> Markup {
 }
 
 /// The home page: a grid of books, each linking to its detail page.
-pub fn index_page(books: &[BookCard]) -> Markup {
+pub fn index_page(books: &[BookCard], theme: Theme) -> Markup {
     page(
         "Podspine",
+        theme,
         html! {
             main {
                 @if books.is_empty() {
@@ -236,10 +319,10 @@ pub fn index_page(books: &[BookCard]) -> Markup {
 /// becomes the normal book list on its own once the scan finishes. It reuses the
 /// page shell but needs its own `<head>` (the refresh directive and a distinct
 /// title), so it is built directly rather than through [`page`].
-pub fn scanning_page() -> Markup {
+pub fn scanning_page(theme: Theme) -> Markup {
     html! {
         (DOCTYPE)
-        html lang="en" {
+        html lang="en" data-theme=[theme.attr()] {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
@@ -262,13 +345,14 @@ pub fn scanning_page() -> Markup {
 }
 
 /// A book's detail page: cover, copy-feed-URL, scannable QR, and how-to panel.
-pub fn book_page(book: &BookDetail) -> Markup {
+pub fn book_page(book: &BookDetail, theme: Theme) -> Markup {
     // The QR encodes the /subscribe helper page, not the raw feed: a raw RSS URL
     // scanned by the iOS Camera opens Safari to bare XML ("can't open"), whereas
     // the helper page offers real per-app "Open in…" deep links.
     let qr = qr_svg(&book.subscribe_url);
     page(
         &book.title,
+        theme,
         html! {
             main {
                 a.back href="/" { "← All books" }
@@ -401,10 +485,11 @@ pub fn subscribe_links(feed_url: &str) -> Vec<AppLink> {
 /// scan (desktop→phone handoff) — and a copy-the-URL fallback. This is what the
 /// book-page QR points at, so an iOS Camera scan lands on real app links instead of
 /// raw feed XML.
-pub fn subscribe_page(book: &BookDetail) -> Markup {
+pub fn subscribe_page(book: &BookDetail, theme: Theme) -> Markup {
     let apps = subscribe_links(&book.feed_url);
     page(
         &format!("Add \u{201c}{}\u{201d} to a podcast app", book.title),
+        theme,
         html! {
             main {
                 a.back href=(format!("/book/{}", book.slug)) { "← Back to book" }
@@ -518,7 +603,7 @@ mod tests {
             card("dracula", "Dracula", true),
             card("solaris", "Solaris", false),
         ];
-        let html = index_page(&books).into_string();
+        let html = index_page(&books, Theme::System).into_string();
         assert!(html.contains("href=\"/book/dracula\""));
         assert!(html.contains("href=\"/book/solaris\""));
         // Cover present -> img with alt; absent -> labelled placeholder.
@@ -530,7 +615,7 @@ mod tests {
 
     #[test]
     fn scanning_page_holds_and_self_refreshes() {
-        let html = scanning_page().into_string();
+        let html = scanning_page(Theme::System).into_string();
         // A clear scanning state, not an empty book grid...
         assert!(html.contains("Scanning your library…"));
         assert!(!html.contains("No audiobooks found"));
@@ -540,9 +625,37 @@ mod tests {
 
     #[test]
     fn empty_library_shows_a_message() {
-        let html = index_page(&[]).into_string();
+        let html = index_page(&[], Theme::System).into_string();
         assert!(html.contains("No audiobooks found"));
         assert!(!html.contains("<ul"));
+    }
+
+    #[test]
+    fn theme_picker_reflects_choice() {
+        // System (the default): no data-theme on <html>, so the page follows the OS.
+        // (The CSS names data-theme in selectors, so assert on the tag, not a substring.)
+        let sys = index_page(&[], Theme::System).into_string();
+        assert!(
+            sys.contains("<html lang=\"en\">"),
+            "System sets no data-theme"
+        );
+        assert!(sys.contains("themepicker"), "the picker is always present");
+        // The active option is marked on its button (assert on the label so the CSS
+        // selector `[aria-pressed="true"]` doesn't count as a match). Auto for System.
+        assert!(sys.contains("aria-pressed=\"true\">Auto</button>"));
+
+        // Dark: the <html> tag carries data-theme="dark" and posts to /theme/{mode}.
+        let dark = index_page(&[], Theme::Dark).into_string();
+        assert!(dark.contains("<html lang=\"en\" data-theme=\"dark\">"));
+        assert!(dark.contains("formaction=\"/theme/dark\""));
+        assert!(
+            dark.contains("aria-pressed=\"true\">Dark</button>"),
+            "Dark active"
+        );
+        assert!(
+            !dark.contains("aria-pressed=\"true\">Auto</button>"),
+            "Auto not active in dark"
+        );
     }
 
     #[test]
@@ -570,7 +683,7 @@ mod tests {
 
     #[test]
     fn book_page_has_exact_feed_url_and_qr() {
-        let html = book_page(&detail()).into_string();
+        let html = book_page(&detail(), Theme::System).into_string();
         // The copy input carries the exact working (capability) URL.
         assert!(html.contains("value=\"http://host:8080/feed/Xk9mQ2vP7nR4tB1cY6wZ8a.xml\""));
         assert!(html.contains("12 episodes"));
@@ -587,7 +700,7 @@ mod tests {
 
     #[test]
     fn subscribe_page_has_per_app_deep_links_and_qrs() {
-        let html = subscribe_page(&detail()).into_string();
+        let html = subscribe_page(&detail(), Theme::System).into_string();
         // Apple Podcasts: podcast:// + feed URL WITHOUT the scheme.
         assert!(html.contains("href=\"podcast://host:8080/feed/Xk9mQ2vP7nR4tB1cY6wZ8a.xml\""));
         assert!(html.contains("pktc://subscribe/host:8080/feed/"));
@@ -638,7 +751,7 @@ mod tests {
     #[test]
     fn markup_escapes_untrusted_title() {
         let books = [card("x", "<script>alert(1)</script>", false)];
-        let html = index_page(&books).into_string();
+        let html = index_page(&books, Theme::System).into_string();
         assert!(!html.contains("<script>alert(1)"));
         assert!(html.contains("&lt;script&gt;"));
     }

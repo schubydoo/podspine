@@ -50,7 +50,9 @@ use tower_http::trace::TraceLayer;
 use podspine_feed::{FeedBook, FeedEpisode, render_checked};
 use podspine_index::{BookRow, Index};
 use podspine_splitter::{ChapterCut, remux_faststart, split_chapter};
-use podspine_ui::{BookCard, BookDetail, book_page, index_page, scanning_page, subscribe_page};
+use podspine_ui::{
+    BookCard, BookDetail, Theme, book_page, index_page, scanning_page, subscribe_page,
+};
 
 /// Max concurrent in-flight requests before backpressure (DoS guard). Generous
 /// for a homelab tool; only bounds a pathological flood.
@@ -83,8 +85,9 @@ fn valid_feed_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// Same-origin guard for the state-changing `POST` routes (CSRF defense). This
-/// app uses **no cookies**, so `SameSite` is inapplicable; instead we check the
+/// Same-origin guard for the state-changing `POST` routes (CSRF defense). The only
+/// cookie the app sets is the non-auth `theme` preference (no session/auth cookie),
+/// so `SameSite` carries no ambient authority to protect; instead we check the
 /// browser-set fetch-metadata / `Origin` headers. Modern browsers always send
 /// `Sec-Fetch-Site`, so cross-site form posts are caught even in the proxy-auth
 /// deployment (where a forged request would otherwise ride the owner's proxy
@@ -99,6 +102,22 @@ fn same_origin(headers: &HeaderMap, base_url: &str) -> bool {
         Some(origin) => origin == base_url.split('/').take(3).collect::<Vec<_>>().join("/"),
         None => true,
     }
+}
+
+/// The visitor's colour [`Theme`] from the `theme` cookie (absent/garbage →
+/// [`Theme::System`], i.e. follow the OS). Parsed by hand — the app pulls in no
+/// cookie crate for one first-party, non-auth preference cookie.
+fn theme_from_cookie(headers: &HeaderMap) -> Theme {
+    headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|cookies| {
+            cookies
+                .split(';')
+                .find_map(|kv| kv.trim().strip_prefix("theme="))
+        })
+        .map(Theme::parse)
+        .unwrap_or_default()
 }
 
 /// Shared server state.
@@ -207,6 +226,7 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(index))
         .route("/book/{slug}", get(book))
         .route("/book/{slug}/regenerate", post(regenerate))
+        .route("/theme/{mode}", post(set_theme))
         .route("/subscribe/{feed_id}", get(subscribe))
         .route("/cover/{feed_id}", get(cover))
         .route("/feed/{feed_id}", get(feed))
@@ -270,11 +290,15 @@ async fn feed(
 }
 
 /// `GET /` — the browsable book grid.
-async fn index(State(state): State<AppState>) -> Result<Html<String>, AppError> {
+async fn index(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, AppError> {
+    let theme = theme_from_cookie(&headers);
     // Until the initial scan finishes, hold on a "Scanning…" page rather than
     // render an empty grid that reads as "no books / broken" (issue 159).
     if !state.is_ready() {
-        return Ok(Html(scanning_page().into_string()));
+        return Ok(Html(scanning_page(theme).into_string()));
     }
     let books = {
         let index = state.index.lock().map_err(AppError::internal)?;
@@ -290,17 +314,19 @@ async fn index(State(state): State<AppState>) -> Result<Html<String>, AppError> 
             has_cover: b.cover_path.is_some(),
         })
         .collect();
-    Ok(Html(index_page(&cards).into_string()))
+    Ok(Html(index_page(&cards, theme).into_string()))
 }
 
 /// `GET /book/{slug}` — a book's page: copy-feed-URL, QR, how-to panel.
 async fn book(
     State(state): State<AppState>,
     Path(slug): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Html<String>, AppError> {
     if !valid_slug(&slug) {
         return Err(AppError::NotFound);
     }
+    let theme = theme_from_cookie(&headers);
     let (book, episode_count) = {
         let index = state.index.lock().map_err(AppError::internal)?;
         let book = index
@@ -324,7 +350,7 @@ async fn book(
         has_cover: book.cover_path.is_some(),
         episode_count,
     };
-    Ok(Html(book_page(&detail).into_string()))
+    Ok(Html(book_page(&detail, theme).into_string()))
 }
 
 /// `GET /subscribe/{feed_id}` — the "add to a podcast app" helper page (per-app
@@ -333,10 +359,12 @@ async fn book(
 async fn subscribe(
     State(state): State<AppState>,
     Path(feed_id): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Html<String>, AppError> {
     if !valid_feed_id(&feed_id) {
         return Err(AppError::NotFound);
     }
+    let theme = theme_from_cookie(&headers);
     let (book, episode_count) = {
         let index = state.index.lock().map_err(AppError::internal)?;
         let book = index
@@ -359,7 +387,7 @@ async fn subscribe(
         has_cover: book.cover_path.is_some(),
         episode_count,
     };
-    Ok(Html(subscribe_page(&detail).into_string()))
+    Ok(Html(subscribe_page(&detail, theme).into_string()))
 }
 
 /// `POST /book/{slug}/regenerate` — rotate the book's capability `feed_id` (leak
@@ -387,6 +415,50 @@ async fn regenerate(
             .map_err(AppError::internal)?;
     }
     Ok(Redirect::to(&format!("/book/{slug}")))
+}
+
+/// `POST /theme/{mode}` — persist the visitor's colour theme. `mode` is
+/// `light`/`dark` (sets the `theme` cookie) or `system` (clears it, reverting to
+/// the OS preference). No-JS: the header picker is a form of submit buttons whose
+/// `formaction` posts here; we set the cookie and 303-redirect back (PRG) to the
+/// same-origin page they came from. Same-origin-guarded like [`regenerate`].
+async fn set_theme(
+    State(state): State<AppState>,
+    Path(mode): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    if !same_origin(&headers, &state.base_url) {
+        return Err(AppError::Forbidden);
+    }
+    // A year-long, first-party, non-`Secure` (so it also works on a LAN over http)
+    // cosmetic cookie. `SameSite=Lax` still lets the top-level POST navigation set
+    // it. `system` clears the cookie via Max-Age=0.
+    let cookie = match Theme::parse(&mode).cookie_value() {
+        Some(value) => format!("theme={value}; Path=/; Max-Age=31536000; SameSite=Lax"),
+        None => "theme=; Path=/; Max-Age=0; SameSite=Lax".to_string(),
+    };
+    // Redirect back to the page they came from, but only a same-origin one, reduced
+    // to a relative path so it can't be turned into an open redirect.
+    let origin = state
+        .base_url
+        .split('/')
+        .take(3)
+        .collect::<Vec<_>>()
+        .join("/");
+    let back = headers
+        .get(header::REFERER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|r| r.strip_prefix(&origin))
+        .filter(|path| path.starts_with('/'))
+        .unwrap_or("/")
+        .to_string();
+
+    let mut resp = Redirect::to(&back).into_response();
+    resp.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&cookie).map_err(AppError::internal)?,
+    );
+    Ok(resp)
 }
 
 /// `GET /cover/{feed_id}` — the book's cover image, keyed by capability id so it
