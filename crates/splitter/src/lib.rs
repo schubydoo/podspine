@@ -436,15 +436,18 @@ pub fn split_book_encoded(
             .collect();
     }
 
-    // Split chapters in parallel. Each is an independent ffmpeg stream-copy (or
-    // re-encode) to its own `{idx+1:03}.<ext>` file, so the only shared state is the
-    // per-index result slot each worker writes exactly once — no ordering or file
-    // conflicts, and per-episode pubDates are derived from the chapter index later,
-    // not from split order. Actual ffmpeg concurrency is still bounded by the
-    // process-wide `ffmpeg_gate`; the pool is capped at the same CPU count so extra
-    // workers wouldn't just park on the gate. This is the first-scan speed-up:
-    // splitting was previously serial while the gate sat unused.
-    let slots: Vec<Mutex<Option<Result<SplitEpisode, SplitError>>>> =
+    // Two phases so a multi-chapter split is all-or-nothing.
+    //
+    // Phase 1 — produce every chapter's `.part` in PARALLEL. Each is an independent
+    // ffmpeg stream-copy (or re-encode) to its own `{idx+1:03}.part.<ext>`, so the
+    // only shared state is the per-index result slot each worker writes exactly
+    // once. Actual ffmpeg concurrency is bounded by the process-wide `ffmpeg_gate`;
+    // the pool is capped at the same CPU count so extra workers wouldn't just park.
+    // (This is the first-scan speed-up: splitting was serial while the gate sat
+    // unused.) Nothing is published yet, so the previously-served episodes are
+    // untouched no matter what happens here.
+    let out_path_for = |ch: &ChapterCut| out_dir.join(format!("{:03}.{out_ext}", ch.idx + 1));
+    let slots: Vec<Mutex<Option<Result<ProducedPart, SplitError>>>> =
         (0..n).map(|_| Mutex::new(None)).collect();
     let cursor = AtomicUsize::new(0);
     let workers = ffmpeg_parallelism().min(n);
@@ -456,22 +459,55 @@ pub fn split_book_encoded(
                     if i >= n {
                         break;
                     }
-                    let result = split_chapter_encoded(input, out_dir, &chapters[i], out_ext, enc);
+                    let ch = &chapters[i];
+                    let result = if ch.end_sec - ch.start_sec <= 0.0 {
+                        Err(SplitError::EmptyChapter { idx: ch.idx })
+                    } else {
+                        produce_part(&out_path_for(ch), ch.idx, enc, |part| {
+                            build_encode_args(input, part, Some((ch.start_sec, ch.end_sec)), enc)
+                        })
+                    };
                     *slots[i].lock().expect("split slot mutex poisoned") = Some(result);
                 }
             });
         }
     });
+    let produced: Vec<Result<ProducedPart, SplitError>> = slots
+        .into_iter()
+        .map(|m| {
+            m.into_inner()
+                .expect("split slot mutex poisoned")
+                .expect("every chapter slot was filled by a worker")
+        })
+        .collect();
 
-    // Reassemble in chapter order; surface the lowest-index error (what the old
-    // serial loop returned) so the message is deterministic.
+    // If ANY chapter failed, publish NONE: delete every produced part (so the old
+    // episode files stay in place) and return the lowest-index error, matching the
+    // old serial `?`. This is what keeps a failed re-ingest from leaving a chapter's
+    // new bytes over the index's old enclosure length.
+    if produced.iter().any(Result::is_err) {
+        for p in produced.iter().flatten() {
+            let _ = fs::remove_file(&p.part);
+        }
+        // Surface the lowest-index error (matches the old serial `?`).
+        return Err(produced
+            .into_iter()
+            .filter_map(Result::err)
+            .next()
+            .expect("a failed result exists in this branch"));
+    }
+
+    // Phase 2 — every chapter produced: publish each `.part` into place, in order,
+    // and reassemble the episodes in chapter order.
     let mut episodes = Vec::with_capacity(n);
-    for slot in slots {
-        let ep = slot
-            .into_inner()
-            .expect("split slot mutex poisoned")
-            .expect("every chapter slot was filled by a worker")?;
-        episodes.push(ep);
+    for (ch, r) in chapters.iter().zip(produced) {
+        let produced = r.expect("all parts are Ok in this branch");
+        episodes.push(publish_part(
+            produced,
+            out_path_for(ch),
+            ch.idx,
+            ch.end_sec - ch.start_sec,
+        )?);
     }
     Ok(episodes)
 }
@@ -522,10 +558,37 @@ fn produce_episode(
     enc: Encoding,
     args_for: impl FnOnce(&Path) -> Vec<OsString>,
 ) -> Result<SplitEpisode, SplitError> {
-    let part = part_path(&out_path);
+    let produced = produce_part(&out_path, idx, enc, args_for)?;
+    publish_part(produced, out_path, idx, duration_sec)
+}
+
+/// One episode's audio, produced into its `.part` file and validated but **not yet
+/// published** (renamed into place). Splitting produce from publish lets
+/// [`split_book_encoded`] make a multi-chapter split all-or-nothing: it produces
+/// every chapter's part first, and only publishes them if all succeeded — so a
+/// failing chapter never leaves a sibling's new bytes over the old index length.
+struct ProducedPart {
+    /// The validated `.part` file (awaiting a rename to its final path).
+    part: PathBuf,
+    /// Real output size in bytes (`fs::metadata().len()`) — the enclosure length.
+    byte_length: u64,
+    /// ffmpeg wall-clock, recorded into the split histogram only on publish.
+    elapsed: Duration,
+}
+
+/// Run ffmpeg for one episode into its `.part` file and validate the output, but do
+/// **not** rename it into place. On any failure the `.part` is removed and the
+/// already-published episode (if any) is left untouched.
+fn produce_part(
+    out_path: &Path,
+    idx: usize,
+    enc: Encoding,
+    args_for: impl FnOnce(&Path) -> Vec<OsString>,
+) -> Result<ProducedPart, SplitError> {
+    let part = part_path(out_path);
     let args = args_for(&part);
 
-    // Timed around the ffmpeg call only. The observation is recorded at the end,
+    // Timed around the ffmpeg call only. The observation is recorded on publish,
     // once the output has been validated: a failed or timed-out split would
     // otherwise pollute the latency distribution with a duration that reflects
     // the failure rather than the work.
@@ -555,30 +618,39 @@ fn produce_episode(
         let _ = fs::remove_file(&part);
         return Err(SplitError::OutputMissing {
             idx,
-            path: out_path,
+            path: out_path.to_path_buf(),
         });
     }
 
-    // Same directory, so this is an atomic replace: readers see the old file or
-    // the new one, never a mix.
-    fs::rename(&part, &out_path).map_err(|source| SplitError::Publish {
+    Ok(ProducedPart {
+        part,
+        byte_length,
+        elapsed,
+    })
+}
+
+/// Publish a produced `.part` into its final path — a same-directory atomic replace
+/// (readers see the old file or the new one, never a mix) — and record the split
+/// metric. An ffmpeg that "succeeds" into a missing or zero-byte file was already
+/// rejected by [`produce_part`], so reaching here means real, published work: a
+/// re-encode is observed here too (the same unit of work, and the slowest ingest an
+/// operator can have — hiding it would make the histogram lie about the tail).
+fn publish_part(
+    produced: ProducedPart,
+    out_path: PathBuf,
+    idx: usize,
+    duration_sec: f64,
+) -> Result<SplitEpisode, SplitError> {
+    fs::rename(&produced.part, &out_path).map_err(|source| SplitError::Publish {
         idx,
         path: out_path.clone(),
         source,
     })?;
-
-    // Only now: ffmpeg exited 0, the output is present and non-empty, and it is
-    // published. An ffmpeg that "succeeds" into a missing or zero-byte file is a
-    // failed split, and must not land in a histogram documented as successful
-    // splits only. A re-encode is observed here too: it is the same unit of work
-    // (one episode produced), and it is the slowest ingest work an operator can
-    // have — hiding it would make the histogram lie about the tail.
-    podspine_metrics::split_observed(elapsed);
-
+    podspine_metrics::split_observed(produced.elapsed);
     Ok(SplitEpisode {
         idx,
         path: out_path,
-        byte_length,
+        byte_length: produced.byte_length,
         duration_sec,
     })
 }
@@ -1152,6 +1224,94 @@ mod tests {
             assert_eq!(ep.path, out.join(format!("{:03}.m4a", i + 1)));
             assert!(ep.path.exists() && ep.byte_length > 0);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failing_chapter_publishes_none_of_a_multi_chapter_split() {
+        if !have_ffmpeg() {
+            skip!("ffmpeg not available");
+        }
+        // All-or-nothing: if one chapter of a re-ingest fails, the chapters that DID
+        // succeed must not be published over the already-served files — otherwise the
+        // index's old enclosure length would point at new bytes.
+        let dir = std::env::temp_dir().join("podspine-atomic-book");
+        let _ = std::fs::remove_dir_all(&dir);
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let input = dir.join("book.m4a");
+        let ok = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=10",
+                "-c:a",
+                "aac",
+            ])
+            .arg(&input)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "ffmpeg synth failed");
+
+        // Stand-ins for previously-published episodes.
+        let published: Vec<PathBuf> = (1..=3).map(|n| out.join(format!("{n:03}.m4a"))).collect();
+        for (n, p) in published.iter().enumerate() {
+            std::fs::write(p, format!("old episode {n}")).unwrap();
+        }
+        let before: Vec<Vec<u8>> = published
+            .iter()
+            .map(|p| std::fs::read(p).unwrap())
+            .collect();
+
+        // Chapters 0 and 1 are valid; chapter 2 is empty (end == start) → fails
+        // before ffmpeg, so 0/1 produce real parts but nothing is published.
+        let cuts = [
+            ChapterCut {
+                idx: 0,
+                start_sec: 0.0,
+                end_sec: 3.0,
+            },
+            ChapterCut {
+                idx: 1,
+                start_sec: 3.0,
+                end_sec: 6.0,
+            },
+            ChapterCut {
+                idx: 2,
+                start_sec: 6.0,
+                end_sec: 6.0,
+            },
+        ];
+        let err = split_book(&input, &out, &cuts, "m4a")
+            .expect_err("the empty chapter must fail the split");
+        assert!(
+            matches!(err, SplitError::EmptyChapter { idx: 2 }),
+            "{err:?}"
+        );
+
+        // Every previously-published episode is byte-for-byte untouched...
+        for (p, was) in published.iter().zip(&before) {
+            assert_eq!(
+                &std::fs::read(p).unwrap(),
+                was,
+                "{p:?} must not be overwritten"
+            );
+        }
+        // ...and no half-produced `.part` files are left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&out)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".part"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "produced parts must be cleaned up: {leftovers:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
