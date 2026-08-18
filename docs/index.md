@@ -40,6 +40,15 @@ docker run \
 Then open <http://localhost:8080> to browse your books, copy feed URLs, or scan a
 book's QR code to open its one-tap [subscribe page](importing.md).
 
+!!! note "The first scan can take a while"
+    On first start Podspine processes your whole library — **chaptered** books are
+    split into per-chapter episodes (whole-file books, like MP3 folders, stream in
+    place), so a large chaptered library can take minutes. While it runs, the browse
+    page shows a self-refreshing **"Scanning…"** message (it isn't broken — it turns
+    into your book grid when the scan finishes), and feed/audio requests answer `503`
+    with `Retry-After` so podcatchers simply retry. A restart with an already-populated
+    `/data` volume is fast — it only processes what's new or changed.
+
 !!! tip "Set `PODSPINE_BASE_URL`"
     Point it at the address podcast apps will actually reach (your LAN IP or public
     hostname). It defaults to `http://localhost:8080`, which only works from the same
