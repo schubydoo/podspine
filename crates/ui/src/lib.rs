@@ -53,9 +53,21 @@ pub struct BookDetail {
 /// Shared styles + a page shell. Inlined so the binary needs no static assets.
 /// The palette is chosen for WCAG AA contrast (NFR-C3): `#18181b` text on white
 /// (~16:1), `#52525b` muted (~7:1), and white on the `#1d4ed8` accent (~5.3:1).
+/// Everything is driven through the `--*` custom properties, so the dark palette
+/// below is just an OS-preference override of those same variables — no per-rule
+/// duplication. `color-scheme` lets native controls/scrollbars follow suit.
 const STYLE: &str = r#"
-:root { --bg:#ffffff; --surface:#f4f4f5; --border:#d4d4d8; --text:#18181b;
+:root { color-scheme: light dark;
+        --bg:#ffffff; --surface:#f4f4f5; --border:#d4d4d8; --text:#18181b;
         --muted:#52525b; --accent:#1d4ed8; --accent-text:#ffffff; --danger:#b91c1c; }
+/* Auto dark mode: follows the OS setting, no JS, no toggle. AA-contrast dark
+   palette — `#f4f4f5` text on `#18181b` (~16:1), `#a1a1aa` muted (~7:1), and
+   `#0b1120` text on the lighter `#60a5fa` accent (~7:1). The QR SVGs keep their
+   own white background (set inline on `.appqr svg`) so a phone can still scan. */
+@media (prefers-color-scheme: dark) {
+  :root { --bg:#18181b; --surface:#27272a; --border:#3f3f46; --text:#f4f4f5;
+          --muted:#a1a1aa; --accent:#60a5fa; --accent-text:#0b1120; --danger:#f87171; }
+}
 * { box-sizing:border-box; }
 body { margin:0; font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
        color:var(--text); background:var(--bg); }
@@ -531,6 +543,16 @@ mod tests {
         let html = index_page(&[]).into_string();
         assert!(html.contains("No audiobooks found"));
         assert!(!html.contains("<ul"));
+    }
+
+    #[test]
+    fn style_supports_os_dark_mode() {
+        // Auto dark mode is an OS-preference override of the same --* variables,
+        // with color-scheme so native controls follow. No JS/toggle.
+        assert!(STYLE.contains("color-scheme: light dark"));
+        assert!(STYLE.contains("@media (prefers-color-scheme: dark)"));
+        // The dark override redefines the palette variables.
+        assert!(STYLE.contains("--bg:#18181b"));
     }
 
     fn detail() -> BookDetail {
