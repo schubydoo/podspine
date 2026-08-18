@@ -1829,3 +1829,25 @@ async fn set_theme_rejects_cross_site() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn set_theme_redirects_back_even_when_ui_origin_differs() {
+    // base_url is http://test, but the browse UI is reached on a different origin
+    // (a LAN IP). The toggle must still return to the same page via the Referer's
+    // path, not bounce to `/` (Greptile P1).
+    let resp = router(empty_state())
+        .oneshot(
+            Request::post("/theme/dark")
+                .header("sec-fetch-site", "same-origin")
+                .header(header::REFERER, "http://192.168.1.5:8080/book/dracula")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        resp.headers().get(header::LOCATION).unwrap(),
+        "/book/dracula"
+    );
+}

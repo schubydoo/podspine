@@ -120,6 +120,24 @@ fn theme_from_cookie(headers: &HeaderMap) -> Theme {
         .unwrap_or_default()
 }
 
+/// The same-origin path to redirect back to after a `POST /theme` (PRG), taken from
+/// the `Referer`. Returns the path+query of an absolute `scheme://host/path` URL, or
+/// a value that is already a plain absolute path. Rejects protocol-relative
+/// (`//host`) and anything not starting with a single `/`, so it can never become an
+/// open redirect. `None` (→ caller falls back to `/`) when there's no usable path.
+fn referer_path(referer: &str) -> Option<String> {
+    // Strip `scheme://authority`, leaving `/path?query`; if there's no `://`, the
+    // header was already a bare path (defensive — Referer is normally absolute).
+    let candidate = match referer.split_once("://") {
+        Some((_, after_authority)) => match after_authority.find('/') {
+            Some(slash) => &after_authority[slash..],
+            None => "/", // authority with no path
+        },
+        None => referer,
+    };
+    (candidate.starts_with('/') && !candidate.starts_with("//")).then(|| candidate.to_string())
+}
+
 /// Shared server state.
 #[derive(Clone)]
 pub struct AppState {
@@ -437,21 +455,18 @@ async fn set_theme(
         Some(value) => format!("theme={value}; Path=/; Max-Age=31536000; SameSite=Lax"),
         None => "theme=; Path=/; Max-Age=0; SameSite=Lax".to_string(),
     };
-    // Redirect back to the page they came from, but only a same-origin one, reduced
-    // to a relative path so it can't be turned into an open redirect.
-    let origin = state
-        .base_url
-        .split('/')
-        .take(3)
-        .collect::<Vec<_>>()
-        .join("/");
+    // Redirect back to the page they came from. Take the *path* of the Referer, not
+    // a match against `base_url`: the POST already passed the same-origin guard, so
+    // the Referer is this origin's page, and the browse UI is often on a different
+    // origin than `base_url` (which addresses podcatchers) — comparing against it
+    // would bounce every toggle to `/`. Only a single-slash absolute path is kept,
+    // so a protocol-relative (`//host`) or off-site value can't become an open
+    // redirect.
     let back = headers
         .get(header::REFERER)
         .and_then(|v| v.to_str().ok())
-        .and_then(|r| r.strip_prefix(&origin))
-        .filter(|path| path.starts_with('/'))
-        .unwrap_or("/")
-        .to_string();
+        .and_then(referer_path)
+        .unwrap_or_else(|| "/".to_string());
 
     let mut resp = Redirect::to(&back).into_response();
     resp.headers_mut().insert(
@@ -1227,6 +1242,28 @@ mod tests {
         ] {
             assert!(!valid_feed_id(bad), "must reject {bad:?}");
         }
+    }
+
+    #[test]
+    fn referer_path_extracts_path_and_blocks_open_redirect() {
+        // Absolute URLs → their path+query, regardless of host/port (so a UI origin
+        // that differs from base_url still returns home to the right page).
+        assert_eq!(
+            referer_path("http://192.168.1.5:8080/book/dracula").as_deref(),
+            Some("/book/dracula")
+        );
+        assert_eq!(
+            referer_path("https://podspine.example/subscribe/x?y=1").as_deref(),
+            Some("/subscribe/x?y=1")
+        );
+        // An absolute URL with no path → root.
+        assert_eq!(referer_path("http://host").as_deref(), Some("/"));
+        // Already a bare path is accepted.
+        assert_eq!(referer_path("/book/x").as_deref(), Some("/book/x"));
+        // Open-redirect vectors are rejected (caller falls back to `/`).
+        assert_eq!(referer_path("http://evil.com//evil.com/x"), None);
+        assert_eq!(referer_path("//evil.com/x"), None);
+        assert_eq!(referer_path("javascript:alert(1)"), None);
     }
 
     #[test]
