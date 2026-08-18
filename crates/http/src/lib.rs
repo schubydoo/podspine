@@ -35,7 +35,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum_extra::TypedHeader;
@@ -393,9 +393,15 @@ async fn regenerate(
 /// isn't a guessable catalog-probe surface. Covers are populated by cover
 /// extraction (Task 3.4); until then books have no cover and this 404s. The
 /// stored path is canonicalized and confirmed under the data dir before serving.
+///
+/// Cached: an `ETag` (from the file's size+mtime) plus `Cache-Control` let a
+/// browser revalidate to a bodyless `304` instead of re-downloading the (often
+/// multi-MB) image on every page refresh — the grid pulls many covers at once, so
+/// over a slow link (e.g. Tailscale) that re-download was the bottleneck.
 async fn cover(
     State(state): State<AppState>,
     Path(feed_id): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Response, AppError> {
     // No covers extracted until the first scan finishes — 503 (retry), not 404.
     if !state.is_ready() {
@@ -421,15 +427,50 @@ async fn cover(
         tracing::warn!(feed_id, "resolved cover path escaped the data dir");
         return Err(AppError::NotFound);
     }
+
+    // Validator from size+mtime: a re-extracted cover (different bytes) bumps mtime,
+    // so the ETag changes and clients refetch; otherwise it revalidates cheaply.
+    let meta = tokio::fs::metadata(&canonical)
+        .await
+        .map_err(|_| AppError::NotFound)?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let etag = format!("\"{:x}-{:x}\"", meta.len(), mtime);
+    let etag_value = HeaderValue::from_str(&etag).map_err(AppError::internal)?;
+    // Short max-age so a refresh burst skips the network entirely, while a covered
+    // book that gets re-extracted goes stale for at most that window.
+    let cache_control = HeaderValue::from_static("public, max-age=300");
+
+    // If-None-Match: honour a matching tag (weak `W/` prefix, comma list, or `*`)
+    // with a 304 so the client keeps its cached image and no body is sent.
+    let unchanged = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|h| {
+            h.trim() == "*"
+                || h.split(',')
+                    .any(|t| t.trim().trim_start_matches("W/") == etag)
+        });
+    if unchanged {
+        let mut resp = StatusCode::NOT_MODIFIED.into_response();
+        resp.headers_mut().insert(header::ETAG, etag_value);
+        resp.headers_mut()
+            .insert(header::CACHE_CONTROL, cache_control);
+        return Ok(resp);
+    }
+
     let bytes = tokio::fs::read(&canonical)
         .await
         .map_err(|_| AppError::NotFound)?;
-    Ok((
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, image_mime(&cover_path))],
-        bytes,
-    )
-        .into_response())
+    let mut resp = ([(header::CONTENT_TYPE, image_mime(&cover_path))], bytes).into_response();
+    let h = resp.headers_mut();
+    h.insert(header::ETAG, etag_value);
+    h.insert(header::CACHE_CONTROL, cache_control);
+    Ok(resp)
 }
 
 /// `GET /audio/{feed_id}/{number}` — stream an episode with Range support.

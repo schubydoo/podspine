@@ -205,6 +205,7 @@ async fn serves_cover_when_present() {
 
     // Covers are served by capability id, not the slug.
     let resp = app
+        .clone()
         .oneshot(
             Request::get(format!("/cover/{feed_id}"))
                 .body(Body::empty())
@@ -217,7 +218,41 @@ async fn serves_cover_when_present() {
         resp.headers().get(header::CONTENT_TYPE).unwrap(),
         "image/jpeg"
     );
+    // Cacheable: an ETag + Cache-Control so a refresh revalidates instead of
+    // re-downloading the image every time.
+    let etag = resp
+        .headers()
+        .get(header::ETAG)
+        .expect("cover carries an ETag")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        resp.headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains("max-age")),
+        "cover carries Cache-Control"
+    );
     assert!(!body_bytes(resp).await.is_empty(), "cover bytes served");
+
+    // A conditional re-request with that ETag gets a bodyless 304, not the image
+    // again — the fix for re-pulling covers on every refresh.
+    let resp = app
+        .oneshot(
+            Request::get(format!("/cover/{feed_id}"))
+                .header(header::IF_NONE_MATCH, &etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        resp.headers().get(header::ETAG).unwrap().to_str().unwrap(),
+        etag
+    );
+    assert!(body_bytes(resp).await.is_empty(), "a 304 carries no body");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
