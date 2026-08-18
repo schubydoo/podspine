@@ -1008,8 +1008,11 @@ mod tests {
             assert_eq!(*sem.permits.lock().unwrap(), 0, "permit taken");
         }
         assert_eq!(*sem.permits.lock().unwrap(), 1, "permit released on drop");
-        // Sized to at least one CPU.
-        assert!(*ffmpeg_gate().permits.lock().unwrap() >= 1);
+        // The gate is sized to at least one CPU. Assert the sizing source, not the
+        // global gate's live free-permit count — since split_book_encoded now runs
+        // ffmpeg through that same process-wide gate in parallel, a concurrent test
+        // can legitimately hold every permit, so reading the live count here races.
+        assert!(ffmpeg_parallelism() >= 1);
     }
 
     #[test]
