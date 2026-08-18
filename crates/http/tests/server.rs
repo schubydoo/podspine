@@ -186,10 +186,10 @@ async fn serves_cover_when_present() {
     let input = synth_with_cover(&dir);
     let book = scan_book(&input, &data, &index).unwrap();
     let feed_id = book.feed_id.clone();
-    assert!(
-        book.cover_path.is_some(),
-        "cover should have been extracted"
-    );
+    let cover_file = book
+        .cover_path
+        .clone()
+        .expect("cover should have been extracted");
 
     let state = AppState::new(
         index,
@@ -239,6 +239,7 @@ async fn serves_cover_when_present() {
     // A conditional re-request with that ETag gets a bodyless 304, not the image
     // again — the fix for re-pulling covers on every refresh.
     let resp = app
+        .clone()
         .oneshot(
             Request::get(format!("/cover/{feed_id}"))
                 .header(header::IF_NONE_MATCH, &etag)
@@ -253,6 +254,26 @@ async fn serves_cover_when_present() {
         etag
     );
     assert!(body_bytes(resp).await.is_empty(), "a 304 carries no body");
+
+    // Content-addressed ETag: if the cover bytes change (a re-extraction), the old
+    // tag no longer matches, so the same conditional request now gets a fresh 200
+    // with a *different* ETag — never a stale 304 for the wrong bytes.
+    std::fs::write(&cover_file, b"different cover bytes").unwrap();
+    let resp = app
+        .oneshot(
+            Request::get(format!("/cover/{feed_id}"))
+                .header(header::IF_NONE_MATCH, &etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "changed bytes must not 304");
+    assert_ne!(
+        resp.headers().get(header::ETAG).unwrap().to_str().unwrap(),
+        etag,
+        "a changed cover gets a new ETag"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

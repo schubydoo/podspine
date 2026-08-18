@@ -394,7 +394,7 @@ async fn regenerate(
 /// extraction (Task 3.4); until then books have no cover and this 404s. The
 /// stored path is canonicalized and confirmed under the data dir before serving.
 ///
-/// Cached: an `ETag` (from the file's size+mtime) plus `Cache-Control` let a
+/// Cached: an `ETag` (a blake3 hash of the served bytes) plus `Cache-Control` let a
 /// browser revalidate to a bodyless `304` instead of re-downloading the (often
 /// multi-MB) image on every page refresh — the grid pulls many covers at once, so
 /// over a slow link (e.g. Tailscale) that re-download was the bottleneck.
@@ -428,25 +428,24 @@ async fn cover(
         return Err(AppError::NotFound);
     }
 
-    // Validator from size+mtime: a re-extracted cover (different bytes) bumps mtime,
-    // so the ETag changes and clients refetch; otherwise it revalidates cheaply.
-    let meta = tokio::fs::metadata(&canonical)
+    // Read the bytes first, then derive the ETag from *those exact bytes* (blake3).
+    // A validator built from stat() metadata could advertise the old file's tag
+    // against new bytes if a rescan overwrites the cover between the stat and the
+    // read (TOCTOU), and whole-second mtime wouldn't change for a same-length,
+    // same-second replacement. A content hash matches whatever is served, always.
+    let bytes = tokio::fs::read(&canonical)
         .await
         .map_err(|_| AppError::NotFound)?;
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let etag = format!("\"{:x}-{:x}\"", meta.len(), mtime);
+    let etag = format!("\"{}\"", blake3::hash(&bytes).to_hex());
     let etag_value = HeaderValue::from_str(&etag).map_err(AppError::internal)?;
     // Short max-age so a refresh burst skips the network entirely, while a covered
     // book that gets re-extracted goes stale for at most that window.
     let cache_control = HeaderValue::from_static("public, max-age=300");
 
     // If-None-Match: honour a matching tag (weak `W/` prefix, comma list, or `*`)
-    // with a 304 so the client keeps its cached image and no body is sent.
+    // with a 304 so the client keeps its cached image and no body is sent. We still
+    // read the file to hash it, but skip re-sending the (multi-MB) body — the
+    // network transfer was the cost over a slow link, not the local disk read.
     let unchanged = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
@@ -463,9 +462,6 @@ async fn cover(
         return Ok(resp);
     }
 
-    let bytes = tokio::fs::read(&canonical)
-        .await
-        .map_err(|_| AppError::NotFound)?;
     let mut resp = ([(header::CONTENT_TYPE, image_mime(&cover_path))], bytes).into_response();
     let h = resp.headers_mut();
     h.insert(header::ETAG, etag_value);
