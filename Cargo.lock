@@ -1262,6 +1262,7 @@ dependencies = [
  "axum",
  "axum-extra 0.12.6",
  "axum-range",
+ "blake3",
  "http-body-util",
  "podspine-feed",
  "podspine-index",
