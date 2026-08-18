@@ -33,6 +33,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -259,17 +260,21 @@ impl Drop for Permit<'_> {
     }
 }
 
+/// How many ffmpeg jobs may run at once: the CPU count (fallback 4 when the OS
+/// won't say). The single source of truth for both the process-wide [`ffmpeg_gate`]
+/// and the per-book split worker pool ([`split_book_encoded`]), so they agree.
+fn ffmpeg_parallelism() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+}
+
 /// The process-wide ffmpeg concurrency gate, sized to the CPU count (min 1).
 fn ffmpeg_gate() -> &'static Semaphore {
     static GATE: OnceLock<Semaphore> = OnceLock::new();
-    GATE.get_or_init(|| {
-        let n = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
-        Semaphore {
-            permits: Mutex::new(n),
-            cv: Condvar::new(),
-        }
+    GATE.get_or_init(|| Semaphore {
+        permits: Mutex::new(ffmpeg_parallelism()),
+        cv: Condvar::new(),
     })
 }
 
@@ -422,9 +427,51 @@ pub fn split_book_encoded(
         source,
     })?;
 
-    let mut episodes = Vec::with_capacity(chapters.len());
-    for ch in chapters {
-        episodes.push(split_chapter_encoded(input, out_dir, ch, out_ext, enc)?);
+    let n = chapters.len();
+    // One or zero chapters: no worker pool, no overhead.
+    if n <= 1 {
+        return chapters
+            .iter()
+            .map(|ch| split_chapter_encoded(input, out_dir, ch, out_ext, enc))
+            .collect();
+    }
+
+    // Split chapters in parallel. Each is an independent ffmpeg stream-copy (or
+    // re-encode) to its own `{idx+1:03}.<ext>` file, so the only shared state is the
+    // per-index result slot each worker writes exactly once — no ordering or file
+    // conflicts, and per-episode pubDates are derived from the chapter index later,
+    // not from split order. Actual ffmpeg concurrency is still bounded by the
+    // process-wide `ffmpeg_gate`; the pool is capped at the same CPU count so extra
+    // workers wouldn't just park on the gate. This is the first-scan speed-up:
+    // splitting was previously serial while the gate sat unused.
+    let slots: Vec<Mutex<Option<Result<SplitEpisode, SplitError>>>> =
+        (0..n).map(|_| Mutex::new(None)).collect();
+    let cursor = AtomicUsize::new(0);
+    let workers = ffmpeg_parallelism().min(n);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let i = cursor.fetch_add(1, Ordering::Relaxed);
+                    if i >= n {
+                        break;
+                    }
+                    let result = split_chapter_encoded(input, out_dir, &chapters[i], out_ext, enc);
+                    *slots[i].lock().expect("split slot mutex poisoned") = Some(result);
+                }
+            });
+        }
+    });
+
+    // Reassemble in chapter order; surface the lowest-index error (what the old
+    // serial loop returned) so the message is deterministic.
+    let mut episodes = Vec::with_capacity(n);
+    for slot in slots {
+        let ep = slot
+            .into_inner()
+            .expect("split slot mutex poisoned")
+            .expect("every chapter slot was filled by a worker")?;
+        episodes.push(ep);
     }
     Ok(episodes)
 }
@@ -1052,6 +1099,56 @@ mod tests {
         let err = split_book(&bad, &dir.join("out"), std::slice::from_ref(&ch), "m4a")
             .expect_err("bad input must fail");
         assert!(matches!(err, SplitError::Ffmpeg { idx: 0, .. }), "{err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parallel_split_returns_every_chapter_in_index_order() {
+        if !have_ffmpeg() {
+            skip!("ffmpeg not available");
+        }
+        // Many chapters (> the worker pool on most CPUs) so the parallel path runs
+        // and we can prove the results come back in chapter order regardless of
+        // which worker finished first.
+        let dir = std::env::temp_dir().join("podspine-parallel-split");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("book.m4a");
+        let ok = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=24",
+                "-c:a",
+                "aac",
+            ])
+            .arg(&input)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "ffmpeg synth failed");
+
+        let cuts: Vec<ChapterCut> = (0..12)
+            .map(|i| ChapterCut {
+                idx: i,
+                start_sec: i as f64 * 2.0,
+                end_sec: i as f64 * 2.0 + 2.0,
+            })
+            .collect();
+        let out = dir.join("out");
+        let eps = split_book(&input, &out, &cuts, "m4a").expect("split");
+
+        assert_eq!(eps.len(), 12);
+        // Episodes are in chapter order, and each lands at its own numbered file.
+        for (i, ep) in eps.iter().enumerate() {
+            assert_eq!(ep.idx, i);
+            assert_eq!(ep.path, out.join(format!("{:03}.m4a", i + 1)));
+            assert!(ep.path.exists() && ep.byte_length > 0);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
