@@ -77,6 +77,7 @@ fn test_state(index: Index, data: &Path, library: &Path) -> AppState {
         None,
         None,
     )
+    .expect("test dirs canonicalize")
 }
 
 /// [`test_state`] in `saver` storage mode.
@@ -91,6 +92,7 @@ fn saver_state(index: Index, data: &Path, library: &Path) -> AppState {
         None,
         None,
     )
+    .expect("test dirs canonicalize")
 }
 
 /// [`saver_state`] with a cache size cap in bytes.
@@ -105,6 +107,7 @@ fn saver_state_capped(index: Index, data: &Path, library: &Path, cap_bytes: u64)
         Some(cap_bytes),
         None,
     )
+    .expect("test dirs canonicalize")
 }
 
 /// [`test_state`] with a feed-level default cover URL.
@@ -124,6 +127,32 @@ fn state_with_default_cover(
         None,
         None,
     )
+    .expect("test dirs canonicalize")
+}
+
+/// A root that can't be canonicalized must fail construction loudly. The old
+/// fallback kept the as-given path, and every containment check then failed
+/// closed — a server that silently 404s everything (security audit 2026-08-19).
+#[test]
+fn state_construction_fails_when_a_root_is_missing() {
+    let dir = scratch("http-missing-root");
+    let missing = dir.path().join("nope");
+    for (data, library, what) in [
+        (missing.as_path(), dir.path(), "missing data dir"),
+        (dir.path(), missing.as_path(), "missing library root"),
+    ] {
+        let state = AppState::new(
+            Index::open_in_memory().unwrap(),
+            "http://test".to_string(),
+            data,
+            library,
+            None,
+            StorageMode::Full,
+            None,
+            None,
+        );
+        assert!(state.is_err(), "{what} must fail AppState construction");
+    }
 }
 
 /// Synthesize a two-chapter FLAC (chapters via a `.cue` sidecar — embedded FLAC
@@ -427,6 +456,8 @@ async fn serves_whole_file_episode_in_place_from_the_library() {
     let library = base.join("library");
     let data = base.join("data");
     std::fs::create_dir_all(&library).unwrap();
+    // Both roots must exist before AppState::new (Config::validate's contract).
+    std::fs::create_dir_all(&data).unwrap();
 
     let index = Index::open_in_memory().unwrap();
     let input = synth_flat(&library);
@@ -494,6 +525,8 @@ async fn in_place_source_outside_the_library_is_a_404() {
     let library = base.join("library");
     let data = base.join("data");
     std::fs::create_dir_all(&library).unwrap();
+    // Both roots must exist before AppState::new (Config::validate's contract).
+    std::fs::create_dir_all(&data).unwrap();
 
     let index = Index::open_in_memory().unwrap();
     let input = synth_flat(&library);
@@ -721,6 +754,8 @@ async fn regenerate_rejects_an_invalid_slug() {
     // No ffmpeg: the slug is rejected before any DB/filesystem work.
     let dir = scratch("http-regen-badslug");
     let data = dir.join("data");
+    // Both roots must exist before AppState::new (Config::validate's contract).
+    std::fs::create_dir_all(&data).unwrap();
     let index = Index::open_in_memory().unwrap();
     let state = test_state(index, &data, &dir);
     let app = router(state);

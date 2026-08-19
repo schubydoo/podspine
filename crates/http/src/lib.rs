@@ -183,6 +183,13 @@ impl AppState {
     /// path-safety checks (served files must stay under one of them). The
     /// storage/cache args come from [`podspine_config::Config`] (pre-split
     /// default: `StorageMode::Full`).
+    ///
+    /// Errors when either root can't be canonicalized. Both are guaranteed to
+    /// exist by `Config::validate` (library checked, data dir created), so a
+    /// failure here means the filesystem changed under us — and falling back to
+    /// the as-given path would make every containment check fail closed: a
+    /// server that silently 404s everything. Failing startup is louder and
+    /// therefore kinder.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         index: Index,
@@ -193,14 +200,14 @@ impl AppState {
         storage: StorageMode,
         cache_size_bytes: Option<u64>,
         cache_ttl: Option<Duration>,
-    ) -> Self {
-        let data_dir = data_dir
-            .canonicalize()
-            .unwrap_or_else(|_| data_dir.to_path_buf());
-        let library_dir = library_dir
-            .canonicalize()
-            .unwrap_or_else(|_| library_dir.to_path_buf());
-        Self {
+    ) -> std::io::Result<Self> {
+        let data_dir = data_dir.canonicalize().inspect_err(|err| {
+            tracing::error!(path = %data_dir.display(), error = %err, "cannot canonicalize the data dir");
+        })?;
+        let library_dir = library_dir.canonicalize().inspect_err(|err| {
+            tracing::error!(path = %library_dir.display(), error = %err, "cannot canonicalize the library root");
+        })?;
+        Ok(Self {
             index: Arc::new(Mutex::new(index)),
             base_url,
             data_dir,
@@ -211,7 +218,7 @@ impl AppState {
             cache_ttl,
             inflight: Arc::new(Mutex::new(HashMap::new())),
             ready: Arc::new(AtomicBool::new(true)),
-        }
+        })
     }
 
     /// Flip the "initial scan finished" flag. The server binary sets it `false`

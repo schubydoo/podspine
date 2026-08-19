@@ -58,7 +58,8 @@ async fn main() -> Result<()> {
         config.storage_mode,
         config.cache_size_bytes,
         config.cache_ttl,
-    );
+    )
+    .context("canonicalizing the data dir / library root")?;
 
     // First-run UX (issue 159): don't hold the HTTP port down behind the initial
     // reconcile. A large first scan takes minutes to split, and anything in front
