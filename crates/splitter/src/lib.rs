@@ -479,6 +479,24 @@ fn build_cover_thumb_args(input: &Path, output: &Path) -> Vec<OsString> {
     ]
 }
 
+/// The file name of episode `idx` (zero-based) under a book's output directory:
+/// `NNN.<ext>` with `NNN = idx + 1`, zero-padded to three digits.
+///
+/// This is the cross-crate episode-filename contract, centralized here (like
+/// [`cover_thumb_path`]) so the producers in this crate, the http layer's
+/// resolver, and the scanner's sweeps all agree on it.
+pub fn episode_file_name(idx: usize, ext: &str) -> String {
+    format!("{:03}.{ext}", idx + 1)
+}
+
+/// Whether a file stem marks a produced episode file — the stem side of the
+/// [`episode_file_name`] contract: all digits and nothing else. A `.part`
+/// temporary keeps `.part` in its stem ([`part_path`]) so it never matches,
+/// which is what lets the cache eviction and the scanner's sweeps skip it.
+pub fn is_episode_stem(stem: &str) -> bool {
+    !stem.is_empty() && stem.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Split every chapter of `input` into `out_dir`, returning one [`SplitEpisode`]
 /// per chapter (fails fast on the first error). Creates `out_dir` if needed and
 /// never modifies `input`. `out_ext` selects the stream-copy output container to
@@ -526,7 +544,7 @@ pub fn split_book_encoded(
     // (This is the first-scan speed-up: splitting was serial while the gate sat
     // unused.) Nothing is published yet, so the previously-served episodes are
     // untouched no matter what happens here.
-    let out_path_for = |ch: &ChapterCut| out_dir.join(format!("{:03}.{out_ext}", ch.idx + 1));
+    let out_path_for = |ch: &ChapterCut| out_dir.join(episode_file_name(ch.idx, out_ext));
     let slots: Vec<Mutex<Option<Result<ProducedPart, SplitError>>>> =
         (0..n).map(|_| Mutex::new(None)).collect();
     let cursor = AtomicUsize::new(0);
@@ -651,7 +669,7 @@ pub fn split_chapter_encoded(
         return Err(SplitError::EmptyChapter { idx: ch.idx });
     }
 
-    let out_path = out_dir.join(format!("{:03}.{out_ext}", ch.idx + 1));
+    let out_path = out_dir.join(episode_file_name(ch.idx, out_ext));
     produce_episode(out_path, ch.idx, duration_sec, enc, |part| {
         build_encode_args(input, part, Some((ch.start_sec, ch.end_sec)), enc)
     })
@@ -773,9 +791,12 @@ fn publish_part(
 /// relocated to the front — so podcast clients seek immediately. Serves a
 /// non-faststart whole-file episode from the cache when `PODSPINE_REMUX_NON_FASTSTART`
 /// is on (Sprint 6.3); the source is never touched. Like [`split_chapter`] it is a
-/// deterministic `-c copy`, so the output size is a stable `enclosure length`.
-/// `idx`/`out_ext` name the cache file (`NNN.<ext>`); `duration_sec` is the whole
-/// file's duration (the enclosure duration, carried through unchanged).
+/// deterministic `-c copy`, so the output size is a stable `enclosure length`, and
+/// it publishes through the same atomic [`produce_episode`] path (`.part` then
+/// rename, observed in the split histogram) — a failed remux never touches a
+/// previously cached copy. `idx`/`out_ext` name the cache file (`NNN.<ext>`);
+/// `duration_sec` is the whole file's duration (the enclosure duration, carried
+/// through unchanged).
 pub fn remux_faststart(
     input: &Path,
     out_dir: &Path,
@@ -783,37 +804,9 @@ pub fn remux_faststart(
     out_ext: &str,
     duration_sec: f64,
 ) -> Result<SplitEpisode, SplitError> {
-    let out_path = out_dir.join(format!("{:03}.{out_ext}", idx + 1));
-    let args = build_remux_args(input, &out_path);
-
-    match run_ffmpeg(&args) {
-        Ok(()) => {}
-        Err(RunError::Spawn(e)) => return Err(SplitError::Spawn(e)),
-        Err(RunError::Failed { code, stderr }) => {
-            return Err(SplitError::Ffmpeg { idx, code, stderr });
-        }
-        Err(RunError::TimedOut) => return Err(SplitError::TimedOut { idx }),
-    }
-
-    // enclosure length MUST come from the real file, never prorated.
-    let byte_length = fs::metadata(&out_path)
-        .map_err(|source| SplitError::Metadata {
-            path: out_path.clone(),
-            source,
-        })?
-        .len();
-    if byte_length == 0 {
-        return Err(SplitError::OutputMissing {
-            idx,
-            path: out_path,
-        });
-    }
-
-    Ok(SplitEpisode {
-        idx,
-        path: out_path,
-        byte_length,
-        duration_sec,
+    let out_path = out_dir.join(episode_file_name(idx, out_ext));
+    produce_episode(out_path, idx, duration_sec, Encoding::Copy, |part| {
+        build_remux_args(input, part)
     })
 }
 
@@ -839,7 +832,7 @@ pub fn transcode_whole(
         source,
     })?;
 
-    let out_path = out_dir.join(format!("{:03}.{out_ext}", idx + 1));
+    let out_path = out_dir.join(episode_file_name(idx, out_ext));
     produce_episode(out_path, idx, duration_sec, enc, |part| {
         build_encode_args(input, part, None, enc)
     })
@@ -928,7 +921,7 @@ fn build_encode_args(
 /// The extension is **preserved** (`001.m4a` → `001.part.m4a`): ffmpeg picks its
 /// muxer from it, and [`is_mp4_family`] reads it to decide `+faststart`. The stem
 /// is no longer a bare `NNN`, so the cache-eviction and stale-copy sweeps — which
-/// both match a three-digit stem — skip a temporary.
+/// both match an all-digit stem ([`is_episode_stem`]) — skip a temporary.
 fn part_path(out_path: &Path) -> PathBuf {
     let stem = out_path
         .file_stem()
@@ -1463,17 +1456,30 @@ mod tests {
     }
 
     #[test]
+    fn episode_file_name_and_stem_agree_on_the_contract() {
+        // The cross-crate contract: `NNN = idx + 1`, zero-padded to three digits,
+        // and the stem side recognizes exactly what the name side produces.
+        assert_eq!(episode_file_name(0, "m4a"), "001.m4a");
+        assert_eq!(episode_file_name(11, "mp3"), "012.mp3");
+        assert!(is_episode_stem("001"));
+        assert!(is_episode_stem("1000"), "a 1000-chapter book still matches");
+        assert!(!is_episode_stem(""));
+        assert!(!is_episode_stem("001.part"));
+        assert!(!is_episode_stem("cover"));
+    }
+
+    #[test]
     fn a_temporary_keeps_the_extension_and_hides_from_the_sweeps() {
         let p = part_path(Path::new("/data/books/b/001.m4a"));
         // ffmpeg picks its muxer from the extension, and `is_mp4_family` reads it
         // to decide `+faststart` — so the extension has to survive.
         assert_eq!(p, Path::new("/data/books/b/001.part.m4a"));
         assert!(is_mp4_family(&p), "a temporary must still look mp4-family");
-        // Both the cache eviction and the stale-copy sweep match a 3-digit stem.
+        // Both the cache eviction and the stale-copy sweep match an episode stem.
         let stem = p.file_stem().unwrap().to_str().unwrap();
         assert_eq!(stem, "001.part");
         assert!(
-            !(stem.len() == 3 && stem.bytes().all(|b| b.is_ascii_digit())),
+            !is_episode_stem(stem),
             "a temporary must not look like an episode file"
         );
         assert_eq!(
@@ -1634,13 +1640,30 @@ mod tests {
     fn remux_maps_a_nonzero_ffmpeg_exit_to_a_split_error() {
         skip_unless_ffmpeg!();
         // A non-audio input makes ffmpeg exit non-zero → the remux error arm.
+        // A remux publishes through the same atomic `.part` path as every other
+        // producer, so a previously cached copy being served must survive the
+        // failure byte-for-byte, and no temporary may be left.
         let dir = scratch("remux-fail");
         let out = dir.join("out");
         std::fs::create_dir_all(&out).unwrap();
+        let published = out.join("001.m4a");
+        std::fs::write(&published, b"the previously cached remux").unwrap();
+        let before = std::fs::read(&published).unwrap();
+
         let bad = dir.join("notaudio.m4a");
         std::fs::write(&bad, b"definitely not an audio stream").unwrap();
         let err = remux_faststart(&bad, &out, 0, "m4a", 3.0).expect_err("bad input must fail");
         assert!(matches!(err, SplitError::Ffmpeg { idx: 0, .. }), "{err:?}");
+
+        assert_eq!(
+            std::fs::read(&published).unwrap(),
+            before,
+            "a failed remux must never write the final path directly"
+        );
+        assert!(
+            !part_path(&published).exists(),
+            "a failed remux must clean up its temporary"
+        );
     }
 
     #[test]

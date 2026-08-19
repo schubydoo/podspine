@@ -607,14 +607,15 @@ fn remove_stale_episode_copies(book_out: &Path) {
 }
 
 /// Whether `path` is a produced episode file rather than something else in the
-/// book directory: a numbered `NNN.<ext>`, or the `NNN.part.<ext>` temporary an
-/// interrupted encode can leave (see `podspine_splitter::part_path`). An extracted
-/// `cover.*` matches neither, so no sweep ever removes it.
+/// book directory: a numbered `NNN.<ext>` (the splitter's cross-crate
+/// [`podspine_splitter::episode_file_name`] contract), or the `NNN.part.<ext>`
+/// temporary an interrupted encode can leave (see `podspine_splitter::part_path`).
+/// An extracted `cover.*` matches neither, so no sweep ever removes it.
 fn is_episode_stem(path: &Path) -> bool {
     path.file_stem()
         .and_then(|s| s.to_str())
         .map(|s| s.strip_suffix(".part").unwrap_or(s))
-        .is_some_and(|s| s.len() == 3 && s.bytes().all(|b| b.is_ascii_digit()))
+        .is_some_and(podspine_splitter::is_episode_stem)
 }
 
 /// One per-chapter MP3 track discovered in a folder, with the metadata needed to
@@ -803,20 +804,8 @@ fn collect_mp3s(dir: &Path, library_root: &Path) -> Vec<PathBuf> {
         // is inside it — `source_is_inside` only vetted the folder. Such a track
         // would be indexed into the feed and then 404 at serve time, because the
         // http layer canonicalizes each enclosure and refuses anything outside the
-        // library root. Drop it here, loudly (Greptile).
-        .filter(|p| {
-            match p.canonicalize() {
-                Ok(real) if real.starts_with(library_root) => true,
-                Ok(real) => {
-                    tracing::warn!(track = %p.display(), target = %real.display(), "skipping an MP3 track that links outside the library");
-                    false
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, track = %p.display(), "skipping an unreadable MP3 track");
-                    false
-                }
-            }
-        })
+        // library root. Drop it here, loudly (Greptile) — [`resolve_inside`] warns.
+        .filter(|p| resolve_inside(p, library_root).is_some())
         .collect()
 }
 
@@ -849,6 +838,14 @@ enum BookSource {
 }
 
 impl BookSource {
+    /// The source's filesystem path: the audio file, or the MP3 folder.
+    fn path(&self) -> &Path {
+        match self {
+            BookSource::File(p) => p,
+            BookSource::Mp3Folder(d) => d,
+        }
+    }
+
     /// The base name a slug is derived from.
     ///
     /// For anything discoverable before recursive walking existed — a file at the
@@ -1055,10 +1052,7 @@ pub fn scan_library(
     let mut seen = HashSet::new();
     let mut summary = ScanSummary::default();
     for source in sources {
-        let source_path = match &source {
-            BookSource::File(p) => p.as_path(),
-            BookSource::Mp3Folder(d) => d.as_path(),
-        };
+        let source_path = source.path();
         // If this exact source is already indexed, keep its id — that is what makes
         // a feed URL stable across scans, and what stops a once-suffixed book from
         // being re-indexed under a since-freed base id. Otherwise reserve a slug in
@@ -1436,21 +1430,23 @@ fn walk_library(
     // Canonicalize for the loop guard: a symlink pointing back up the tree (or at
     // a sibling already walked) would otherwise recurse until the depth cap, and
     // index the same book twice on the way.
-    let real = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    //
+    // Below the root, containment is enforced too ([`resolve_inside`]): `is_dir`
+    // follows symlinks, so a link inside the library pointing at audio elsewhere
+    // on the host would be walked and indexed — and then be unplayable, because
+    // the serve layer canonicalizes an episode's source and refuses anything
+    // outside the library root (TAD §7). A feed whose audio 404s is worse than a
+    // book that never appears, so the walk refuses to leave the tree. The root
+    // itself is exempt (it defines the tree).
+    let real = if depth == 0 {
+        dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf())
+    } else {
+        match resolve_inside(dir, library_root) {
+            Some(real) => real,
+            None => return,
+        }
+    };
     if data_root.is_some_and(|d| real.starts_with(d)) {
-        return;
-    }
-    // `is_dir` follows symlinks, so a link inside the library pointing at audio
-    // elsewhere on the host would be walked and indexed — and then be unplayable,
-    // because the serve layer canonicalizes an episode's source and refuses
-    // anything outside the library root (TAD §7). A feed whose audio 404s is worse
-    // than a book that never appears, so the walk refuses to leave the tree.
-    if depth > 0 && !real.starts_with(library_root) {
-        tracing::warn!(
-            dir = %dir.display(),
-            target = %real.display(),
-            "skipping a link that leaves the library root"
-        );
         return;
     }
     if !visited.insert(real) {
@@ -1529,23 +1525,30 @@ fn walk_library(
 /// are logged, not silently dropped: a book missing from the UI with nothing in
 /// the log is the worst version of this.
 fn source_is_inside(src: &BookSource, library_root: &Path) -> bool {
-    let path = match src {
-        BookSource::File(p) => p.as_path(),
-        BookSource::Mp3Folder(d) => d.as_path(),
-    };
+    resolve_inside(src.path(), library_root).is_some()
+}
+
+/// Canonicalize `path` and keep it only if it resolves inside `root` — the
+/// symlink-containment rule shared by the walk, source vetting, and MP3-track
+/// collection: the serve layer canonicalizes every source and refuses anything
+/// outside the library root (TAD §7), so indexing an escapee would publish audio
+/// that 404s. A path that resolves outside the root, or can't be resolved at all,
+/// is dropped with a warning — a book missing from the UI with nothing in the log
+/// is the worst version of this.
+fn resolve_inside(path: &Path, root: &Path) -> Option<PathBuf> {
     match path.canonicalize() {
-        Ok(real) if real.starts_with(library_root) => true,
+        Ok(real) if real.starts_with(root) => Some(real),
         Ok(real) => {
             tracing::warn!(
                 path = %path.display(),
                 target = %real.display(),
                 "skipping a link that leaves the library root"
             );
-            false
+            None
         }
         Err(err) => {
             tracing::warn!(error = %err, path = %path.display(), "skipping an unreadable source");
-            false
+            None
         }
     }
 }
@@ -3381,13 +3384,7 @@ mod tests {
         let mut seen = HashSet::new();
         let slugs: Vec<String> = found
             .iter()
-            .map(|s| {
-                let p = match s {
-                    BookSource::File(p) => p.as_path(),
-                    BookSource::Mp3Folder(d) => d.as_path(),
-                };
-                assign_slug(&slugify(&s.base_name(&root)), p, &index, &mut seen)
-            })
+            .map(|s| assign_slug(&slugify(&s.base_name(&root)), s.path(), &index, &mut seen))
             .collect();
         // `Dracula/inner.m4b` keeps `inner`; the folder book and the root file do not
         // trade ids.
@@ -3505,13 +3502,7 @@ mod tests {
         let mut seen = HashSet::new();
         let slugs: Vec<String> = discover(&root, &root.join("data"))
             .iter()
-            .map(|s| {
-                let p = match s {
-                    BookSource::File(p) => p.as_path(),
-                    BookSource::Mp3Folder(d) => d.as_path(),
-                };
-                assign_slug(&slugify(&s.base_name(&root)), p, &index, &mut seen)
-            })
+            .map(|s| assign_slug(&slugify(&s.base_name(&root)), s.path(), &index, &mut seen))
             .collect();
         // Not `dracula` and `dracula-2`, whose assignment would hinge on walk order.
         assert_eq!(slugs, vec!["author-one-dracula", "author-two-dracula"]);

@@ -49,7 +49,10 @@ use tower_http::trace::TraceLayer;
 
 use podspine_feed::{FeedBook, FeedEpisode, render_checked};
 use podspine_index::{BookRow, Index, StorageMode, TranscodeMode};
-use podspine_splitter::{ChapterCut, cover_thumb_path, remux_faststart, split_chapter};
+use podspine_splitter::{
+    ChapterCut, cover_thumb_path, episode_file_name, is_episode_stem, remux_faststart,
+    split_chapter,
+};
 use podspine_ui::{
     BookCard, BookDetail, Theme, book_page, index_page, scanning_page, subscribe_page,
 };
@@ -337,6 +340,29 @@ async fn index(
     Ok(Html(index_page(&cards, theme).into_string()))
 }
 
+/// Build the [`BookDetail`] view model the detail pages share: count the book's
+/// episodes and derive the public feed/subscribe URLs from its capability id.
+/// Each handler keeps its own lookup (slug vs `feed_id`) and page template.
+fn book_detail(state: &AppState, book: BookRow) -> Result<BookDetail, AppError> {
+    let episode_count = {
+        let index = state.index.lock().map_err(AppError::internal)?;
+        index
+            .episodes_for_book(&book.id)
+            .map_err(AppError::internal)?
+            .len()
+    };
+    Ok(BookDetail {
+        feed_url: format!("{}/feed/{}.xml", state.base_url, book.feed_id),
+        subscribe_url: format!("{}/subscribe/{}", state.base_url, book.feed_id),
+        slug: book.slug,
+        feed_id: book.feed_id,
+        title: book.title,
+        author: book.author,
+        has_cover: book.cover_path.is_some(),
+        episode_count,
+    })
+}
+
 /// `GET /book/{slug}` — a book's page: copy-feed-URL, QR, how-to panel.
 async fn book(
     State(state): State<AppState>,
@@ -347,29 +373,14 @@ async fn book(
         return Err(AppError::NotFound);
     }
     let theme = theme_from_cookie(&headers);
-    let (book, episode_count) = {
+    let book = {
         let index = state.index.lock().map_err(AppError::internal)?;
-        let book = index
+        index
             .get_book_by_slug(&slug)
             .map_err(AppError::internal)?
-            .ok_or(AppError::NotFound)?;
-        let count = index
-            .episodes_for_book(&book.id)
-            .map_err(AppError::internal)?
-            .len();
-        (book, count)
+            .ok_or(AppError::NotFound)?
     };
-
-    let detail = BookDetail {
-        feed_url: format!("{}/feed/{}.xml", state.base_url, book.feed_id),
-        subscribe_url: format!("{}/subscribe/{}", state.base_url, book.feed_id),
-        slug: book.slug,
-        feed_id: book.feed_id,
-        title: book.title,
-        author: book.author,
-        has_cover: book.cover_path.is_some(),
-        episode_count,
-    };
+    let detail = book_detail(&state, book)?;
     Ok(Html(book_page(&detail, theme).into_string()))
 }
 
@@ -385,28 +396,14 @@ async fn subscribe(
         return Err(AppError::NotFound);
     }
     let theme = theme_from_cookie(&headers);
-    let (book, episode_count) = {
+    let book = {
         let index = state.index.lock().map_err(AppError::internal)?;
-        let book = index
+        index
             .get_book_by_feed_id(&feed_id)
             .map_err(AppError::internal)?
-            .ok_or(AppError::NotFound)?;
-        let count = index
-            .episodes_for_book(&book.id)
-            .map_err(AppError::internal)?
-            .len();
-        (book, count)
+            .ok_or(AppError::NotFound)?
     };
-    let detail = BookDetail {
-        feed_url: format!("{}/feed/{}.xml", state.base_url, book.feed_id),
-        subscribe_url: format!("{}/subscribe/{}", state.base_url, book.feed_id),
-        slug: book.slug,
-        feed_id: book.feed_id,
-        title: book.title,
-        author: book.author,
-        has_cover: book.cover_path.is_some(),
-        episode_count,
-    };
+    let detail = book_detail(&state, book)?;
     Ok(Html(subscribe_page(&detail, theme).into_string()))
 }
 
@@ -558,6 +555,31 @@ fn book_cover_path(state: &AppState, feed_id: &str) -> Result<String, AppError> 
         .ok_or(AppError::NotFound)
 }
 
+/// The A01 containment check every serve path funnels through (TAD §7):
+/// canonicalize `path` (resolving `..` and symlinks) and confirm the result stays
+/// under the trusted `root`. A path that can't be canonicalized (missing file) or
+/// that resolves outside `root` is rejected as `NotFound` — never a distinct
+/// status, so the rejection is not an existence oracle. `what` names the site in
+/// the operator's log; the client never sees it. `number` is the episode number
+/// when the site has one — it identifies the poisoned row in the warn.
+fn canonical_under(
+    path: &FsPath,
+    root: &FsPath,
+    what: &'static str,
+    feed_id: &str,
+    number: Option<u32>,
+) -> Result<PathBuf, AppError> {
+    let canonical = path.canonicalize().map_err(|_| AppError::NotFound)?;
+    if !canonical.starts_with(root) {
+        match number {
+            Some(number) => tracing::warn!(feed_id, number, "{what}"),
+            None => tracing::warn!(feed_id, "{what}"),
+        }
+        return Err(AppError::NotFound);
+    }
+    Ok(canonical)
+}
+
 /// Canonicalize a stored image path and confirm it stays under the data dir (a
 /// resolved path that escapes it is rejected as `NotFound`, never served). Fails
 /// with `NotFound` when the file doesn't exist — which the thumbnail handler relies
@@ -567,14 +589,13 @@ fn resolve_under_data_dir(
     data_dir: &FsPath,
     feed_id: &str,
 ) -> Result<PathBuf, AppError> {
-    let canonical = PathBuf::from(path)
-        .canonicalize()
-        .map_err(|_| AppError::NotFound)?;
-    if !canonical.starts_with(data_dir) {
-        tracing::warn!(feed_id, "resolved cover path escaped the data dir");
-        return Err(AppError::NotFound);
-    }
-    Ok(canonical)
+    canonical_under(
+        FsPath::new(path),
+        data_dir,
+        "resolved cover path escaped the data dir",
+        feed_id,
+        None,
+    )
 }
 
 /// Serve an on-disk image with content-addressed caching: an `ETag` (a blake3 hash
@@ -832,13 +853,13 @@ fn resolve_audio_target(
     // Returns before the data-dir/regeneration logic below, so a poisoned row can
     // never fall through into it.
     if !ep.source_path.is_empty() && ep.file_path == ep.source_path {
-        let src = FsPath::new(&ep.source_path)
-            .canonicalize()
-            .map_err(|_| AppError::NotFound)?;
-        if !src.starts_with(&state.library_dir) {
-            tracing::warn!(feed_id, number, "in-place audio escaped the library root");
-            return Err(AppError::NotFound);
-        }
+        let src = canonical_under(
+            FsPath::new(&ep.source_path),
+            &state.library_dir,
+            "in-place audio escaped the library root",
+            feed_id,
+            Some(number),
+        )?;
         let src_len = std::fs::metadata(&src)
             .map(|m| m.len() as i64)
             .map_err(|_| AppError::NotFound)?;
@@ -880,7 +901,7 @@ fn resolve_audio_target(
         tracing::warn!(feed_id, number, "resolved audio path escaped the data dir");
         return Err(AppError::NotFound);
     }
-    let path = out_dir.join(format!("{:03}.{out_ext}", idx + 1));
+    let path = out_dir.join(episode_file_name(idx as usize, &out_ext));
 
     // Two kinds of episode materialize under the data dir here:
     let regen = if !ep.source_path.is_empty() && ep.needs_faststart {
@@ -891,13 +912,13 @@ fn resolve_audio_target(
         // `source_path` is NOT remuxed into its container here; it drops to the
         // chaptered arm and serves its actual split (or 404s). Validate the source
         // stays under the library root first (the A01 rule), 404 on escape.
-        let src = FsPath::new(&ep.source_path)
-            .canonicalize()
-            .map_err(|_| AppError::NotFound)?;
-        if !src.starts_with(&state.library_dir) {
-            tracing::warn!(feed_id, number, "remux source escaped the library root");
-            return Err(AppError::NotFound);
-        }
+        let src = canonical_under(
+            FsPath::new(&ep.source_path),
+            &state.library_dir,
+            "remux source escaped the library root",
+            feed_id,
+            Some(number),
+        )?;
         Some(Regen {
             source: src,
             out_dir,
@@ -921,17 +942,13 @@ fn resolve_audio_target(
         // library root before it can reach ffmpeg. Checked here rather than at
         // regen time so a poisoned row is rejected before anything is opened or
         // written — including when the cached chapter happens to already exist.
-        let src = FsPath::new(&book.source_path)
-            .canonicalize()
-            .map_err(|_| AppError::NotFound)?;
-        if !src.starts_with(&state.library_dir) {
-            tracing::warn!(
-                feed_id,
-                number,
-                "saver regen source escaped the library root"
-            );
-            return Err(AppError::NotFound);
-        }
+        let src = canonical_under(
+            FsPath::new(&book.source_path),
+            &state.library_dir,
+            "saver regen source escaped the library root",
+            feed_id,
+            Some(number),
+        )?;
         Some(Regen {
             source: src,
             out_dir,
@@ -1096,7 +1113,7 @@ fn evict(
             let numeric = p
                 .file_stem()
                 .and_then(|s| s.to_str())
-                .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
+                .is_some_and(is_episode_stem);
             if !numeric {
                 continue;
             }
