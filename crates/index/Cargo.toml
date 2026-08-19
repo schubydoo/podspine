@@ -10,8 +10,13 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+# typed `book.storage_mode`/`book.transcode` columns (re-exported for http)
+podspine-config = { path = "../config" }
 rusqlite = { workspace = true }
 thiserror = { workspace = true }
 # capability feed ids (v1.5): 128-bit random -> URL-safe base64 (stored raw)
 getrandom = { workspace = true }
 base64 = { workspace = true }
+
+[dev-dependencies]
+podspine-test-support = { path = "../test-support" }

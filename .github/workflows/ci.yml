@@ -58,8 +58,44 @@ jobs:
       # whole libav* tree); see .github/actions/setup-ffmpeg for the why.
       - name: Set up ffmpeg
         uses: ./.github/actions/setup-ffmpeg
-      - name: Test
-        run: cargo test --workspace --all-features
+      # nextest instead of `cargo test`: same tests, same gate (non-zero exit on
+      # failure), but a junit.xml falls out (.config/nextest.toml `ci` profile) —
+      # the only format Codecov's Test Analytics ingests. Prebuilt binary via
+      # install-action, matching the coverage/supply-chain jobs.
+      - uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
+        with:
+          tool: cargo-nextest
+      - name: Test (nextest → JUnit)
+        run: cargo nextest run --workspace --all-features --profile ci
+      # nextest does not run doctests. The workspace has none today; this guards
+      # the day one appears, and reuses the build cache so it costs seconds.
+      - name: Doctests
+        run: cargo test --workspace --all-features --doc
+      # Upload from every leg, tagged with its OS as a Codecov flag, so Test
+      # Analytics (flaky/slow tests) breaks out per platform. Tokenless (public
+      # repo), non-blocking, and `!cancelled()` so a FAILED run still uploads —
+      # nextest writes junit.xml before exiting non-zero, and a failing suite is
+      # exactly when the analytics matter. (Pattern lifted from claustrum's CI.)
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
+        with:
+          files: target/nextest/ci/junit.xml
+          # `files` is additive, not exclusive — without this the CLI still walks
+          # the checkout looking for more report-shaped files.
+          disable_search: true
+          flags: ${{ runner.os }}
+          report_type: test_results
+          fail_ci_if_error: false
+      # Keep the junit file even when the upload is a no-op; the Codecov step is
+      # deliberately non-blocking, so a rejected upload is only a warning line.
+      - name: Upload test results artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-results-${{ matrix.os }}
+          path: target/nextest/ci/junit.xml
+          retention-days: 7
 
   test-windows:
     # Informational: Podspine has no Windows release target and its tests have
@@ -76,8 +112,31 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Set up ffmpeg
         uses: ./.github/actions/setup-ffmpeg
-      - name: Test
-        run: cargo test --workspace --all-features
+      - uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
+        with:
+          tool: cargo-nextest
+      # Same nextest → JUnit → Codecov pipeline as the `test` matrix (see there
+      # for the why); flagged Windows so Test Analytics separates this leg.
+      - name: Test (nextest → JUnit)
+        run: cargo nextest run --workspace --all-features --profile ci
+      - name: Doctests
+        run: cargo test --workspace --all-features --doc
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
+        with:
+          files: target/nextest/ci/junit.xml
+          disable_search: true
+          flags: ${{ runner.os }}
+          report_type: test_results
+          fail_ci_if_error: false
+      - name: Upload test results artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-results-windows
+          path: target/nextest/ci/junit.xml
+          retention-days: 7
 
   coverage:
     name: coverage (>= 90% lines)

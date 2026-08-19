@@ -17,6 +17,11 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
+// Re-exported so downstream crates (http) can consume the typed
+// `storage_mode`/`transcode` columns without a `podspine-config` dependency of
+// their own.
+pub use podspine_config::{StorageMode, TranscodeMode};
+
 /// Capability-id generation: an unguessable, URL-safe feed id. Stored raw (it is
 /// the owner's own retrievable link, shown in the UI and QR — not a hashed
 /// per-subscriber secret).
@@ -49,7 +54,6 @@ CREATE TABLE IF NOT EXISTS book (
     cover_path   TEXT,
     source_path  TEXT NOT NULL,
     source_mtime INTEGER NOT NULL,
-    status       TEXT NOT NULL,
     storage_mode TEXT NOT NULL DEFAULT '',
     default_cover_url TEXT,
     force_embedded INTEGER NOT NULL DEFAULT 0,
@@ -92,13 +96,11 @@ pub struct BookRow {
     pub source_path: String,
     /// Source mtime (epoch seconds).
     pub source_mtime: i64,
-    /// Processing status (e.g. `ready`).
-    pub status: String,
-    /// Effective per-book storage mode as a string (`"full"`/`"saver"`), or `""`
-    /// to follow the global config (a pre-6.4 row, until re-scanned). Persisted so
-    /// the serve/evict layers honor a per-book `.podspine.toml` override without
-    /// the sidecar (Sprint 6.4).
-    pub storage_mode: String,
+    /// Effective per-book storage mode, or `None` to follow the global config
+    /// (a pre-6.4 row, until re-scanned). Persisted so the serve/evict layers
+    /// honor a per-book `.podspine.toml` override without the sidecar
+    /// (Sprint 6.4). Stored as TEXT (`"full"`/`"saver"`, `None` = `""`).
+    pub storage_mode: Option<StorageMode>,
     /// Per-book feed cover fallback (a `.podspine.toml` override), tried before
     /// the server-wide `default_cover_url`.
     pub default_cover_url: Option<String>,
@@ -106,11 +108,12 @@ pub struct BookRow {
     /// override). Persisted only so a scan can detect a toggle and re-ingest;
     /// not read at serve time.
     pub force_embedded: bool,
-    /// Effective transcode mode at last ingest (`""`/`"off"`/`"aac"`/`"mp3"`,
-    /// Task 5.2). Persisted only so a scan can detect a `PODSPINE_TRANSCODE`
-    /// toggle — which changes the episode container and every `byte_length` — and
-    /// re-ingest the book; not read at serve time. `""` is a pre-5.2 row.
-    pub transcode: String,
+    /// Effective transcode mode at last ingest (Task 5.2). Persisted so a scan
+    /// can detect a `PODSPINE_TRANSCODE` toggle — which changes the episode
+    /// container and every `byte_length` — and re-ingest the book. `None` is a
+    /// pre-5.2 row, which was necessarily stream-copied. Stored as TEXT
+    /// (`"off"`/`"aac"`/`"mp3"`, `None` = `""`).
+    pub transcode: Option<TranscodeMode>,
 }
 
 /// One episode (a split chapter). Numeric fields are stored as SQLite integers.
@@ -195,94 +198,36 @@ impl Index {
     /// Existing episodes get `start_sec = 0`; that value is only read for
     /// `saver`-mode regeneration and is corrected on the next re-scan.
     fn migrate(conn: &Connection) -> Result<(), IndexError> {
-        let has_start_sec: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('episode') WHERE name = 'start_sec'",
-            [],
-            |r| r.get(0),
+        // `episode.start_sec` (saver-mode regeneration). Existing rows get 0;
+        // corrected on the next re-scan.
+        add_column_if_missing(conn, "episode", "start_sec", "REAL NOT NULL DEFAULT 0")?;
+        // `episode.source_path` (serve-in-place, Sprint 6.2). Existing rows
+        // default to `''` (extracted/copied under `<data_dir>`, as before); a
+        // re-scan flips whole-file books to in-place serving and reclaims their
+        // copies.
+        add_column_if_missing(conn, "episode", "source_path", "TEXT NOT NULL DEFAULT ''")?;
+        // `episode.needs_faststart` (faststart detection, Sprint 6.3). Existing
+        // rows default to `0`; a re-scan re-detects and records it per
+        // whole-file mp4.
+        add_column_if_missing(
+            conn,
+            "episode",
+            "needs_faststart",
+            "INTEGER NOT NULL DEFAULT 0",
         )?;
-        if has_start_sec == 0 {
-            conn.execute(
-                "ALTER TABLE episode ADD COLUMN start_sec REAL NOT NULL DEFAULT 0",
-                [],
-            )?;
-        }
-        // `source_path` (serve-in-place, Sprint 6.2). Existing rows default to
-        // `''` (extracted/copied under `<data_dir>`, as before); a re-scan flips
-        // whole-file books to in-place serving and reclaims their copies.
-        let has_source_path: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('episode') WHERE name = 'source_path'",
-            [],
-            |r| r.get(0),
-        )?;
-        if has_source_path == 0 {
-            conn.execute(
-                "ALTER TABLE episode ADD COLUMN source_path TEXT NOT NULL DEFAULT ''",
-                [],
-            )?;
-        }
-        // `needs_faststart` (faststart detection, Sprint 6.3). Existing rows
-        // default to `0`; a re-scan re-detects and records it per whole-file mp4.
-        let has_needs_faststart: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('episode') WHERE name = 'needs_faststart'",
-            [],
-            |r| r.get(0),
-        )?;
-        if has_needs_faststart == 0 {
-            conn.execute(
-                "ALTER TABLE episode ADD COLUMN needs_faststart INTEGER NOT NULL DEFAULT 0",
-                [],
-            )?;
-        }
         // `book.storage_mode` + `book.default_cover_url` (per-book overrides,
         // Sprint 6.4). Existing rows default to `''`/NULL, meaning "follow the
         // global config"; a re-scan records the effective per-book value.
-        let has_book_storage_mode: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('book') WHERE name = 'storage_mode'",
-            [],
-            |r| r.get(0),
-        )?;
-        if has_book_storage_mode == 0 {
-            conn.execute(
-                "ALTER TABLE book ADD COLUMN storage_mode TEXT NOT NULL DEFAULT ''",
-                [],
-            )?;
-        }
-        let has_book_cover_url: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('book') WHERE name = 'default_cover_url'",
-            [],
-            |r| r.get(0),
-        )?;
-        if has_book_cover_url == 0 {
-            conn.execute("ALTER TABLE book ADD COLUMN default_cover_url TEXT", [])?;
-        }
+        add_column_if_missing(conn, "book", "storage_mode", "TEXT NOT NULL DEFAULT ''")?;
+        add_column_if_missing(conn, "book", "default_cover_url", "TEXT")?;
         // `book.force_embedded` (per-book overrides, 6.4). Recorded so a scan can
         // detect a `.podspine.toml` `force_embedded_chapters` toggle (which changes
         // the chapter source without changing the audio mtime) and re-ingest.
-        let has_force_embedded: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('book') WHERE name = 'force_embedded'",
-            [],
-            |r| r.get(0),
-        )?;
-        if has_force_embedded == 0 {
-            conn.execute(
-                "ALTER TABLE book ADD COLUMN force_embedded INTEGER NOT NULL DEFAULT 0",
-                [],
-            )?;
-        }
+        add_column_if_missing(conn, "book", "force_embedded", "INTEGER NOT NULL DEFAULT 0")?;
         // `book.transcode` (opt-in re-encoding, Task 5.2). Existing rows default
         // to `''` — "unknown, pre-5.2" — which a scan treats as "not transcoded",
         // matching how every pre-5.2 book was actually produced.
-        let has_book_transcode: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('book') WHERE name = 'transcode'",
-            [],
-            |r| r.get(0),
-        )?;
-        if has_book_transcode == 0 {
-            conn.execute(
-                "ALTER TABLE book ADD COLUMN transcode TEXT NOT NULL DEFAULT ''",
-                [],
-            )?;
-        }
+        add_column_if_missing(conn, "book", "transcode", "TEXT NOT NULL DEFAULT ''")?;
         // `book.created_at` (first-seen time, epoch millis). Its only use is
         // picking the survivor when healing a database that holds two rows for one
         // source: the earliest-created row is the feed subscribers have held
@@ -298,18 +243,16 @@ impl Index {
         // are tiny next to the epoch-millis stamps new rows get, so a migrated row
         // always sorts before any row written afterwards — still correct, since it
         // is genuinely older.
-        let has_book_created_at: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('book') WHERE name = 'created_at'",
-            [],
-            |r| r.get(0),
-        )?;
-        if has_book_created_at == 0 {
-            conn.execute(
-                "ALTER TABLE book ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0",
-                [],
-            )?;
+        if add_column_if_missing(conn, "book", "created_at", "INTEGER NOT NULL DEFAULT 0")? {
             conn.execute("UPDATE book SET created_at = rowid", [])?;
         }
+        // `book.status` is gone: it was write-only — always `"ready"`, never read
+        // anywhere in the workspace — so it was dead weight in every SELECT and
+        // struct literal. A database created by an older Podspine still carries
+        // the column (with `NOT NULL`, which would break the column-less INSERT
+        // in `upsert_book`), so drop it rather than leave fresh and migrated
+        // schemas divergent.
+        drop_column_if_present(conn, "book", "status")?;
         Ok(())
     }
 
@@ -322,12 +265,12 @@ impl Index {
     pub fn upsert_book(&self, b: &BookRow) -> Result<(), IndexError> {
         self.conn.execute(
             "INSERT INTO book
-               (id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status, storage_mode, default_cover_url, force_embedded, transcode, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+               (id, slug, feed_id, title, author, cover_path, source_path, source_mtime, storage_mode, default_cover_url, force_embedded, transcode, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(id) DO UPDATE SET
                slug=excluded.slug, title=excluded.title, author=excluded.author,
                cover_path=excluded.cover_path, source_path=excluded.source_path,
-               source_mtime=excluded.source_mtime, status=excluded.status,
+               source_mtime=excluded.source_mtime,
                storage_mode=excluded.storage_mode, default_cover_url=excluded.default_cover_url,
                force_embedded=excluded.force_embedded, transcode=excluded.transcode",
             // created_at is set on first insert and deliberately absent from the
@@ -342,11 +285,13 @@ impl Index {
                 b.cover_path,
                 b.source_path,
                 b.source_mtime,
-                b.status,
-                b.storage_mode,
+                // The enum↔TEXT boundary (write side): `None` persists as `""`,
+                // a known mode as its canonical label — byte-identical to what
+                // pre-typed builds wrote, so a re-scan never churns rows.
+                b.storage_mode.map_or("", StorageMode::label),
                 b.default_cover_url,
                 b.force_embedded,
-                b.transcode,
+                b.transcode.map_or("", TranscodeMode::label),
                 now_epoch_millis(),
             ],
         )?;
@@ -387,8 +332,7 @@ impl Index {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status, storage_mode, default_cover_url, force_embedded, transcode
-                 FROM book WHERE id = ?1",
+                &format!("SELECT {BOOK_COLUMNS} FROM book WHERE id = ?1"),
                 [id],
                 book_from_row,
             )
@@ -400,8 +344,7 @@ impl Index {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status, storage_mode, default_cover_url, force_embedded, transcode
-                 FROM book WHERE slug = ?1",
+                &format!("SELECT {BOOK_COLUMNS} FROM book WHERE slug = ?1"),
                 [slug],
                 book_from_row,
             )
@@ -410,10 +353,9 @@ impl Index {
 
     /// All books, ordered by title.
     pub fn list_books(&self) -> Result<Vec<BookRow>, IndexError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status, storage_mode, default_cover_url, force_embedded, transcode
-             FROM book ORDER BY title",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT {BOOK_COLUMNS} FROM book ORDER BY title"))?;
         let rows = stmt.query_map([], book_from_row)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
@@ -447,8 +389,7 @@ impl Index {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status, storage_mode, default_cover_url, force_embedded, transcode
-                 FROM book WHERE feed_id = ?1",
+                &format!("SELECT {BOOK_COLUMNS} FROM book WHERE feed_id = ?1"),
                 [feed_id],
                 book_from_row,
             )
@@ -474,19 +415,49 @@ impl Index {
         let n = self.conn.execute("DELETE FROM book WHERE id = ?1", [id])?;
         Ok(n > 0)
     }
+}
 
-    /// Fetch an episode by guid.
-    pub fn get_episode(&self, guid: &str) -> Result<Option<EpisodeRow>, IndexError> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT guid, book_id, idx, title, file_path, byte_length, duration_sec, start_sec, pubdate_epoch, source_path, needs_faststart
-                 FROM episode WHERE guid = ?1",
-                [guid],
-                episode_from_row,
-            )
-            .optional()?)
+/// Add `column` to `table` if it is missing; `ddl` is the type + constraints
+/// clause. Returns whether the column was added, so a migration can run a
+/// one-time backfill on exactly the databases that migrated.
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    ddl: &str,
+) -> Result<bool, IndexError> {
+    let present: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+        params![table, column],
+        |r| r.get(0),
+    )?;
+    if present == 0 {
+        // table/column/ddl are compile-time literals from `migrate`, never user
+        // input — safe to splice.
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {ddl}"),
+            [],
+        )?;
+        return Ok(true);
     }
+    Ok(false)
+}
+
+/// Drop `column` from `table` if present — [`add_column_if_missing`]'s inverse,
+/// for retiring a column an older Podspine wrote that nothing reads anymore.
+/// Same `pragma_table_info` probe; `ALTER TABLE … DROP COLUMN` needs SQLite ≥
+/// 3.35, and the bundled SQLite in rusqlite 0.40 is far past that.
+fn drop_column_if_present(conn: &Connection, table: &str, column: &str) -> Result<(), IndexError> {
+    let present: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+        params![table, column],
+        |r| r.get(0),
+    )?;
+    if present > 0 {
+        // table/column are compile-time literals from `migrate` — safe to splice.
+        conn.execute(&format!("ALTER TABLE {table} DROP COLUMN {column}"), [])?;
+    }
+    Ok(())
 }
 
 /// Wall-clock **milliseconds** since the Unix epoch, for a book's first-seen time.
@@ -499,6 +470,10 @@ fn now_epoch_millis() -> i64 {
         .unwrap_or(0)
 }
 
+/// The `book` SELECT column list. Order must match `book_from_row`'s ordinals —
+/// one definition so adding a column edits exactly one string and one mapper.
+const BOOK_COLUMNS: &str = "id, slug, feed_id, title, author, cover_path, source_path, source_mtime, storage_mode, default_cover_url, force_embedded, transcode";
+
 fn book_from_row(row: &Row) -> rusqlite::Result<BookRow> {
     Ok(BookRow {
         id: row.get(0)?,
@@ -509,11 +484,14 @@ fn book_from_row(row: &Row) -> rusqlite::Result<BookRow> {
         cover_path: row.get(5)?,
         source_path: row.get(6)?,
         source_mtime: row.get(7)?,
-        status: row.get(8)?,
-        storage_mode: row.get(9)?,
-        default_cover_url: row.get(10)?,
-        force_embedded: row.get(11)?,
-        transcode: row.get(12)?,
+        // The enum↔TEXT boundary (read side): `""` — a pre-6.4/pre-5.2 row — and
+        // any unrecognized value both map to `None`, preserving the historical
+        // fall-through-to-global behavior (a typo'd or future mode can never
+        // crash a serve; it just follows the server config until re-scanned).
+        storage_mode: StorageMode::from_label(&row.get::<_, String>(8)?),
+        default_cover_url: row.get(9)?,
+        force_embedded: row.get(10)?,
+        transcode: TranscodeMode::from_label(&row.get::<_, String>(11)?),
     })
 }
 
@@ -536,6 +514,7 @@ fn episode_from_row(row: &Row) -> rusqlite::Result<EpisodeRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use podspine_test_support::scratch;
 
     fn book(id: &str, slug: &str, title: &str) -> BookRow {
         BookRow {
@@ -547,11 +526,10 @@ mod tests {
             cover_path: None,
             source_path: format!("/library/{id}.m4b"),
             source_mtime: 1_700_000_000,
-            status: "ready".to_string(),
-            storage_mode: String::new(),
+            storage_mode: None,
             default_cover_url: None,
             force_embedded: false,
-            transcode: String::new(),
+            transcode: None,
         }
     }
 
@@ -622,11 +600,7 @@ mod tests {
             vec![0, 1, 2],
             "episodes ordered by idx"
         );
-        assert_eq!(
-            idx.get_episode("b1-1").unwrap().as_ref(),
-            Some(&episode("b1", 1))
-        );
-        assert_eq!(idx.get_episode("missing").unwrap(), None);
+        assert_eq!(eps[1], episode("b1", 1), "upsert keeps the row content");
     }
 
     #[test]
@@ -650,9 +624,7 @@ mod tests {
 
     #[test]
     fn open_persists_to_a_file_across_reopen() {
-        let dir = std::env::temp_dir().join("podspine-index-file");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("index-file");
         let db = dir.join("podspine.db");
 
         let idx = Index::open(&db).unwrap();
@@ -662,15 +634,12 @@ mod tests {
         // Reopen the same file: the row (and schema) survived.
         let reopened = Index::open(&db).unwrap();
         assert_eq!(reopened.get_book("b1").unwrap().unwrap().title, "A Book");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn open_migrates_a_pre_start_sec_database() {
         // Simulate a database created before `episode.start_sec` existed.
-        let dir = std::env::temp_dir().join("podspine-index-migrate");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("index-migrate");
         let db = dir.join("old.db");
         {
             let conn = Connection::open(&db).unwrap();
@@ -722,8 +691,20 @@ mod tests {
         );
         let book = idx.get_book("b1").unwrap().unwrap();
         assert_eq!(
-            book.transcode, "",
-            "migrated rows default to an empty transcode mode (pre-5.2, not transcoded)"
+            book.transcode, None,
+            "migrated rows default to no transcode mode (pre-5.2, not transcoded)"
+        );
+        let status_present: i64 = idx
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('book') WHERE name = 'status'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status_present, 0,
+            "the write-only status column is dropped by the migration"
         );
         let (_, _, created_at) = idx
             .book_source_identities()
@@ -739,8 +720,6 @@ mod tests {
         // Idempotent: reopening an already-migrated DB is a no-op.
         drop(idx);
         assert!(Index::open(&db).is_ok());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -752,9 +731,7 @@ mod tests {
         // established feed. rowid preserves insertion order, so `book-2` keeps the
         // earlier `created_at` and `book_source_identities` returns it first — which
         // is the row the heal keeps.
-        let dir = std::env::temp_dir().join("podspine-index-createdat-order");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("index-createdat-order");
         let db = dir.join("old.db");
         {
             let conn = Connection::open(&db).unwrap();
@@ -790,7 +767,6 @@ mod tests {
             vec!["book-2", "book"],
             "the established (earlier-inserted) row must sort first, not the base id"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- capability feed ids (v1.5) ----

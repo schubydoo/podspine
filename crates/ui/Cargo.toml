@@ -12,3 +12,4 @@ publish = false
 [dependencies]
 maud = { workspace = true }
 qrcode = { workspace = true }
+tracing = { workspace = true }

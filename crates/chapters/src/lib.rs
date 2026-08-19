@@ -250,6 +250,7 @@ pub fn parse_ffmeta(text: &str) -> Vec<Chapter> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use podspine_test_support::scratch;
 
     fn embedded() -> Vec<Chapter> {
         vec![Chapter {
@@ -264,9 +265,7 @@ mod tests {
     fn an_ffmeta_sidecar_that_yields_no_chapters_falls_back_to_embedded() {
         // A present-but-useless sidecar (header only, or hand-edited to nothing)
         // must not win over real embedded markers and leave the book chapterless.
-        let dir = std::env::temp_dir().join("podspine-chapters-empty-ffmeta");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("chapters-empty-ffmeta");
         let audio = dir.join("book.m4b");
         std::fs::write(&audio, b"audio").unwrap();
         std::fs::write(
@@ -279,7 +278,6 @@ mod tests {
 
         assert_eq!(resolved.source, ChapterSource::Embedded);
         assert_eq!(resolved.chapters.len(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -328,9 +326,7 @@ FILE "book.m4b" WAVE
 
     #[test]
     fn resolve_prefers_cue_then_ffmeta_then_embedded() {
-        let dir = std::env::temp_dir().join("podspine-chapters-test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("chapters-test");
         let audio = dir.join("book.m4b");
         std::fs::write(&audio, b"not real audio").unwrap();
 
@@ -361,15 +357,11 @@ FILE "book.m4b" WAVE
         let r = resolve(&audio, &embedded(), 100.0, true);
         assert_eq!(r.source, ChapterSource::Embedded);
         assert_eq!(r.chapters[0].title.as_deref(), Some("Embedded"));
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn opf_nfo_odm_are_never_chapter_sources() {
-        let dir = std::env::temp_dir().join("podspine-chapters-nonsources");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("chapters-nonsources");
         let audio = dir.join("book.m4b");
         std::fs::write(&audio, b"x").unwrap();
         for ext in ["opf", "nfo", "odm"] {
@@ -378,7 +370,6 @@ FILE "book.m4b" WAVE
         // Only metadata/manifest siblings exist -> falls back to embedded.
         let r = resolve(&audio, &embedded(), 100.0, false);
         assert_eq!(r.source, ChapterSource::Embedded);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -400,9 +391,7 @@ FILE "book.m4b" WAVE
 
     #[test]
     fn resolve_falls_through_an_empty_cue_to_ffmeta() {
-        let dir = std::env::temp_dir().join("podspine-chapters-fallthrough");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("chapters-fallthrough");
         let audio = dir.join("book.m4b");
         std::fs::write(&audio, b"x").unwrap();
         // A .cue with no INDEX parses to zero chapters -> fall through to .ffmeta.
@@ -414,6 +403,5 @@ FILE "book.m4b" WAVE
         .unwrap();
         let r = resolve(&audio, &embedded(), 100.0, false);
         assert_eq!(r.source, ChapterSource::Ffmeta);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

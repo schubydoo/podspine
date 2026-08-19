@@ -31,10 +31,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-// Re-exported: both are part of this crate's public surface — `BookOverrides` is a
-// parameter of the scan API and `TranscodeMode` a field of [`ScanOptions`].
-pub use podspine_config::{BookOverrides, TranscodeMode};
-use podspine_config::{StorageMode, book_overrides};
+// Re-exported: all three are part of this crate's public surface — `BookOverrides`
+// is a parameter of the scan API, `StorageMode`/`TranscodeMode` fields of
+// [`ScanOptions`].
+use podspine_config::book_overrides;
+pub use podspine_config::{BookOverrides, StorageMode, TranscodeMode};
 use podspine_feed::{episode_guid, pubdate_epoch};
 use podspine_index::{BookRow, EpisodeRow, Index, IndexError};
 use podspine_prober::{ProbeError, needs_faststart, probe};
@@ -55,9 +56,10 @@ const DRM_EXTENSIONS: &[&str] = &["aax", "aaxc", "aa", "odm"];
 pub struct ScanOptions {
     /// Ignore any `.cue`/`.ffmeta` sidecar and use embedded chapters (Task 3.8).
     pub force_embedded: bool,
-    /// `saver` storage for chaptered books: split at ingest to record each real
-    /// `byte_length`, then delete and regenerate on demand (Sprint 5.1).
-    pub saver: bool,
+    /// Storage strategy for chaptered books (Sprint 5.1): `Saver` splits at
+    /// ingest to record each real `byte_length`, then deletes and regenerates on
+    /// demand; `Full` (the default) pre-splits and keeps the files.
+    pub storage: StorageMode,
     /// Remux a non-faststart whole-file mp4 to a faststart cache copy instead of
     /// serving it in place (Sprint 6.3).
     pub remux_non_faststart: bool,
@@ -163,11 +165,8 @@ pub fn scan_book_as(
     let remux_non_faststart = overrides
         .remux_non_faststart
         .unwrap_or(opts.remux_non_faststart);
-    let saver = match overrides.storage_mode {
-        Some(StorageMode::Saver) => true,
-        Some(StorageMode::Full) => false,
-        None => opts.saver,
-    };
+    let storage = overrides.storage_mode.unwrap_or(opts.storage);
+    let saver = storage == StorageMode::Saver;
     let force_reingest = overrides.force_reingest == Some(true);
 
     // Effective per-book metadata (override → default). Computed up here so the
@@ -175,7 +174,6 @@ pub fn scan_book_as(
     // audio mtime) and re-ingest, and so the BookRow build below reuses it.
     let eff_title = overrides.title.clone().unwrap_or_else(|| file_stem(input));
     let eff_author = overrides.author.clone();
-    let eff_storage_mode = if saver { "saver" } else { "full" }.to_string();
     let eff_cover = overrides.default_cover_url.clone();
 
     let id = id.to_string();
@@ -225,7 +223,7 @@ pub fn scan_book_as(
         // guids stay stable (no spurious client re-downloads).
         let metadata_consistent = existing.title == eff_title
             && existing.author == eff_author
-            && existing.storage_mode == eff_storage_mode
+            && existing.storage_mode == Some(storage)
             && existing.default_cover_url == eff_cover
             // `force_embedded_chapters` changes the chapter SOURCE (embedded vs a
             // `.cue`/`.ffmeta` sidecar) without touching the fields above, so a
@@ -234,14 +232,10 @@ pub fn scan_book_as(
         // Transcode toggle guard (Task 5.2): flipping `PODSPINE_TRANSCODE` changes
         // the episode container AND every recorded `byte_length`, and touches no
         // source mtime — so re-ingest when the persisted mode no longer matches
-        // what this setting would produce. A pre-5.2 row (`""`) was produced by a
-        // stream copy, which is exactly what `"off"` means, so it is not a
+        // what this setting would produce. A pre-5.2 row (`None`) was produced by
+        // a stream copy, which is exactly what `Off` means, so it is not a
         // mismatch and doesn't re-split anyone's library on upgrade.
-        let stored_transcode = if existing.transcode.is_empty() {
-            "off"
-        } else {
-            existing.transcode.as_str()
-        };
+        let stored_transcode = existing.transcode.unwrap_or(TranscodeMode::Off);
         let transcode_consistent = expected_transcode(input, opts.transcode)
             .is_none_or(|expected| stored_transcode == expected);
         // `force_reingest` (a troubleshooting knob) always skips the early return
@@ -287,7 +281,7 @@ pub fn scan_book_as(
         tracing::info!(
             id = %id,
             codec = probed.audio_codec.as_deref().unwrap_or("unknown"),
-            target = mode_label(opts.transcode),
+            target = opts.transcode.label(),
             "re-encoding a non-podcast-safe source (transcoding is on)"
         );
     }
@@ -486,19 +480,18 @@ pub fn scan_book_as(
         cover_path,
         source_path: input.to_string_lossy().into_owned(),
         source_mtime,
-        status: "ready".to_string(),
         // Persist the effective mode so serve/evict honor it without the sidecar.
-        storage_mode: eff_storage_mode,
+        storage_mode: Some(storage),
         default_cover_url: eff_cover,
         force_embedded,
-        // What actually happened to this book's audio (Task 5.2): `"off"` when it
+        // What actually happened to this book's audio (Task 5.2): `Off` when it
         // was stream-copied. Read by the serve/evict layers (a transcoded book is
         // never regenerated) and by the toggle guard above.
-        transcode: if transcoding {
-            mode_label(opts.transcode).to_string()
+        transcode: Some(if transcoding {
+            opts.transcode
         } else {
-            "off".to_string()
-        },
+            TranscodeMode::Off
+        }),
     };
     index.upsert_book(&book)?;
 
@@ -614,14 +607,15 @@ fn remove_stale_episode_copies(book_out: &Path) {
 }
 
 /// Whether `path` is a produced episode file rather than something else in the
-/// book directory: a numbered `NNN.<ext>`, or the `NNN.part.<ext>` temporary an
-/// interrupted encode can leave (see `podspine_splitter::part_path`). An extracted
-/// `cover.*` matches neither, so no sweep ever removes it.
+/// book directory: a numbered `NNN.<ext>` (the splitter's cross-crate
+/// [`podspine_splitter::episode_file_name`] contract), or the `NNN.part.<ext>`
+/// temporary an interrupted encode can leave (see `podspine_splitter::part_path`).
+/// An extracted `cover.*` matches neither, so no sweep ever removes it.
 fn is_episode_stem(path: &Path) -> bool {
     path.file_stem()
         .and_then(|s| s.to_str())
         .map(|s| s.strip_suffix(".part").unwrap_or(s))
-        .is_some_and(|s| s.len() == 3 && s.bytes().all(|b| b.is_ascii_digit()))
+        .is_some_and(podspine_splitter::is_episode_stem)
 }
 
 /// One per-chapter MP3 track discovered in a folder, with the metadata needed to
@@ -726,19 +720,18 @@ fn scan_mp3_folder(
         // Per-book overrides (Sprint 6.4), computed above and re-checked by the
         // idempotency guard so a sidecar edit re-persists them. storage_mode/remux/
         // force_embedded are no-ops for MP3 folders (tracks are served in place),
-        // so persist storage_mode as `""` (follow global).
+        // so persist no storage_mode (`None` = follow global).
         title: eff_title,
         author: eff_author,
         cover_path: None,
         source_path: dir.to_string_lossy().into_owned(),
         source_mtime,
-        status: "ready".to_string(),
-        storage_mode: String::new(),
+        storage_mode: None,
         default_cover_url: eff_cover,
         // No chapters in an MP3 folder, so force_embedded never applies.
         force_embedded: false,
         // MP3 is podcast-safe: an MP3 folder is never re-encoded (Task 5.2).
-        transcode: "off".to_string(),
+        transcode: Some(TranscodeMode::Off),
     };
     index.upsert_book(&book)?;
 
@@ -811,20 +804,8 @@ fn collect_mp3s(dir: &Path, library_root: &Path) -> Vec<PathBuf> {
         // is inside it — `source_is_inside` only vetted the folder. Such a track
         // would be indexed into the feed and then 404 at serve time, because the
         // http layer canonicalizes each enclosure and refuses anything outside the
-        // library root. Drop it here, loudly (Greptile).
-        .filter(|p| {
-            match p.canonicalize() {
-                Ok(real) if real.starts_with(library_root) => true,
-                Ok(real) => {
-                    tracing::warn!(track = %p.display(), target = %real.display(), "skipping an MP3 track that links outside the library");
-                    false
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, track = %p.display(), "skipping an unreadable MP3 track");
-                    false
-                }
-            }
-        })
+        // library root. Drop it here, loudly (Greptile) — [`resolve_inside`] warns.
+        .filter(|p| resolve_inside(p, library_root).is_some())
         .collect()
 }
 
@@ -857,6 +838,14 @@ enum BookSource {
 }
 
 impl BookSource {
+    /// The source's filesystem path: the audio file, or the MP3 folder.
+    fn path(&self) -> &Path {
+        match self {
+            BookSource::File(p) => p,
+            BookSource::Mp3Folder(d) => d,
+        }
+    }
+
     /// The base name a slug is derived from.
     ///
     /// For anything discoverable before recursive walking existed — a file at the
@@ -979,8 +968,12 @@ fn resolve_book_overrides(source: &Path, library_root: &Path) -> BookOverrides {
 /// canonicalizable paths also means an unmounted library (every source missing)
 /// collapses nothing. Best-effort: a failed lookup leaves the index untouched.
 fn collapse_duplicate_source_rows(index: &Index, data_dir: &Path) {
-    let Ok(identities) = index.book_source_identities() else {
-        return;
+    let identities = match index.book_source_identities() {
+        Ok(identities) => identities,
+        Err(err) => {
+            tracing::warn!(error = %err, "duplicate-row collapse skipped: identity listing failed");
+            return;
+        }
     };
     // `book_source_identities` is ordered oldest-first (created_at asc), so the
     // FIRST row seen for a source is the earliest-created — the feed subscribers
@@ -1042,20 +1035,24 @@ pub fn scan_library(
     // that was suffixed because a now-pruned stale row occupied its base id would,
     // on the next scan, ALSO be indexed under the freed base id: one audiobook
     // under two capability feeds (Greptile). Reuse makes the id stable per source.
-    let existing_by_source: HashMap<PathBuf, String> = index
-        .list_books()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|b| (PathBuf::from(b.source_path), b.id))
-        .collect();
+    let existing_by_source: HashMap<PathBuf, String> = match index.list_books() {
+        Ok(books) => books
+            .into_iter()
+            .map(|b| (PathBuf::from(b.source_path), b.id))
+            .collect(),
+        Err(err) => {
+            // Proceed with an empty map (same behavior as before), but say so:
+            // id reuse — the primary feed-URL stability mechanism — is skipped
+            // for this scan, leaving only the owns_a_different_source guard.
+            tracing::warn!(error = %err, "listing books failed; id reuse skipped this scan");
+            HashMap::new()
+        }
+    };
 
     let mut seen = HashSet::new();
     let mut summary = ScanSummary::default();
     for source in sources {
-        let source_path = match &source {
-            BookSource::File(p) => p.as_path(),
-            BookSource::Mp3Folder(d) => d.as_path(),
-        };
+        let source_path = source.path();
         // If this exact source is already indexed, keep its id — that is what makes
         // a feed URL stable across scans, and what stops a once-suffixed book from
         // being re-indexed under a since-freed base id. Otherwise reserve a slug in
@@ -1088,8 +1085,11 @@ pub fn scan_library(
         // `disabled` (a `.podspine.toml` troubleshooting knob): drop the book from
         // every surface — prune it if it was previously indexed, and skip.
         if overrides.disabled == Some(true) {
-            if matches!(index.get_book(&slug), Ok(Some(_))) {
-                let _ = index.delete_book(&slug);
+            // `delete_book` reports via its bool whether a row existed, so no
+            // pre-check is needed; a failed delete must be surfaced — the book
+            // would silently stay indexed and keep serving its feed.
+            if let Err(err) = index.delete_book(&slug) {
+                tracing::warn!(slug = %slug, error = %err, "failed to prune disabled book");
             }
             tracing::info!(slug = %slug, "book disabled by .podspine.toml — skipped");
             summary.skipped += 1;
@@ -1430,21 +1430,23 @@ fn walk_library(
     // Canonicalize for the loop guard: a symlink pointing back up the tree (or at
     // a sibling already walked) would otherwise recurse until the depth cap, and
     // index the same book twice on the way.
-    let real = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    //
+    // Below the root, containment is enforced too ([`resolve_inside`]): `is_dir`
+    // follows symlinks, so a link inside the library pointing at audio elsewhere
+    // on the host would be walked and indexed — and then be unplayable, because
+    // the serve layer canonicalizes an episode's source and refuses anything
+    // outside the library root (TAD §7). A feed whose audio 404s is worse than a
+    // book that never appears, so the walk refuses to leave the tree. The root
+    // itself is exempt (it defines the tree).
+    let real = if depth == 0 {
+        dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf())
+    } else {
+        match resolve_inside(dir, library_root) {
+            Some(real) => real,
+            None => return,
+        }
+    };
     if data_root.is_some_and(|d| real.starts_with(d)) {
-        return;
-    }
-    // `is_dir` follows symlinks, so a link inside the library pointing at audio
-    // elsewhere on the host would be walked and indexed — and then be unplayable,
-    // because the serve layer canonicalizes an episode's source and refuses
-    // anything outside the library root (TAD §7). A feed whose audio 404s is worse
-    // than a book that never appears, so the walk refuses to leave the tree.
-    if depth > 0 && !real.starts_with(library_root) {
-        tracing::warn!(
-            dir = %dir.display(),
-            target = %real.display(),
-            "skipping a link that leaves the library root"
-        );
         return;
     }
     if !visited.insert(real) {
@@ -1523,23 +1525,30 @@ fn walk_library(
 /// are logged, not silently dropped: a book missing from the UI with nothing in
 /// the log is the worst version of this.
 fn source_is_inside(src: &BookSource, library_root: &Path) -> bool {
-    let path = match src {
-        BookSource::File(p) => p.as_path(),
-        BookSource::Mp3Folder(d) => d.as_path(),
-    };
+    resolve_inside(src.path(), library_root).is_some()
+}
+
+/// Canonicalize `path` and keep it only if it resolves inside `root` — the
+/// symlink-containment rule shared by the walk, source vetting, and MP3-track
+/// collection: the serve layer canonicalizes every source and refuses anything
+/// outside the library root (TAD §7), so indexing an escapee would publish audio
+/// that 404s. A path that resolves outside the root, or can't be resolved at all,
+/// is dropped with a warning — a book missing from the UI with nothing in the log
+/// is the worst version of this.
+fn resolve_inside(path: &Path, root: &Path) -> Option<PathBuf> {
     match path.canonicalize() {
-        Ok(real) if real.starts_with(library_root) => true,
+        Ok(real) if real.starts_with(root) => Some(real),
         Ok(real) => {
             tracing::warn!(
                 path = %path.display(),
                 target = %real.display(),
                 "skipping a link that leaves the library root"
             );
-            false
+            None
         }
         Err(err) => {
             tracing::warn!(error = %err, path = %path.display(), "skipping an unreadable source");
-            false
+            None
         }
     }
 }
@@ -1744,15 +1753,6 @@ fn episode_ext(codec: Option<&str>, enc: Encoding) -> &'static str {
     }
 }
 
-/// The persisted label for a transcode mode (`book.transcode`).
-fn mode_label(mode: TranscodeMode) -> &'static str {
-    match mode {
-        TranscodeMode::Off => "off",
-        TranscodeMode::Aac => "aac",
-        TranscodeMode::Mp3 => "mp3",
-    }
-}
-
 /// The `book.transcode` value an already-indexed book *should* carry under the
 /// current setting, judged from its file extension alone — the idempotency guard
 /// runs before the probe and must not force one.
@@ -1763,16 +1763,16 @@ fn mode_label(mode: TranscodeMode) -> &'static str {
 /// the book on every single scan. An ALAC book therefore keeps its existing
 /// episodes until its source changes; `force_reingest = true` in its
 /// `.podspine.toml` picks up the new setting immediately.
-fn expected_transcode(input: &Path, mode: TranscodeMode) -> Option<&'static str> {
+fn expected_transcode(input: &Path, mode: TranscodeMode) -> Option<TranscodeMode> {
     if !mode.is_on() {
         // Nothing may stay transcoded once the flag is off.
-        return Some("off");
+        return Some(TranscodeMode::Off);
     }
     match ext_lower(input).as_deref() {
         // Tier-2 containers: never podcast-safe, so they get the target codec.
-        Some("flac" | "ogg" | "oga" | "opus") => Some(mode_label(mode)),
+        Some("flac" | "ogg" | "oga" | "opus") => Some(mode),
         // MP3 is podcast-safe and never re-encoded.
-        Some("mp3") => Some("off"),
+        Some("mp3") => Some(TranscodeMode::Off),
         _ => None,
     }
 }
@@ -1847,41 +1847,15 @@ fn mtime_epoch(p: &Path) -> Result<i64, ScanError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use podspine_test_support::{
+        ScratchDir, skip, skip_unless_ffmpeg, synth_sine, synth_three_chapters, synth_with_cover,
+    };
     use std::process::Command;
 
-    /// Skip the rest of a test that this machine cannot run — no ffmpeg, or no
-    /// encoder for the format the test needs.
-    ///
-    /// The `eprintln!` and the `return` live here, once, instead of at every call
-    /// site. Wherever ffmpeg IS installed — CI, most dev machines — they cannot
-    /// execute, and 62 copies of them dominated the uncovered-line count (35 of the
-    /// 56 lines in PR 152's diff).
-    ///
-    /// Measured, not assumed: llvm-cov attributes a macro body to each **expansion**,
-    /// not to the definition, so a call site still reports one unreachable line —
-    /// one instead of two, which took 63 lines off the report (scanner 158 → 105
-    /// misses, splitter 45 → 35). One line per skip is the floor for deciding at
-    /// runtime; something has to stand for "this didn't run".
-    macro_rules! skip {
-        ($($why:tt)*) => {{
-            eprintln!("skipping: {}", format_args!($($why)*));
-            return;
-        }};
-    }
-
-    fn ffmpeg_available() -> bool {
-        Command::new("ffmpeg")
-            .arg("-version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    }
-
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join("podspine-scan").join(name);
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// Crate-prefixed [`podspine_test_support::scratch`], so scanner test dirs
+    /// can't collide with another crate's over a shared short name.
+    fn scratch(name: &str) -> ScratchDir {
+        podspine_test_support::scratch(&format!("scan-{name}"))
     }
 
     #[test]
@@ -1909,72 +1883,16 @@ mod tests {
 
     /// Synthesize an AAC file; `chapters` true embeds three 10s chapters.
     fn synth(dir: &Path, chapters: bool) -> PathBuf {
-        let name = if chapters { "chapters" } else { "flat" };
-        let input = dir.join(format!("{name}.m4a"));
-        let mut cmd = Command::new("ffmpeg");
-        cmd.args(["-y", "-loglevel", "error", "-f", "lavfi", "-i"]);
         if chapters {
-            let meta = dir.join("meta.txt");
-            std::fs::write(
-                &meta,
-                ";FFMETADATA1\n\
-                 [CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=10000\ntitle=One\n\
-                 [CHAPTER]\nTIMEBASE=1/1000\nSTART=10000\nEND=20000\ntitle=Two\n\
-                 [CHAPTER]\nTIMEBASE=1/1000\nSTART=20000\nEND=30000\ntitle=Three\n",
-            )
-            .unwrap();
-            cmd.arg("sine=frequency=440:duration=30")
-                .arg("-i")
-                .arg(&meta)
-                .args(["-map_metadata", "1", "-map", "0:a", "-c:a", "aac"]);
+            synth_three_chapters(dir, "chapters.m4a")
         } else {
-            cmd.arg("sine=frequency=330:duration=12")
-                .args(["-c:a", "aac"]);
+            synth_sine(dir, "flat.m4a", 12.0)
         }
-        let status = cmd.arg(&input).status().expect("spawn ffmpeg");
-        assert!(status.success(), "ffmpeg synth failed");
-        input
     }
 
     fn touch(path: &Path) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, b"x").unwrap();
-    }
-
-    /// Synthesize an AAC file with an embedded (attached-picture) cover.
-    fn synth_with_cover(dir: &Path) -> PathBuf {
-        let input = dir.join("cover.m4a");
-        let status = Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-loglevel",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                "sine=frequency=440:duration=6",
-                "-f",
-                "lavfi",
-                "-i",
-                "color=c=blue:s=120x120:d=0.1",
-                "-map",
-                "0:a",
-                "-map",
-                "1:v",
-                "-frames:v",
-                "1",
-                "-c:a",
-                "aac",
-                "-c:v",
-                "mjpeg",
-                "-disposition:v:0",
-                "attached_pic",
-            ])
-            .arg(&input)
-            .status()
-            .expect("spawn ffmpeg");
-        assert!(status.success(), "ffmpeg cover synth failed");
-        input
     }
 
     /// Synthesize a real MP3 with an optional `track` tag. Returns `None` if the
@@ -2002,9 +1920,7 @@ mod tests {
 
     #[test]
     fn mp3_folder_serves_tracks_in_place_in_track_order() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         let root = scratch("mp3-order");
         let book = root.join("A Folder Book");
         // Filenames are deliberately NOT in track order; durations tag each track.
@@ -2066,9 +1982,7 @@ mod tests {
 
     #[test]
     fn mp3_folder_falls_back_to_filename_order_on_missing_track() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         let root = scratch("mp3-fallback");
         let book = root.join("Mixed Book");
         // One track tagged, one missing -> mixed -> filename sort (01 before 02).
@@ -2096,9 +2010,7 @@ mod tests {
 
     #[test]
     fn cue_sidecar_overrides_embedded_chapters() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         // synth() embeds THREE 10s chapters. A sibling .cue defines only TWO
         // chapters (0–5s, 5–30s), which must win.
         let dir = scratch("cue-sidecar");
@@ -2144,9 +2056,7 @@ mod tests {
 
     #[test]
     fn saver_mode_records_real_sizes_and_starts_but_deletes_the_files() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         let dir = scratch("saver-mode");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -2160,7 +2070,7 @@ mod tests {
             &data,
             &index,
             ScanOptions {
-                saver: true,
+                storage: StorageMode::Saver,
                 ..Default::default()
             },
             &podspine_config::BookOverrides::default(),
@@ -2194,7 +2104,7 @@ mod tests {
             &data,
             &index,
             ScanOptions {
-                saver: true,
+                storage: StorageMode::Saver,
                 ..Default::default()
             },
             &podspine_config::BookOverrides::default(),
@@ -2207,9 +2117,7 @@ mod tests {
 
     #[test]
     fn saver_reingests_migrated_rows_with_zero_start_sec() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         let dir = scratch("saver-migrated");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -2248,7 +2156,7 @@ mod tests {
             &data,
             &index,
             ScanOptions {
-                saver: true,
+                storage: StorageMode::Saver,
                 ..Default::default()
             },
             &podspine_config::BookOverrides::default(),
@@ -2334,23 +2242,36 @@ mod tests {
 
     #[test]
     fn expected_transcode_guards_a_toggle_without_probing() {
-        assert_eq!(mode_label(TranscodeMode::Off), "off");
-        assert_eq!(mode_label(TranscodeMode::Aac), "aac");
-        assert_eq!(mode_label(TranscodeMode::Mp3), "mp3");
+        // The persisted labels, via the canonical methods (all values pinned).
+        assert_eq!(TranscodeMode::Off.label(), "off");
+        assert_eq!(TranscodeMode::Aac.label(), "aac");
+        assert_eq!(TranscodeMode::Mp3.label(), "mp3");
         let flac = Path::new("/lib/book.flac");
         let m4b = Path::new("/lib/book.m4b");
         let mp3 = Path::new("/lib/book.mp3");
         // Flag off: nothing may stay transcoded, whatever the container.
-        assert_eq!(expected_transcode(flac, TranscodeMode::Off), Some("off"));
-        assert_eq!(expected_transcode(m4b, TranscodeMode::Off), Some("off"));
+        assert_eq!(
+            expected_transcode(flac, TranscodeMode::Off),
+            Some(TranscodeMode::Off)
+        );
+        assert_eq!(
+            expected_transcode(m4b, TranscodeMode::Off),
+            Some(TranscodeMode::Off)
+        );
         // Flag on: a Tier-2 container is definitely re-encoded...
-        assert_eq!(expected_transcode(flac, TranscodeMode::Aac), Some("aac"));
+        assert_eq!(
+            expected_transcode(flac, TranscodeMode::Aac),
+            Some(TranscodeMode::Aac)
+        );
         assert_eq!(
             expected_transcode(Path::new("/lib/b.opus"), TranscodeMode::Mp3),
-            Some("mp3")
+            Some(TranscodeMode::Mp3)
         );
         // ...MP3 definitely isn't...
-        assert_eq!(expected_transcode(mp3, TranscodeMode::Aac), Some("off"));
+        assert_eq!(
+            expected_transcode(mp3, TranscodeMode::Aac),
+            Some(TranscodeMode::Off)
+        );
         // ...and an mp4-family file is unknowable without a probe (AAC or ALAC), so
         // the guard abstains rather than re-ingesting the book on every scan.
         assert_eq!(expected_transcode(m4b, TranscodeMode::Aac), None);
@@ -2361,9 +2282,7 @@ mod tests {
     /// real output size.
     #[test]
     fn flac_with_cue_transcodes_to_aac_when_enabled() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         let dir = scratch("flac-transcode-aac");
         let Some(flac) = synth_encoded(&dir, "book.flac", &["-c:a", "flac"], 20) else {
             skip!("no flac encoder");
@@ -2389,7 +2308,11 @@ mod tests {
             &BookOverrides::default(),
         )
         .unwrap();
-        assert_eq!(book.transcode, "aac", "the effective mode is persisted");
+        assert_eq!(
+            book.transcode,
+            Some(TranscodeMode::Aac),
+            "the effective mode is persisted"
+        );
 
         let eps = index.episodes_for_book(&book.id).unwrap();
         assert_eq!(eps.len(), 2, "cue defines two chapters");
@@ -2420,9 +2343,7 @@ mod tests {
     /// re-encoded: the bytes clients get only exist under `<data_dir>`.
     #[test]
     fn chapterless_flac_transcodes_into_the_data_dir_instead_of_serving_in_place() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         let dir = scratch("flac-transcode-whole");
         let Some(flac) = synth_encoded(&dir, "whole.flac", &["-c:a", "flac"], 8) else {
             skip!("no flac encoder");
@@ -2463,9 +2384,7 @@ mod tests {
     /// this ffmpeg has no `libmp3lame`.
     #[test]
     fn flac_transcodes_to_mp3_when_that_target_is_chosen() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         let dir = scratch("flac-transcode-mp3");
         let Some(flac) = synth_encoded(&dir, "book.flac", &["-c:a", "flac"], 6) else {
             skip!("no flac encoder");
@@ -2488,7 +2407,7 @@ mod tests {
             &BookOverrides::default(),
         )
         .unwrap();
-        assert_eq!(book.transcode, "mp3");
+        assert_eq!(book.transcode, Some(TranscodeMode::Mp3));
         let eps = index.episodes_for_book(&book.id).unwrap();
         let e = &eps[0];
         assert!(e.file_path.ends_with(".mp3"), "{}", e.file_path);
@@ -2511,9 +2430,7 @@ mod tests {
     /// to regenerate or evict them).
     #[test]
     fn a_transcoded_saver_book_keeps_its_episodes_on_disk() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         let dir = scratch("flac-transcode-saver");
         let Some(flac) = synth_encoded(&dir, "book.flac", &["-c:a", "flac"], 12) else {
             skip!("no flac encoder");
@@ -2533,7 +2450,7 @@ mod tests {
             &data,
             &index,
             ScanOptions {
-                saver: true,
+                storage: StorageMode::Saver,
                 transcode: TranscodeMode::Aac,
                 ..Default::default()
             },
@@ -2541,10 +2458,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            book.storage_mode, "saver",
+            book.storage_mode,
+            Some(StorageMode::Saver),
             "the requested mode is still recorded"
         );
-        assert_eq!(book.transcode, "aac");
+        assert_eq!(book.transcode, Some(TranscodeMode::Aac));
         for e in index.episodes_for_book(&book.id).unwrap() {
             assert!(
                 Path::new(&e.file_path).exists(),
@@ -2592,9 +2510,7 @@ mod tests {
 
     #[test]
     fn switching_the_transcode_target_reclaims_the_previous_container() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         let dir = scratch("flac-transcode-reclaim");
         let Some(flac) = synth_encoded(&dir, "book.flac", &["-c:a", "flac"], 12) else {
             skip!("no flac encoder");
@@ -2663,9 +2579,7 @@ mod tests {
     /// playable rather than deleting them and then failing to replace them.
     #[test]
     fn a_failed_reingest_leaves_the_previous_episodes_in_place() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         let dir = scratch("flac-transcode-failed-reingest");
         let Some(flac) = synth_encoded(&dir, "book.flac", &["-c:a", "flac"], 12) else {
             skip!("no flac encoder");
@@ -2732,14 +2646,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A book indexed before Task 5.2 carries `transcode = ""`. It was necessarily
-    /// stream-copied, which is what `"off"` means — so it must NOT be re-ingested
+    /// A book indexed before Task 5.2 carries `transcode = None`. It was necessarily
+    /// stream-copied, which is what `Off` means — so it must NOT be re-ingested
     /// on upgrade, while a genuinely stale mode must be.
     #[test]
     fn a_pre_transcode_row_is_not_reingested_but_a_stale_mode_is() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         let dir = scratch("flac-transcode-upgrade");
         let Some(flac) = synth_encoded(&dir, "book.flac", &["-c:a", "flac"], 12) else {
             skip!("no flac encoder");
@@ -2765,11 +2677,11 @@ mod tests {
             )
             .unwrap()
         };
-        let stored_mode = |mode: &str| {
+        let stored_mode = |mode: Option<TranscodeMode>| {
             let book = index.get_book("u").unwrap().unwrap();
             index
                 .upsert_book(&BookRow {
-                    transcode: mode.to_string(),
+                    transcode: mode,
                     ..book
                 })
                 .unwrap();
@@ -2780,13 +2692,13 @@ mod tests {
         let survived = |ep: &str| std::fs::read(ep).unwrap() == b"sentinel";
 
         let book = scan();
-        assert_eq!(book.transcode, "off");
+        assert_eq!(book.transcode, Some(TranscodeMode::Off));
         let ep = index.episodes_for_book(&book.id).unwrap()[0]
             .file_path
             .clone();
 
-        // Pre-5.2 row: `""` means the same thing as `"off"` — no re-split.
-        stored_mode("");
+        // Pre-5.2 row: `None` means the same thing as `Off` — no re-split.
+        stored_mode(None);
         sentinel(&ep);
         scan();
         assert!(
@@ -2795,14 +2707,14 @@ mod tests {
         );
 
         // A row claiming a transcode while the flag is off is genuinely stale.
-        stored_mode("aac");
+        stored_mode(Some(TranscodeMode::Aac));
         sentinel(&ep);
         let back = scan();
         assert!(
             !survived(&ep),
             "a stale transcode mode must force a re-ingest"
         );
-        assert_eq!(back.transcode, "off");
+        assert_eq!(back.transcode, Some(TranscodeMode::Off));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2811,9 +2723,7 @@ mod tests {
     /// stale rows. And an unchanged setting must NOT re-ingest.
     #[test]
     fn toggling_transcode_reingests_a_flac_book() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         let dir = scratch("flac-transcode-toggle");
         let Some(flac) = synth_encoded(&dir, "book.flac", &["-c:a", "flac"], 8) else {
             skip!("no flac encoder");
@@ -2826,7 +2736,7 @@ mod tests {
 
         // Copy-first by default: a .flac episode.
         let off = scan(ScanOptions::default());
-        assert_eq!(off.transcode, "off");
+        assert_eq!(off.transcode, Some(TranscodeMode::Off));
         let before = index.episodes_for_book(&off.id).unwrap();
         assert!(before[0].file_path.ends_with(".flac"));
 
@@ -2835,7 +2745,7 @@ mod tests {
             transcode: TranscodeMode::Aac,
             ..Default::default()
         });
-        assert_eq!(on.transcode, "aac");
+        assert_eq!(on.transcode, Some(TranscodeMode::Aac));
         let after = index.episodes_for_book(&on.id).unwrap();
         assert!(
             after[0].file_path.ends_with(".m4a"),
@@ -2863,7 +2773,7 @@ mod tests {
         // transcoded copy under the data dir reclaimed rather than orphaned.
         let transcoded_copy = after[0].file_path.clone();
         let back = scan(ScanOptions::default());
-        assert_eq!(back.transcode, "off");
+        assert_eq!(back.transcode, Some(TranscodeMode::Off));
         let now = index.episodes_for_book(&back.id).unwrap();
         assert!(now[0].file_path.ends_with(".flac"));
         assert_eq!(
@@ -2879,9 +2789,7 @@ mod tests {
 
     #[test]
     fn flac_with_cue_splits_by_sidecar_no_reencode() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         let dir = scratch("flac-cue");
         // FLAC has no titled embedded chapters, so it leans on a .cue (PRD S7).
         let Some(flac) = synth_encoded(&dir, "book.flac", &["-c:a", "flac"], 20) else {
@@ -2913,9 +2821,7 @@ mod tests {
 
     #[test]
     fn flac_without_cue_degrades_to_single_episode() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         let dir = scratch("flac-plain");
         let Some(flac) = synth_encoded(&dir, "plain.flac", &["-c:a", "flac"], 8) else {
             skip!("no flac encoder");
@@ -2938,9 +2844,7 @@ mod tests {
 
     #[test]
     fn opus_single_file_served_in_place() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         let dir = scratch("opus");
         let flac = synth_encoded(&dir, "b.opus", &["-c:a", "libopus"], 6)
             .or_else(|| synth_encoded(&dir, "b.opus", &["-c:a", "opus", "-strict", "-2"], 6));
@@ -2977,9 +2881,7 @@ mod tests {
 
     #[test]
     fn scans_and_extracts_an_embedded_cover() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         let dir = scratch("cover");
         let input = synth_with_cover(&dir);
         let data = dir.join("data");
@@ -3013,9 +2915,7 @@ mod tests {
     /// real index rows — the case that returned `indexed=0` before this walk.
     #[test]
     fn scan_library_indexes_an_author_title_tree() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         let root = scratch("scan-nested");
         let mk = |rel: &str| {
             let path = root.join(rel);
@@ -3197,11 +3097,10 @@ mod tests {
             cover_path: None,
             source_path: source_str.clone(),
             source_mtime: 1,
-            status: "ready".into(),
-            storage_mode: String::new(),
+            storage_mode: None,
             default_cover_url: None,
             force_embedded: false,
-            transcode: "off".into(),
+            transcode: Some(TranscodeMode::Off),
         };
         // The ESTABLISHED feed is the suffixed `book-2` (indexed first, so earlier
         // created_at); the later duplicate is the base `book`. The survivor must be
@@ -3258,11 +3157,10 @@ mod tests {
                     cover_path: None,
                     source_path: missing.clone(),
                     source_mtime: 1,
-                    status: "ready".into(),
-                    storage_mode: String::new(),
+                    storage_mode: None,
                     default_cover_url: None,
                     force_embedded: false,
-                    transcode: "off".into(),
+                    transcode: Some(TranscodeMode::Off),
                 })
                 .unwrap();
         }
@@ -3282,9 +3180,7 @@ mod tests {
     /// is scan-then-prune, run twice.
     #[test]
     fn a_source_keeps_one_id_across_consecutive_reconciles() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         let root = scratch("dup-feed");
         let data = root.join("data");
         let index = Index::open_in_memory().unwrap();
@@ -3300,11 +3196,10 @@ mod tests {
                 cover_path: None,
                 source_path: root.join("gone.m4b").to_string_lossy().into_owned(),
                 source_mtime: 1,
-                status: "ready".into(),
-                storage_mode: String::new(),
+                storage_mode: None,
                 default_cover_url: None,
                 force_embedded: false,
-                transcode: "off".into(),
+                transcode: Some(TranscodeMode::Off),
             })
             .unwrap();
 
@@ -3365,11 +3260,10 @@ mod tests {
                     .to_string_lossy()
                     .into_owned(),
                 source_mtime: 1,
-                status: "ready".into(),
-                storage_mode: String::new(),
+                storage_mode: None,
                 default_cover_url: None,
                 force_embedded: false,
-                transcode: "off".into(),
+                transcode: Some(TranscodeMode::Off),
             })
             .unwrap();
 
@@ -3490,13 +3384,7 @@ mod tests {
         let mut seen = HashSet::new();
         let slugs: Vec<String> = found
             .iter()
-            .map(|s| {
-                let p = match s {
-                    BookSource::File(p) => p.as_path(),
-                    BookSource::Mp3Folder(d) => d.as_path(),
-                };
-                assign_slug(&slugify(&s.base_name(&root)), p, &index, &mut seen)
-            })
+            .map(|s| assign_slug(&slugify(&s.base_name(&root)), s.path(), &index, &mut seen))
             .collect();
         // `Dracula/inner.m4b` keeps `inner`; the folder book and the root file do not
         // trade ids.
@@ -3614,13 +3502,7 @@ mod tests {
         let mut seen = HashSet::new();
         let slugs: Vec<String> = discover(&root, &root.join("data"))
             .iter()
-            .map(|s| {
-                let p = match s {
-                    BookSource::File(p) => p.as_path(),
-                    BookSource::Mp3Folder(d) => d.as_path(),
-                };
-                assign_slug(&slugify(&s.base_name(&root)), p, &index, &mut seen)
-            })
+            .map(|s| assign_slug(&slugify(&s.base_name(&root)), s.path(), &index, &mut seen))
             .collect();
         // Not `dracula` and `dracula-2`, whose assignment would hinge on walk order.
         assert_eq!(slugs, vec!["author-one-dracula", "author-two-dracula"]);
@@ -3668,7 +3550,7 @@ mod tests {
     #[test]
     fn the_walk_stops_at_the_depth_limit() {
         let root = scratch("discover-depth");
-        let mut deep = root.clone();
+        let mut deep = root.to_path_buf();
         for i in 0..(MAX_LIBRARY_DEPTH + 3) {
             deep = deep.join(format!("level{i}"));
         }
@@ -3764,9 +3646,7 @@ mod tests {
 
     #[test]
     fn library_scan_disambiguates_same_named_books() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         // Two books that slugify identically, in separate folders. The folder
         // names must differ by more than case so they stay distinct on
         // case-insensitive filesystems (Windows/macOS) — `Dracula` and
@@ -3810,9 +3690,7 @@ mod tests {
 
     #[test]
     fn library_scan_skips_bad_books_without_aborting() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         let root = scratch("mixed-lib");
         synth(&root, true); // chapters.m4a at the top level (the good book)
         std::fs::write(root.join("broken.m4a"), b"not really audio").unwrap();
@@ -3858,16 +3736,13 @@ mod tests {
 
     #[test]
     fn scans_chapters_into_the_index_and_is_idempotent() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         let dir = scratch("chapters");
         let input = synth(&dir, true);
         let data = dir.join("data");
         let index = Index::open_in_memory().unwrap();
 
         let book = scan_book(&input, &data, &index).unwrap();
-        assert_eq!(book.status, "ready");
 
         let eps = index.episodes_for_book(&book.id).unwrap();
         assert_eq!(eps.len(), 3, "3 chapters -> 3 episodes");
@@ -3896,9 +3771,7 @@ mod tests {
 
     #[test]
     fn non_faststart_single_file_is_flagged_and_optionally_remuxed() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         let dir = scratch("faststart");
         // ffmpeg's mp4 muxer writes `moov` at the END by default → non-faststart.
         let input = synth(&dir, false);
@@ -3973,9 +3846,7 @@ mod tests {
 
     #[test]
     fn faststart_single_file_is_never_remuxed() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         let dir = scratch("faststart-ok");
         std::fs::create_dir_all(&dir).unwrap();
         let input = dir.join("fast.m4a");
@@ -4029,9 +3900,7 @@ mod tests {
 
     #[test]
     fn toggling_remux_flag_reingests_the_episode() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         let dir = scratch("faststart-toggle");
         let input = synth(&dir, false); // non-faststart m4a
         let data = dir.join("data");
@@ -4091,9 +3960,7 @@ mod tests {
 
     #[test]
     fn per_book_toml_overrides_apply_at_ingest() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         let root = scratch("perbook");
         let input = synth(&root, false); // flat.m4a (top-level single-file book)
         let side = input
@@ -4115,7 +3982,8 @@ mod tests {
         assert_eq!(books[0].title, "My Override");
         assert_eq!(books[0].author.as_deref(), Some("Someone"));
         assert_eq!(
-            books[0].storage_mode, "saver",
+            books[0].storage_mode,
+            Some(StorageMode::Saver),
             "per-book storage_mode is persisted for serve/evict"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -4123,9 +3991,7 @@ mod tests {
 
     #[test]
     fn editing_sidecar_reingests_without_touching_audio() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         let root = scratch("perbook-edit");
         let input = synth(&root, false);
         let data = root.join("data");
@@ -4134,7 +4000,7 @@ mod tests {
         // First scan: no sidecar → default title, `full`.
         scan_library(&root, &data, &index, ScanOptions::default());
         let before = index.list_books().unwrap().remove(0);
-        assert_eq!(before.storage_mode, "full");
+        assert_eq!(before.storage_mode, Some(StorageMode::Full));
         let guid_before = index.episodes_for_book(&before.id).unwrap()[0].guid.clone();
 
         // Edit the sidecar — the AUDIO file is untouched (same mtime). The edit
@@ -4148,7 +4014,11 @@ mod tests {
 
         let after = index.get_book(&before.id).unwrap().unwrap();
         assert_eq!(after.title, "Edited", "sidecar title applied on re-scan");
-        assert_eq!(after.storage_mode, "saver", "sidecar storage_mode applied");
+        assert_eq!(
+            after.storage_mode,
+            Some(StorageMode::Saver),
+            "sidecar storage_mode applied"
+        );
         // source_mtime is unchanged, so the episode guid is stable — a metadata
         // edit doesn't make podcast clients re-download.
         let guid_after = index.episodes_for_book(&before.id).unwrap()[0].guid.clone();
@@ -4162,9 +4032,7 @@ mod tests {
 
     #[test]
     fn toggling_only_force_embedded_reingests() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         let root = scratch("perbook-fe");
         let input = synth(&root, false);
         let data = root.join("data");
@@ -4191,11 +4059,135 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A database failure mid-reconcile is survived and logged, never a panic —
+    /// fault-inject by dropping the `book` table out from under a live [`Index`]
+    /// via a second connection. One reconcile then exercises every
+    /// skipped-with-a-warn arm: the duplicate-row collapse, the id-reuse map, the
+    /// disabled-book prune (the disabled path never probes, so no ffmpeg is
+    /// needed), the orphan prune, and the metrics book count.
+    #[test]
+    fn scan_survives_a_broken_index() {
+        let root = scratch("scan-broken-index");
+        let data = root.join("data");
+        std::fs::write(root.join("book.m4b"), b"").unwrap();
+        std::fs::write(root.join("book.podspine.toml"), b"disabled = true").unwrap();
+
+        let db = root.join("test.db");
+        let index = Index::open(&db).unwrap();
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute("DROP TABLE book", [])
+            .unwrap();
+
+        let summary = reconcile(&root, &data, &index, ScanOptions::default());
+        assert_eq!(
+            summary.skipped, 1,
+            "disabled book is still skipped when every index call fails"
+        );
+        assert_eq!(summary.pruned, 0, "failed orphan prune degrades to zero");
+    }
+
+    /// The duplicate-row collapse must survive a DELETE that fails while reads
+    /// still work — fault-inject with a second connection holding a write lock
+    /// (WAL keeps reads serving; the delete gets SQLITE_BUSY immediately).
+    #[test]
+    fn collapse_survives_a_failing_delete() {
+        let root = scratch("collapse-delete-fail");
+        let src = root.join("book.m4b");
+        std::fs::write(&src, b"").unwrap();
+        let canonical = src.canonicalize().unwrap().to_string_lossy().into_owned();
+
+        let db = root.join("test.db");
+        let index = Index::open(&db).unwrap();
+        for id in ["dup", "dup-2"] {
+            index
+                .upsert_book(&BookRow {
+                    id: id.into(),
+                    slug: id.into(),
+                    feed_id: podspine_index::capability::generate(),
+                    title: "Dup".into(),
+                    author: None,
+                    cover_path: None,
+                    source_path: canonical.clone(),
+                    source_mtime: 0,
+                    storage_mode: None,
+                    default_cover_url: None,
+                    force_embedded: false,
+                    transcode: None,
+                })
+                .unwrap();
+        }
+
+        let blocker = rusqlite::Connection::open(&db).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        collapse_duplicate_source_rows(&index, &root.join("data"));
+        drop(blocker);
+        assert_eq!(
+            index.list_books().unwrap().len(),
+            2,
+            "a failed delete leaves both rows (logged, not fatal)"
+        );
+    }
+
+    /// Symlinks that leave the library root, and dangling symlinks, are skipped
+    /// with a warning — never followed, never fatal.
+    #[cfg(unix)]
+    #[test]
+    fn walk_skips_escaping_and_dangling_symlinks() {
+        let base = scratch("walk-symlinks");
+        let library = base.join("library");
+        std::fs::create_dir_all(&library).unwrap();
+        let outside = base.join("outside.m4b");
+        std::fs::write(&outside, b"").unwrap();
+        std::os::unix::fs::symlink(&outside, library.join("escape.m4b")).unwrap();
+        std::os::unix::fs::symlink(base.join("nope.m4b"), library.join("dangling.m4b")).unwrap();
+
+        let index = Index::open_in_memory().unwrap();
+        let summary = scan_library(&library, &base.join("data"), &index, ScanOptions::default());
+        assert_eq!(summary.indexed, 0, "neither symlink is ingested");
+        assert!(index.list_books().unwrap().is_empty());
+    }
+
+    /// A DB that can't open must still fire the ready callback — otherwise the
+    /// server wedges on the "Scanning…" page forever (issue 159's failure mode).
+    #[test]
+    fn watch_loop_fires_ready_even_when_the_db_cannot_open() {
+        let root = scratch("watch-bad-db");
+        let db_as_dir = root.join("db-as-dir");
+        std::fs::create_dir_all(&db_as_dir).unwrap(); // a directory can't open as SQLite
+        let fired = std::cell::Cell::new(false);
+        let res = watch_loop(
+            &root,
+            &root.join("data"),
+            &db_as_dir,
+            ScanOptions::default(),
+            || fired.set(true),
+        );
+        assert!(res.is_err(), "the DB failure is surfaced");
+        assert!(fired.get(), "readiness flips even on DB failure");
+    }
+
+    /// An unwatchable library degrades to no-auto-refresh: the initial scan
+    /// still runs, ready still fires, and the loop exits cleanly.
+    #[test]
+    fn watch_loop_degrades_when_the_library_cannot_be_watched() {
+        let root = scratch("watch-no-library");
+        let missing = root.join("no-such-library");
+        let fired = std::cell::Cell::new(false);
+        let res = watch_loop(
+            &missing,
+            &root.join("data"),
+            &root.join("test.db"),
+            ScanOptions::default(),
+            || fired.set(true),
+        );
+        assert!(res.is_ok(), "watch failure is degradation, not an error");
+        assert!(fired.get(), "readiness flips without a watch");
+    }
+
     #[test]
     fn per_book_disabled_skips_and_prunes() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         let root = scratch("perbook-disabled");
         let input = synth(&root, false);
         let data = root.join("data");
@@ -4221,9 +4213,7 @@ mod tests {
 
     #[test]
     fn per_book_full_override_beats_global_saver() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         let root = scratch("perbook-full");
         let input = synth(&root, true); // chaptered, so storage_mode matters
         let side = input
@@ -4240,13 +4230,14 @@ mod tests {
             &data,
             &index,
             ScanOptions {
-                saver: true,
+                storage: StorageMode::Saver,
                 ..Default::default()
             },
         );
         let b = index.list_books().unwrap().remove(0);
         assert_eq!(
-            b.storage_mode, "full",
+            b.storage_mode,
+            Some(StorageMode::Full),
             "sidecar full overrides global saver"
         );
         let eps = index.episodes_for_book(&b.id).unwrap();
@@ -4259,9 +4250,7 @@ mod tests {
 
     #[test]
     fn sidecar_global_key_is_ignored_and_a_typo_is_non_fatal() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         // A server-global key in a sidecar is ignored (warned); the per-book key
         // still applies.
         let root = scratch("perbook-global");
@@ -4297,15 +4286,16 @@ mod tests {
             scan_library(&root2, &data2, &index2, ScanOptions::default()).indexed,
             1
         );
-        assert_eq!(index2.list_books().unwrap().remove(0).storage_mode, "full");
+        assert_eq!(
+            index2.list_books().unwrap().remove(0).storage_mode,
+            Some(StorageMode::Full)
+        );
         let _ = std::fs::remove_dir_all(&root2);
     }
 
     #[test]
     fn mp3_folder_with_no_probeable_tracks_is_skipped() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         let root = scratch("mp3-unprobeable");
         let book = root.join("Broken");
         std::fs::create_dir_all(&book).unwrap();
@@ -4323,13 +4313,11 @@ mod tests {
 
     #[test]
     fn library_watcher_indexes_a_book_added_after_startup() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
-        let root = scratch("watcher-lib");
-        let data = scratch("watcher-data");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::create_dir_all(&data).unwrap();
+        skip_unless_ffmpeg!();
+        // `keep()`: the watcher below must outlive this test body (see the
+        // teardown note at the bottom), so the drop-cleanup guard is defused.
+        let root = scratch("watcher-lib").keep();
+        let data = scratch("watcher-data").keep();
         let db_path = data.join("podspine.db");
         // Create the schema so the watcher and this test share the WAL db.
         drop(Index::open(&db_path).unwrap());
@@ -4448,9 +4436,7 @@ mod tests {
 
     #[test]
     fn scan_generates_a_thumbnail_and_reconcile_backfills_a_missing_one() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         let dir = scratch("thumb-gen");
         let data = dir.join("data");
         let input = synth_with_cover(&dir);
@@ -4498,9 +4484,7 @@ mod tests {
 
     #[test]
     fn a_failed_cover_re_extraction_keeps_the_previous_cover() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         let dir = scratch("cover-keep");
         let data = dir.join("data");
         let input = synth_with_cover(&dir);
@@ -4577,9 +4561,7 @@ mod tests {
 
     #[test]
     fn chapterless_file_becomes_a_single_episode() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         let dir = scratch("flat");
         let input = synth(&dir, false);
         let data = dir.join("data");
@@ -4608,9 +4590,7 @@ mod tests {
 
     #[test]
     fn mp3_folder_rescan_is_idempotent_and_stays_in_place() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         let root = scratch("mp3-idem");
         let book = root.join("Idem Book");
         let a = synth_mp3(&book, "01.mp3", Some(1), 2);
@@ -4667,7 +4647,7 @@ mod tests {
     // Two distinctly-named top-level books in `root`; `data` is kept OUTSIDE the
     // library so emptying `root` genuinely empties it (for the guard test). `tag`
     // keeps each test's scratch dirs distinct so parallel runs don't collide.
-    fn two_book_library(tag: &str) -> (PathBuf, PathBuf, Index) {
+    fn two_book_library(tag: &str) -> (ScratchDir, ScratchDir, Index) {
         let root = scratch(&format!("{tag}-lib"));
         let data = scratch(&format!("{tag}-data"));
         let a = synth(&root, false);
@@ -4680,9 +4660,7 @@ mod tests {
 
     #[test]
     fn prune_orphans_removes_a_deleted_source_and_its_split_output() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         // Chaptered books (not whole-file) so each materializes a per-chapter
         // split dir under <data> — that's the "split output" prune must remove.
         let root = scratch("prune-removes-lib");
@@ -4714,9 +4692,7 @@ mod tests {
 
     #[test]
     fn prune_orphans_empty_root_guard_preserves_the_index() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         let (root, data, index) = two_book_library("prune-guard");
         scan_library(&root, &data, &index, ScanOptions::default());
         assert_eq!(index.list_books().unwrap().len(), 2);
@@ -4739,9 +4715,7 @@ mod tests {
 
     #[test]
     fn reconcile_indexes_new_books_and_prunes_deleted_ones() {
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         let (root, data, index) = two_book_library("reconcile");
 
         // First pass indexes both, prunes none.

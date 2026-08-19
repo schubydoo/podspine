@@ -29,8 +29,7 @@ crates/
 ├── index             # rusqlite (bundled) store
 ├── feed              # RSS 2.0 + itunes/podcast + self-check
 ├── http              # Axum router + middleware
-├── ui                # maud pages
-└── cli               # podspine-cli POC
+└── ui                # maud pages
 ```
 
 ## Common commands

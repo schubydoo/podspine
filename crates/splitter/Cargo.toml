@@ -17,3 +17,4 @@ wait-timeout = { workspace = true }
 [dev-dependencies]
 # Integration tests probe the real fixture to get chapters and verify output durations.
 podspine-prober = { path = "../prober" }
+podspine-test-support = { path = "../test-support" }

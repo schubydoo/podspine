@@ -1222,17 +1222,7 @@ name = "podspine-chapters"
 version = "1.7.0"
 dependencies = [
  "podspine-prober",
-]
-
-[[package]]
-name = "podspine-cli"
-version = "1.7.0"
-dependencies = [
- "anyhow",
- "clap",
- "podspine-feed",
- "podspine-prober",
- "podspine-splitter",
+ "podspine-test-support",
 ]
 
 [[package]]
@@ -1240,6 +1230,7 @@ name = "podspine-config"
 version = "1.7.0"
 dependencies = [
  "clap",
+ "podspine-test-support",
  "serde",
  "thiserror",
  "toml",
@@ -1269,7 +1260,9 @@ dependencies = [
  "podspine-metrics",
  "podspine-scanner",
  "podspine-splitter",
+ "podspine-test-support",
  "podspine-ui",
+ "rusqlite",
  "tokio",
  "tower",
  "tower-http",
@@ -1282,6 +1275,8 @@ version = "1.7.0"
 dependencies = [
  "base64 0.23.1",
  "getrandom 0.4.3",
+ "podspine-config",
+ "podspine-test-support",
  "rusqlite",
  "thiserror",
 ]
@@ -1296,7 +1291,6 @@ dependencies = [
  "metrics-exporter-prometheus",
  "tokio",
  "tower",
- "tracing",
 ]
 
 [[package]]
@@ -1320,6 +1314,8 @@ dependencies = [
  "podspine-metrics",
  "podspine-prober",
  "podspine-splitter",
+ "podspine-test-support",
+ "rusqlite",
  "thiserror",
  "tracing",
 ]
@@ -1330,9 +1326,14 @@ version = "1.7.0"
 dependencies = [
  "podspine-metrics",
  "podspine-prober",
+ "podspine-test-support",
  "thiserror",
  "wait-timeout",
 ]
+
+[[package]]
+name = "podspine-test-support"
+version = "1.7.0"
 
 [[package]]
 name = "podspine-ui"
@@ -1340,6 +1341,7 @@ version = "1.7.0"
 dependencies = [
  "maud",
  "qrcode",
+ "tracing",
 ]
 
 [[package]]

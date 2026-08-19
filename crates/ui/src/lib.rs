@@ -570,7 +570,12 @@ fn qr_svg_sized(data: &str, px: u32) -> String {
             .min_dimensions(px, px)
             .quiet_zone(true)
             .build(),
-        Err(_) => String::new(),
+        // Practically unreachable (QR capacity ~2.9 KB; feed URLs are far
+        // shorter) — logged so the impossible is noticed if it ever happens.
+        Err(err) => {
+            tracing::warn!(error = %err, "QR encoding failed; rendering without a code");
+            String::new()
+        }
     }
 }
 
@@ -663,6 +668,14 @@ mod tests {
         assert!(
             !dark.contains("aria-pressed=\"true\">Auto</button>"),
             "Auto not active in dark"
+        );
+
+        // Light: an explicit data-theme="light" (the third attr arm).
+        let light = index_page(&[], Theme::Light).into_string();
+        assert!(light.contains("<html lang=\"en\" data-theme=\"light\">"));
+        assert!(
+            light.contains("aria-pressed=\"true\">Light</button>"),
+            "Light active"
         );
     }
 

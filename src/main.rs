@@ -7,7 +7,7 @@
 //! [`podspine_scanner`].
 
 use anyhow::{Context, Result};
-use podspine_config::{Config, StorageMode};
+use podspine_config::Config;
 use podspine_http::{AppState, serve};
 use podspine_index::Index;
 use podspine_scanner::{ScanOptions, spawn_library_watcher};
@@ -42,10 +42,9 @@ async fn main() -> Result<()> {
 
     let db_path = config.data_dir.join("podspine.db");
     let index = Index::open(&db_path).context("opening the index")?;
-    let saver = matches!(config.storage_mode, StorageMode::Saver);
     let scan_opts = ScanOptions {
         force_embedded: config.force_embedded_chapters,
-        saver,
+        storage: config.storage_mode,
         remux_non_faststart: config.remux_non_faststart,
         transcode: config.transcode,
     };
@@ -56,10 +55,11 @@ async fn main() -> Result<()> {
         &config.data_dir,
         &config.library,
         config.default_cover_url.clone(),
-        saver,
+        config.storage_mode,
         config.cache_size_bytes,
         config.cache_ttl,
-    );
+    )
+    .context("canonicalizing the data dir / library root")?;
 
     // First-run UX (issue 159): don't hold the HTTP port down behind the initial
     // reconcile. A large first scan takes minutes to split, and anything in front

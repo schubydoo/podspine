@@ -44,7 +44,7 @@ The crates are described below; the pipeline runs left to right, with the SQLite
 | `metrics` | Optional Prometheus instrumentation: metric names, the recorder, the helpers other crates record through, and a standalone `/metrics` listener bound separately from the feed server. A no-op unless `--metrics-bind` is set. |
 
 Plus the `podspine` server binary (`src/main.rs`, wiring config → scan → watch →
-serve) and a `podspine-cli` proof-of-concept for the single-file split pipeline.
+serve).
 
 ## Ingest data flow
 

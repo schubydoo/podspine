@@ -48,8 +48,11 @@ use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 use podspine_feed::{FeedBook, FeedEpisode, render_checked};
-use podspine_index::{BookRow, Index};
-use podspine_splitter::{ChapterCut, cover_thumb_path, remux_faststart, split_chapter};
+use podspine_index::{BookRow, Index, StorageMode, TranscodeMode};
+use podspine_splitter::{
+    ChapterCut, cover_thumb_path, episode_file_name, is_episode_stem, remux_faststart,
+    split_chapter,
+};
 use podspine_ui::{
     BookCard, BookDetail, Theme, book_page, index_page, scanning_page, subscribe_page,
 };
@@ -154,9 +157,10 @@ pub struct AppState {
     pub library_dir: PathBuf,
     /// Feed-level fallback cover URL for books with no embedded art.
     pub default_cover_url: Option<String>,
-    /// `saver` storage mode: episode files aren't pre-split — the audio handler
-    /// regenerates a chapter on demand and caches it. `false` = pre-split.
-    pub saver: bool,
+    /// Server-default storage mode. Under [`StorageMode::Saver`], episode files
+    /// aren't pre-split — the audio handler regenerates a chapter on demand and
+    /// caches it; `Full` = pre-split. A book carrying its own mode overrides it.
+    pub storage: StorageMode,
     /// `saver`-mode cache cap in bytes (`None` = unbounded).
     pub cache_size_bytes: Option<u64>,
     /// `saver`-mode cache TTL (`None` = size-only eviction).
@@ -177,8 +181,15 @@ pub struct AppState {
 impl AppState {
     /// Build state, canonicalizing the data dir **and** the library root for the
     /// path-safety checks (served files must stay under one of them). The
-    /// `saver`/cache args come from [`podspine_config::Config`] (pre-split
-    /// defaults: `saver=false`).
+    /// storage/cache args come from [`podspine_config::Config`] (pre-split
+    /// default: `StorageMode::Full`).
+    ///
+    /// Errors when either root can't be canonicalized. Both are guaranteed to
+    /// exist by `Config::validate` (library checked, data dir created), so a
+    /// failure here means the filesystem changed under us — and falling back to
+    /// the as-given path would make every containment check fail closed: a
+    /// server that silently 404s everything. Failing startup is louder and
+    /// therefore kinder.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         index: Index,
@@ -186,28 +197,28 @@ impl AppState {
         data_dir: &FsPath,
         library_dir: &FsPath,
         default_cover_url: Option<String>,
-        saver: bool,
+        storage: StorageMode,
         cache_size_bytes: Option<u64>,
         cache_ttl: Option<Duration>,
-    ) -> Self {
-        let data_dir = data_dir
-            .canonicalize()
-            .unwrap_or_else(|_| data_dir.to_path_buf());
-        let library_dir = library_dir
-            .canonicalize()
-            .unwrap_or_else(|_| library_dir.to_path_buf());
-        Self {
+    ) -> std::io::Result<Self> {
+        let data_dir = data_dir.canonicalize().inspect_err(|err| {
+            tracing::error!(path = %data_dir.display(), error = %err, "cannot canonicalize the data dir");
+        })?;
+        let library_dir = library_dir.canonicalize().inspect_err(|err| {
+            tracing::error!(path = %library_dir.display(), error = %err, "cannot canonicalize the library root");
+        })?;
+        Ok(Self {
             index: Arc::new(Mutex::new(index)),
             base_url,
             data_dir,
             library_dir,
             default_cover_url,
-            saver,
+            storage,
             cache_size_bytes,
             cache_ttl,
             inflight: Arc::new(Mutex::new(HashMap::new())),
             ready: Arc::new(AtomicBool::new(true)),
-        }
+        })
     }
 
     /// Flip the "initial scan finished" flag. The server binary sets it `false`
@@ -336,6 +347,29 @@ async fn index(
     Ok(Html(index_page(&cards, theme).into_string()))
 }
 
+/// Build the [`BookDetail`] view model the detail pages share: count the book's
+/// episodes and derive the public feed/subscribe URLs from its capability id.
+/// Each handler keeps its own lookup (slug vs `feed_id`) and page template.
+fn book_detail(state: &AppState, book: BookRow) -> Result<BookDetail, AppError> {
+    let episode_count = {
+        let index = state.index.lock().map_err(AppError::internal)?;
+        index
+            .episodes_for_book(&book.id)
+            .map_err(AppError::internal)?
+            .len()
+    };
+    Ok(BookDetail {
+        feed_url: format!("{}/feed/{}.xml", state.base_url, book.feed_id),
+        subscribe_url: format!("{}/subscribe/{}", state.base_url, book.feed_id),
+        slug: book.slug,
+        feed_id: book.feed_id,
+        title: book.title,
+        author: book.author,
+        has_cover: book.cover_path.is_some(),
+        episode_count,
+    })
+}
+
 /// `GET /book/{slug}` — a book's page: copy-feed-URL, QR, how-to panel.
 async fn book(
     State(state): State<AppState>,
@@ -346,29 +380,14 @@ async fn book(
         return Err(AppError::NotFound);
     }
     let theme = theme_from_cookie(&headers);
-    let (book, episode_count) = {
+    let book = {
         let index = state.index.lock().map_err(AppError::internal)?;
-        let book = index
+        index
             .get_book_by_slug(&slug)
             .map_err(AppError::internal)?
-            .ok_or(AppError::NotFound)?;
-        let count = index
-            .episodes_for_book(&book.id)
-            .map_err(AppError::internal)?
-            .len();
-        (book, count)
+            .ok_or(AppError::NotFound)?
     };
-
-    let detail = BookDetail {
-        feed_url: format!("{}/feed/{}.xml", state.base_url, book.feed_id),
-        subscribe_url: format!("{}/subscribe/{}", state.base_url, book.feed_id),
-        slug: book.slug,
-        feed_id: book.feed_id,
-        title: book.title,
-        author: book.author,
-        has_cover: book.cover_path.is_some(),
-        episode_count,
-    };
+    let detail = book_detail(&state, book)?;
     Ok(Html(book_page(&detail, theme).into_string()))
 }
 
@@ -384,28 +403,14 @@ async fn subscribe(
         return Err(AppError::NotFound);
     }
     let theme = theme_from_cookie(&headers);
-    let (book, episode_count) = {
+    let book = {
         let index = state.index.lock().map_err(AppError::internal)?;
-        let book = index
+        index
             .get_book_by_feed_id(&feed_id)
             .map_err(AppError::internal)?
-            .ok_or(AppError::NotFound)?;
-        let count = index
-            .episodes_for_book(&book.id)
-            .map_err(AppError::internal)?
-            .len();
-        (book, count)
+            .ok_or(AppError::NotFound)?
     };
-    let detail = BookDetail {
-        feed_url: format!("{}/feed/{}.xml", state.base_url, book.feed_id),
-        subscribe_url: format!("{}/subscribe/{}", state.base_url, book.feed_id),
-        slug: book.slug,
-        feed_id: book.feed_id,
-        title: book.title,
-        author: book.author,
-        has_cover: book.cover_path.is_some(),
-        episode_count,
-    };
+    let detail = book_detail(&state, book)?;
     Ok(Html(subscribe_page(&detail, theme).into_string()))
 }
 
@@ -557,6 +562,31 @@ fn book_cover_path(state: &AppState, feed_id: &str) -> Result<String, AppError> 
         .ok_or(AppError::NotFound)
 }
 
+/// The A01 containment check every serve path funnels through (TAD §7):
+/// canonicalize `path` (resolving `..` and symlinks) and confirm the result stays
+/// under the trusted `root`. A path that can't be canonicalized (missing file) or
+/// that resolves outside `root` is rejected as `NotFound` — never a distinct
+/// status, so the rejection is not an existence oracle. `what` names the site in
+/// the operator's log; the client never sees it. `number` is the episode number
+/// when the site has one — it identifies the poisoned row in the warn.
+fn canonical_under(
+    path: &FsPath,
+    root: &FsPath,
+    what: &'static str,
+    feed_id: &str,
+    number: Option<u32>,
+) -> Result<PathBuf, AppError> {
+    let canonical = path.canonicalize().map_err(|_| AppError::NotFound)?;
+    if !canonical.starts_with(root) {
+        match number {
+            Some(number) => tracing::warn!(feed_id, number, "{what}"),
+            None => tracing::warn!(feed_id, "{what}"),
+        }
+        return Err(AppError::NotFound);
+    }
+    Ok(canonical)
+}
+
 /// Canonicalize a stored image path and confirm it stays under the data dir (a
 /// resolved path that escapes it is rejected as `NotFound`, never served). Fails
 /// with `NotFound` when the file doesn't exist — which the thumbnail handler relies
@@ -566,14 +596,13 @@ fn resolve_under_data_dir(
     data_dir: &FsPath,
     feed_id: &str,
 ) -> Result<PathBuf, AppError> {
-    let canonical = PathBuf::from(path)
-        .canonicalize()
-        .map_err(|_| AppError::NotFound)?;
-    if !canonical.starts_with(data_dir) {
-        tracing::warn!(feed_id, "resolved cover path escaped the data dir");
-        return Err(AppError::NotFound);
-    }
-    Ok(canonical)
+    canonical_under(
+        FsPath::new(path),
+        data_dir,
+        "resolved cover path escaped the data dir",
+        feed_id,
+        None,
+    )
 }
 
 /// Serve an on-disk image with content-addressed caching: an `ETag` (a blake3 hash
@@ -729,26 +758,22 @@ fn build_feed_xml(state: &AppState, feed_id: &str) -> Result<String, AppError> {
 /// What `/audio` needs: the canonical target file (which may not exist yet in
 /// `saver` mode) and, in `saver` mode, everything to regenerate it on demand.
 /// Whether a book's effective storage mode is `saver`: its per-book
-/// `.podspine.toml` override (Sprint 6.4) if set, else the server default. An
-/// empty string is a pre-6.4 row that follows the server config until re-scanned.
+/// `.podspine.toml` override (Sprint 6.4) if set, else the server default. A
+/// `None` is a pre-6.4 row that follows the server config until re-scanned.
 /// Whether this book's episodes were **re-encoded** at ingest (Task 5.2).
 ///
 /// A re-encode is not byte-reproducible across ffmpeg builds, so such an episode
 /// must never be regenerated on demand (the rebuilt file's length could no longer
 /// match the `enclosure length` already published in the feed) and must never be
 /// evicted (nothing could rebuild it). Both callers below therefore treat a
-/// transcoded book as `full`, whatever its `storage_mode` says. `""` is a pre-5.2
-/// row, which was necessarily stream-copied.
+/// transcoded book as `full`, whatever its `storage_mode` says. `None` is a
+/// pre-5.2 row, which was necessarily stream-copied.
 fn book_is_transcoded(book: &BookRow) -> bool {
-    !matches!(book.transcode.as_str(), "" | "off")
+    book.transcode.is_some_and(TranscodeMode::is_on)
 }
 
-fn book_is_saver(book: &BookRow, global_saver: bool) -> bool {
-    match book.storage_mode.as_str() {
-        "saver" => true,
-        "full" => false,
-        _ => global_saver,
-    }
+fn book_is_saver(book: &BookRow, global: StorageMode) -> bool {
+    book.storage_mode.unwrap_or(global) == StorageMode::Saver
 }
 
 struct AudioTarget {
@@ -835,13 +860,13 @@ fn resolve_audio_target(
     // Returns before the data-dir/regeneration logic below, so a poisoned row can
     // never fall through into it.
     if !ep.source_path.is_empty() && ep.file_path == ep.source_path {
-        let src = FsPath::new(&ep.source_path)
-            .canonicalize()
-            .map_err(|_| AppError::NotFound)?;
-        if !src.starts_with(&state.library_dir) {
-            tracing::warn!(feed_id, number, "in-place audio escaped the library root");
-            return Err(AppError::NotFound);
-        }
+        let src = canonical_under(
+            FsPath::new(&ep.source_path),
+            &state.library_dir,
+            "in-place audio escaped the library root",
+            feed_id,
+            Some(number),
+        )?;
         let src_len = std::fs::metadata(&src)
             .map(|m| m.len() as i64)
             .map_err(|_| AppError::NotFound)?;
@@ -883,7 +908,7 @@ fn resolve_audio_target(
         tracing::warn!(feed_id, number, "resolved audio path escaped the data dir");
         return Err(AppError::NotFound);
     }
-    let path = out_dir.join(format!("{:03}.{out_ext}", idx + 1));
+    let path = out_dir.join(episode_file_name(idx as usize, &out_ext));
 
     // Two kinds of episode materialize under the data dir here:
     let regen = if !ep.source_path.is_empty() && ep.needs_faststart {
@@ -894,13 +919,13 @@ fn resolve_audio_target(
         // `source_path` is NOT remuxed into its container here; it drops to the
         // chaptered arm and serves its actual split (or 404s). Validate the source
         // stays under the library root first (the A01 rule), 404 on escape.
-        let src = FsPath::new(&ep.source_path)
-            .canonicalize()
-            .map_err(|_| AppError::NotFound)?;
-        if !src.starts_with(&state.library_dir) {
-            tracing::warn!(feed_id, number, "remux source escaped the library root");
-            return Err(AppError::NotFound);
-        }
+        let src = canonical_under(
+            FsPath::new(&ep.source_path),
+            &state.library_dir,
+            "remux source escaped the library root",
+            feed_id,
+            Some(number),
+        )?;
         Some(Regen {
             source: src,
             out_dir,
@@ -910,7 +935,7 @@ fn resolve_audio_target(
                 duration_sec: ep.duration_sec,
             },
         })
-    } else if book_is_saver(&book, state.saver)
+    } else if book_is_saver(&book, state.storage)
         && !book_is_transcoded(&book)
         && FsPath::new(&book.source_path).is_file()
     {
@@ -924,17 +949,13 @@ fn resolve_audio_target(
         // library root before it can reach ffmpeg. Checked here rather than at
         // regen time so a poisoned row is rejected before anything is opened or
         // written — including when the cached chapter happens to already exist.
-        let src = FsPath::new(&book.source_path)
-            .canonicalize()
-            .map_err(|_| AppError::NotFound)?;
-        if !src.starts_with(&state.library_dir) {
-            tracing::warn!(
-                feed_id,
-                number,
-                "saver regen source escaped the library root"
-            );
-            return Err(AppError::NotFound);
-        }
+        let src = canonical_under(
+            FsPath::new(&book.source_path),
+            &state.library_dir,
+            "saver regen source escaped the library root",
+            feed_id,
+            Some(number),
+        )?;
         Some(Regen {
             source: src,
             out_dir,
@@ -1033,19 +1054,23 @@ async fn enforce_cache(state: &AppState, keep: &FsPath) {
     // without holding the lock across the `is_file` stats.
     let sources: Vec<(String, bool)> = {
         let Ok(index) = state.index.lock() else {
+            tracing::warn!("cache eviction skipped: index lock poisoned");
             return;
         };
         match index.list_books() {
             Ok(bs) => bs
                 .into_iter()
                 .map(|b| {
-                    let regen = book_is_saver(&b, state.saver)
+                    let regen = book_is_saver(&b, state.storage)
                         && !book_is_transcoded(&b)
                         && FsPath::new(&b.source_path).is_file();
                     (b.id, regen)
                 })
                 .collect(),
-            Err(_) => return,
+            Err(err) => {
+                tracing::warn!(error = %err, "cache eviction skipped: listing books failed");
+                return;
+            }
         }
     };
     let regenerable: HashSet<PathBuf> = sources
@@ -1054,7 +1079,11 @@ async fn enforce_cache(state: &AppState, keep: &FsPath) {
         .map(|(id, _)| books.join(id))
         .collect();
     let keep = keep.to_path_buf();
-    let _ = tokio::task::spawn_blocking(move || evict(&books, cap, ttl, &keep, &regenerable)).await;
+    if let Err(err) =
+        tokio::task::spawn_blocking(move || evict(&books, cap, ttl, &keep, &regenerable)).await
+    {
+        tracing::warn!(error = %err, "cache eviction task failed");
+    }
 }
 
 /// Collect cached chapter files (numeric stems under `books/*/`) from
@@ -1091,7 +1120,7 @@ fn evict(
             let numeric = p
                 .file_stem()
                 .and_then(|s| s.to_str())
-                .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
+                .is_some_and(is_episode_stem);
             if !numeric {
                 continue;
             }
@@ -1167,8 +1196,10 @@ enum AppError {
 }
 
 impl AppError {
-    /// Collapse any error into `Internal` (the detail is logged elsewhere).
-    fn internal<E>(_e: E) -> Self {
+    /// Collapse any error into `Internal`, logging the detail — the client sees
+    /// only a 500, but the operator gets the cause.
+    fn internal<E: std::fmt::Display>(e: E) -> Self {
+        tracing::error!(error = %e, "internal error");
         AppError::Internal
     }
 }
@@ -1193,6 +1224,7 @@ impl IntoResponse for AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use podspine_test_support::scratch;
 
     #[test]
     fn mime_by_extension() {
@@ -1204,9 +1236,98 @@ mod tests {
         assert_eq!(mime_for("/x/blob"), "audio/mp4");
     }
 
+    /// `evict` deletes files — pin its guard branches directly: a regenerable
+    /// book dir that vanished, a directory entry with a numeric stem, a
+    /// non-regenerable sibling, the under-cap early return, and the
+    /// stop-once-under-cap break.
+    #[test]
+    fn evict_edge_branches() {
+        let dir = scratch("http-evict-edges");
+        let books = dir.path().join("books");
+        let b1 = books.join("b1");
+        std::fs::create_dir_all(&b1).unwrap();
+        // Chapters: 001 backdated (the LRU victim), 002 fresh. A cover (skipped
+        // by stem) and a directory with a chapter-shaped name (skipped by kind).
+        let old = b1.join("001.m4a");
+        let newer = b1.join("002.m4a");
+        std::fs::write(&old, [0u8; 10]).unwrap();
+        std::fs::write(&newer, [0u8; 10]).unwrap();
+        std::fs::write(b1.join("cover.jpg"), [0u8; 64]).unwrap();
+        std::fs::create_dir(b1.join("003.m4a")).unwrap();
+        let past = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+
+        // Non-regenerable sibling: never a candidate.
+        let b2 = books.join("b2");
+        std::fs::create_dir_all(&b2).unwrap();
+        std::fs::write(b2.join("001.m4a"), [0u8; 10]).unwrap();
+
+        // Regenerable set: b1, plus a dir that no longer exists on disk.
+        let regenerable: HashSet<PathBuf> = [b1.clone(), books.join("gone")].into();
+
+        // Under cap: nothing deleted.
+        evict(&books, Some(1024), None, FsPath::new("/keep"), &regenerable);
+        assert!(old.exists() && newer.exists(), "under cap deletes nothing");
+
+        // Cap of one file: delete oldest-first, then stop once under cap.
+        evict(&books, Some(10), None, FsPath::new("/keep"), &regenerable);
+        assert!(!old.exists(), "oldest chapter evicted first");
+        assert!(newer.exists(), "eviction stops once under cap");
+        assert!(b1.join("cover.jpg").exists(), "covers are never candidates");
+        assert!(
+            b1.join("003.m4a").is_dir(),
+            "directories are never candidates"
+        );
+        assert!(
+            b2.join("001.m4a").exists(),
+            "non-regenerable book untouched"
+        );
+    }
+
+    /// Eviction is best-effort and must never panic or fail a request — fault-
+    /// inject both abandon paths: a database failure (the `book` table dropped
+    /// out from under a live [`Index`] by a second connection) and a poisoned
+    /// index lock. Each returns quietly after logging a warn.
+    #[tokio::test]
+    async fn enforce_cache_survives_a_broken_index_and_a_poisoned_lock() {
+        let dir = scratch("http-enforce-cache-faults");
+        let db = dir.path().join("test.db");
+        let state = AppState::new(
+            Index::open(&db).unwrap(),
+            "http://test".to_string(),
+            dir.path(),
+            dir.path(),
+            None,
+            StorageMode::Saver,
+            Some(1), // a cap, so eviction doesn't no-op before the fault
+            None,
+        )
+        .expect("test dirs canonicalize");
+
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute("DROP TABLE book", [])
+            .unwrap();
+        enforce_cache(&state, FsPath::new("/keep")).await; // DB error: skipped, logged
+
+        let poison = state.clone();
+        std::thread::spawn(move || {
+            let _guard = poison.index.lock().unwrap();
+            panic!("poison the index lock");
+        })
+        .join()
+        .expect_err("the poisoning thread must panic");
+        enforce_cache(&state, FsPath::new("/keep")).await; // poisoned lock: skipped, logged
+    }
+
     #[test]
     fn book_is_saver_follows_per_book_then_global() {
-        let mk = |mode: &str| BookRow {
+        let mk = |mode: Option<StorageMode>| BookRow {
             id: "b".into(),
             slug: "b".into(),
             feed_id: "cap".into(),
@@ -1215,23 +1336,28 @@ mod tests {
             cover_path: None,
             source_path: "/x".into(),
             source_mtime: 0,
-            status: "ready".into(),
-            storage_mode: mode.into(),
+            storage_mode: mode,
             default_cover_url: None,
             force_embedded: false,
-            transcode: String::new(),
+            transcode: None,
         };
         // An explicit per-book mode wins regardless of the server default.
-        assert!(book_is_saver(&mk("saver"), false));
-        assert!(!book_is_saver(&mk("full"), true));
-        // An empty mode (a pre-6.4 row) follows the server default.
-        assert!(book_is_saver(&mk(""), true));
-        assert!(!book_is_saver(&mk(""), false));
+        assert!(book_is_saver(
+            &mk(Some(StorageMode::Saver)),
+            StorageMode::Full
+        ));
+        assert!(!book_is_saver(
+            &mk(Some(StorageMode::Full)),
+            StorageMode::Saver
+        ));
+        // No mode (a pre-6.4 row) follows the server default.
+        assert!(book_is_saver(&mk(None), StorageMode::Saver));
+        assert!(!book_is_saver(&mk(None), StorageMode::Full));
     }
 
     #[test]
     fn a_transcoded_book_is_never_treated_as_regenerable() {
-        let mk = |storage: &str, transcode: &str| BookRow {
+        let mk = |storage: Option<StorageMode>, transcode: Option<TranscodeMode>| BookRow {
             id: "b".into(),
             slug: "b".into(),
             feed_id: "cap".into(),
@@ -1240,20 +1366,23 @@ mod tests {
             cover_path: None,
             source_path: "/x".into(),
             source_mtime: 0,
-            status: "ready".into(),
-            storage_mode: storage.into(),
+            storage_mode: storage,
             default_cover_url: None,
             force_embedded: false,
-            transcode: transcode.into(),
+            transcode,
         };
+        let saver = Some(StorageMode::Saver);
         // A re-encode can't be rebuilt byte-for-byte, so `saver` must not apply.
-        assert!(book_is_transcoded(&mk("saver", "aac")));
-        assert!(book_is_transcoded(&mk("saver", "mp3")));
+        assert!(book_is_transcoded(&mk(saver, Some(TranscodeMode::Aac))));
+        assert!(book_is_transcoded(&mk(saver, Some(TranscodeMode::Mp3))));
         // Stream-copied books (and pre-5.2 rows) stay regenerable.
-        assert!(!book_is_transcoded(&mk("saver", "off")));
-        assert!(!book_is_transcoded(&mk("saver", "")));
+        assert!(!book_is_transcoded(&mk(saver, Some(TranscodeMode::Off))));
+        assert!(!book_is_transcoded(&mk(saver, None)));
         // The two predicates compose: still a saver book, but not a regenerable one.
-        assert!(book_is_saver(&mk("saver", "aac"), false));
+        assert!(book_is_saver(
+            &mk(saver, Some(TranscodeMode::Aac)),
+            StorageMode::Full
+        ));
     }
 
     #[test]
@@ -1388,8 +1517,7 @@ mod tests {
 
     #[test]
     fn evict_enforces_size_cap_and_skips_non_chapter_files() {
-        let dir = std::env::temp_dir().join("podspine-evict-size");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = scratch("evict-size");
         let books = dir.join("books");
         let bk = books.join("b1");
         for n in 1..=3 {
@@ -1407,13 +1535,11 @@ mod tests {
             "non-chapter files are untouched"
         );
         assert!(numeric_files(&bk) <= 1, "size cap evicted older chapters");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn evict_drops_ttl_expired_chapters_except_keep() {
-        let dir = std::env::temp_dir().join("podspine-evict-ttl");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = scratch("evict-ttl");
         let books = dir.join("books");
         let bk = books.join("b1");
         touch(&bk.join("001.m4a"), 100);
@@ -1432,13 +1558,11 @@ mod tests {
 
         assert!(!bk.join("001.m4a").exists(), "TTL-expired chapter evicted");
         assert!(keep.exists(), "keep is never evicted, even past TTL");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn evict_is_a_noop_without_a_cap_or_ttl() {
-        let dir = std::env::temp_dir().join("podspine-evict-noop");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = scratch("evict-noop");
         let books = dir.join("books");
         let bk = books.join("b1");
         touch(&bk.join("001.m4a"), 100);
@@ -1448,7 +1572,6 @@ mod tests {
 
         assert!(keep.exists());
         assert_eq!(numeric_files(&bk), 1, "nothing evicted when unbounded");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1469,8 +1592,7 @@ mod tests {
         // (a directory source — e.g. an MP3 folder, or a legacy pre-6.2 copy).
         // Only the regenerable one may be evicted; the non-regenerable files must
         // survive even a tiny cap (Greptile P1) — nothing would rebuild them.
-        let dir = std::env::temp_dir().join("podspine-evict-mp3safe");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = scratch("evict-mp3safe");
         let books = dir.join("books");
         let split = books.join("splitbook"); // regenerable
         touch(&split.join("001.m4a"), 100);
@@ -1492,7 +1614,6 @@ mod tests {
             !split.join("001.m4a").exists(),
             "regenerable chapters are still evicted under the cap"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

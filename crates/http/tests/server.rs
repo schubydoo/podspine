@@ -12,7 +12,10 @@ use tower::ServiceExt;
 use podspine_http::{AppState, router};
 use podspine_index::{BookRow, EpisodeRow, Index};
 use podspine_scanner::{
-    BookOverrides, ScanOptions, TranscodeMode, scan_book, scan_book_as, scan_library,
+    BookOverrides, ScanOptions, StorageMode, TranscodeMode, scan_book, scan_book_as, scan_library,
+};
+use podspine_test_support::{
+    scratch, skip, skip_unless_ffmpeg, synth_sine, synth_three_chapters, synth_with_cover,
 };
 
 /// A minimal ready book row. Tests that need a *poisoned* row build it directly
@@ -29,11 +32,10 @@ fn book_row(id: &str, feed_id: &str) -> BookRow {
         cover_path: None,
         source_path: "/nonexistent/source.m4b".to_string(),
         source_mtime: 0,
-        status: "ready".to_string(),
-        storage_mode: String::new(),
+        storage_mode: None,
         default_cover_url: None,
         force_embedded: false,
-        transcode: String::new(),
+        transcode: None,
     }
 }
 
@@ -55,43 +57,151 @@ fn episode_row(book_id: &str, idx: i64, byte_length: i64) -> EpisodeRow {
     }
 }
 
-fn ffmpeg_available() -> bool {
-    Command::new("ffmpeg")
-        .arg("-version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+/// A book with three embedded chapters (`synthetic.m4a`, the file stem the
+/// slug-derived assertions rely on).
+fn synth_book(dir: &Path) -> PathBuf {
+    synth_three_chapters(dir, "synthetic.m4a")
 }
 
-fn synth_three_chapters(dir: &Path) -> PathBuf {
-    let meta = dir.join("meta.txt");
-    std::fs::write(
-        &meta,
-        ";FFMETADATA1\n\
-         [CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=10000\ntitle=One\n\
-         [CHAPTER]\nTIMEBASE=1/1000\nSTART=10000\nEND=20000\ntitle=Two\n\
-         [CHAPTER]\nTIMEBASE=1/1000\nSTART=20000\nEND=30000\ntitle=Three\n",
+/// Baseline test state: standard base URL, `full` storage, no cover fallback,
+/// no cache knobs. Tests that need a non-default knob use the variants below,
+/// so the interesting value stays visible at the call site.
+fn test_state(index: Index, data: &Path, library: &Path) -> AppState {
+    AppState::new(
+        index,
+        "http://test".to_string(),
+        data,
+        library,
+        None,
+        StorageMode::Full,
+        None,
+        None,
     )
-    .unwrap();
-    let input = dir.join("synthetic.m4a");
-    let status = Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-loglevel",
-            "error",
-            "-f",
-            "lavfi",
-            "-i",
-            "sine=frequency=440:duration=30",
-            "-i",
-        ])
-        .arg(&meta)
-        .args(["-map_metadata", "1", "-map", "0:a", "-c:a", "aac"])
-        .arg(&input)
-        .status()
-        .expect("spawn ffmpeg");
-    assert!(status.success(), "ffmpeg synth failed");
-    input
+    .expect("test dirs canonicalize")
+}
+
+/// [`test_state`] in `saver` storage mode.
+fn saver_state(index: Index, data: &Path, library: &Path) -> AppState {
+    AppState::new(
+        index,
+        "http://test".to_string(),
+        data,
+        library,
+        None,
+        StorageMode::Saver,
+        None,
+        None,
+    )
+    .expect("test dirs canonicalize")
+}
+
+/// [`saver_state`] with a cache size cap in bytes.
+fn saver_state_capped(index: Index, data: &Path, library: &Path, cap_bytes: u64) -> AppState {
+    AppState::new(
+        index,
+        "http://test".to_string(),
+        data,
+        library,
+        None,
+        StorageMode::Saver,
+        Some(cap_bytes),
+        None,
+    )
+    .expect("test dirs canonicalize")
+}
+
+/// [`test_state`] with a feed-level default cover URL.
+fn state_with_default_cover(
+    index: Index,
+    data: &Path,
+    library: &Path,
+    cover_url: &str,
+) -> AppState {
+    AppState::new(
+        index,
+        "http://test".to_string(),
+        data,
+        library,
+        Some(cover_url.to_string()),
+        StorageMode::Full,
+        None,
+        None,
+    )
+    .expect("test dirs canonicalize")
+}
+
+/// A root that can't be canonicalized must fail construction loudly. The old
+/// fallback kept the as-given path, and every containment check then failed
+/// closed — a server that silently 404s everything (security audit 2026-08-19).
+#[test]
+fn state_construction_fails_when_a_root_is_missing() {
+    let dir = scratch("http-missing-root");
+    let missing = dir.path().join("nope");
+    for (data, library, what) in [
+        (missing.as_path(), dir.path(), "missing data dir"),
+        (dir.path(), missing.as_path(), "missing library root"),
+    ] {
+        let state = AppState::new(
+            Index::open_in_memory().unwrap(),
+            "http://test".to_string(),
+            data,
+            library,
+            None,
+            StorageMode::Full,
+            None,
+            None,
+        );
+        assert!(state.is_err(), "{what} must fail AppState construction");
+    }
+}
+
+/// Final defense-in-depth on the audio route: every resolver check passes (a
+/// chaptered episode, a real file under `data/books/<id>`), but the chapter file
+/// itself is a symlink pointing outside BOTH trusted roots. The last
+/// canonicalize-and-check must catch it and 404 — this is the deliberately
+/// hand-rolled two-root check, and this is its only test.
+#[cfg(unix)]
+#[tokio::test]
+async fn audio_file_symlinked_outside_both_roots_is_a_404() {
+    let base = scratch("http-two-root-escape");
+    let data = base.join("data");
+    let library = base.join("library");
+    std::fs::create_dir_all(&library).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    let outside = base.join("outside.m4a");
+    std::fs::write(&outside, b"not really audio").unwrap();
+
+    let index = Index::open_in_memory().unwrap();
+    index.upsert_book(&book_row("b1", "CapId1")).unwrap();
+    let book_dir = data.join("books").join("b1");
+    std::fs::create_dir_all(&book_dir).unwrap();
+    let target = book_dir.join("001.m4a");
+    std::os::unix::fs::symlink(&outside, &target).unwrap();
+    let mut ep = episode_row("b1", 0, 16);
+    ep.file_path = target.to_string_lossy().into_owned();
+    index.upsert_episode(&ep).unwrap();
+
+    let resp = router(test_state(index, &data, &library))
+        .oneshot(Request::get("/audio/CapId1/1").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert!(outside.exists(), "the outside file is never touched");
+}
+
+/// Invalid feed-id characters 404 at the allow-list, before any DB or
+/// filesystem work — on the thumb route too (the cover route's sibling).
+#[tokio::test]
+async fn cover_thumb_rejects_an_invalid_feed_id() {
+    let resp = router(empty_state())
+        .oneshot(
+            Request::get("/cover/bad!id/thumb")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 /// Synthesize a two-chapter FLAC (chapters via a `.cue` sidecar — embedded FLAC
@@ -135,51 +245,10 @@ async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
         .to_vec()
 }
 
-/// Synthesize an AAC file with an embedded (attached-picture) cover.
-fn synth_with_cover(dir: &Path) -> PathBuf {
-    let input = dir.join("cover.m4a");
-    let status = Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-loglevel",
-            "error",
-            "-f",
-            "lavfi",
-            "-i",
-            "sine=frequency=440:duration=6",
-            "-f",
-            "lavfi",
-            "-i",
-            "color=c=blue:s=120x120:d=0.1",
-            "-map",
-            "0:a",
-            "-map",
-            "1:v",
-            "-frames:v",
-            "1",
-            "-c:a",
-            "aac",
-            "-c:v",
-            "mjpeg",
-            "-disposition:v:0",
-            "attached_pic",
-        ])
-        .arg(&input)
-        .status()
-        .expect("spawn ffmpeg");
-    assert!(status.success(), "ffmpeg cover synth failed");
-    input
-}
-
 #[tokio::test]
 async fn serves_cover_when_present() {
-    if !ffmpeg_available() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-    let dir = std::env::temp_dir().join("podspine-http-cover");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    skip_unless_ffmpeg!();
+    let dir = scratch("http-cover");
     let data = dir.join("data");
 
     let index = Index::open_in_memory().unwrap();
@@ -191,16 +260,7 @@ async fn serves_cover_when_present() {
         .clone()
         .expect("cover should have been extracted");
 
-    let state = AppState::new(
-        index,
-        "http://test".to_string(),
-        &data,
-        &dir,
-        None,
-        false,
-        None,
-        None,
-    );
+    let state = test_state(index, &data, &dir);
     let app = router(state);
 
     // Covers are served by capability id, not the slug.
@@ -274,23 +334,16 @@ async fn serves_cover_when_present() {
         etag,
         "a changed cover gets a new ETag"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn saver_mode_regenerates_a_chapter_on_demand() {
-    if !ffmpeg_available() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-    let dir = std::env::temp_dir().join("podspine-http-saver");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    skip_unless_ffmpeg!();
+    let dir = scratch("http-saver");
     let data = dir.join("data");
 
     let index = Index::open_in_memory().unwrap();
-    let input = synth_three_chapters(&dir);
+    let input = synth_book(&dir);
     // Ingest in `saver` mode: sizes recorded, split files deleted.
     let book = scan_book_as(
         &input,
@@ -298,7 +351,7 @@ async fn saver_mode_regenerates_a_chapter_on_demand() {
         &data,
         &index,
         ScanOptions {
-            saver: true,
+            storage: StorageMode::Saver,
             ..Default::default()
         },
         &BookOverrides::default(),
@@ -315,16 +368,7 @@ async fn saver_mode_regenerates_a_chapter_on_demand() {
     );
     let recorded_len = eps[0].byte_length;
 
-    let state = AppState::new(
-        index,
-        "http://test".to_string(),
-        &data,
-        &dir,
-        None,
-        true,
-        None,
-        None,
-    );
+    let state = saver_state(index, &data, &dir);
     let app = router(state);
 
     // First request: the file is missing, so it's regenerated and served.
@@ -361,30 +405,23 @@ async fn saver_mode_regenerates_a_chapter_on_demand() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
     assert_eq!(body_bytes(resp).await.len(), 10, "range served 10 bytes");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn saver_cache_evicts_over_the_size_cap() {
-    if !ffmpeg_available() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-    let dir = std::env::temp_dir().join("podspine-http-saver-evict");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    skip_unless_ffmpeg!();
+    let dir = scratch("http-saver-evict");
     let data = dir.join("data");
 
     let index = Index::open_in_memory().unwrap();
-    let input = synth_three_chapters(&dir);
+    let input = synth_book(&dir);
     let book = scan_book_as(
         &input,
         "evictbook",
         &data,
         &index,
         ScanOptions {
-            saver: true,
+            storage: StorageMode::Saver,
             ..Default::default()
         },
         &BookOverrides::default(),
@@ -394,16 +431,7 @@ async fn saver_cache_evicts_over_the_size_cap() {
     let book_out = data.join("books").join(&book.id);
 
     // A 1-byte cap forces eviction of everything but the file just served.
-    let state = AppState::new(
-        index,
-        "http://test".to_string(),
-        &data,
-        &dir,
-        None,
-        true,
-        Some(1),
-        None,
-    );
+    let state = saver_state_capped(index, &data, &dir, 1);
     let app = router(state);
 
     for n in [1u32, 2] {
@@ -433,23 +461,16 @@ async fn saver_cache_evicts_over_the_size_cap() {
         })
         .count();
     assert_eq!(cached, 1, "size cap keeps only the most-recent chapter");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn full_mode_missing_file_is_a_404_not_a_regeneration() {
-    if !ffmpeg_available() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-    let dir = std::env::temp_dir().join("podspine-http-fullmiss");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    skip_unless_ffmpeg!();
+    let dir = scratch("http-fullmiss");
     let data = dir.join("data");
 
     let index = Index::open_in_memory().unwrap();
-    let input = synth_three_chapters(&dir);
+    let input = synth_book(&dir);
     let book = scan_book(&input, &data, &index).unwrap(); // full mode: files kept
     let feed_id = book.feed_id.clone();
 
@@ -457,16 +478,7 @@ async fn full_mode_missing_file_is_a_404_not_a_regeneration() {
     let eps = index.episodes_for_book(&book.id).unwrap();
     std::fs::remove_file(&eps[0].file_path).unwrap();
 
-    let state = AppState::new(
-        index,
-        "http://test".to_string(),
-        &data,
-        &dir,
-        None,
-        false,
-        None,
-        None,
-    );
+    let state = test_state(index, &data, &dir);
     let app = router(state);
     let resp = app
         .oneshot(
@@ -477,45 +489,24 @@ async fn full_mode_missing_file_is_a_404_not_a_regeneration() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Synthesize a chapterless AAC single file → served in place (Sprint 6.2).
 fn synth_flat(dir: &Path) -> PathBuf {
-    let input = dir.join("flat.m4a");
-    let status = Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-loglevel",
-            "error",
-            "-f",
-            "lavfi",
-            "-i",
-            "sine=frequency=330:duration=8",
-            "-c:a",
-            "aac",
-        ])
-        .arg(&input)
-        .status()
-        .expect("spawn ffmpeg");
-    assert!(status.success(), "ffmpeg synth failed");
-    input
+    synth_sine(dir, "flat.m4a", 8.0)
 }
 
 #[tokio::test]
 async fn serves_whole_file_episode_in_place_from_the_library() {
-    if !ffmpeg_available() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-    let base = std::env::temp_dir().join("podspine-http-inplace");
-    let _ = std::fs::remove_dir_all(&base);
+    skip_unless_ffmpeg!();
+    let base = scratch("http-inplace");
     // Library and data are SEPARATE trees, so "served from the library" is
     // provable (the file is not, and could not be, under the data dir).
     let library = base.join("library");
     let data = base.join("data");
     std::fs::create_dir_all(&library).unwrap();
+    // Both roots must exist before AppState::new (Config::validate's contract).
+    std::fs::create_dir_all(&data).unwrap();
 
     let index = Index::open_in_memory().unwrap();
     let input = synth_flat(&library);
@@ -540,16 +531,7 @@ async fn serves_whole_file_episode_in_place_from_the_library() {
         "nothing copied under the data dir"
     );
 
-    let state = AppState::new(
-        index,
-        "http://test".to_string(),
-        &data,
-        &library,
-        None,
-        false,
-        None,
-        None,
-    );
+    let state = test_state(index, &data, &library);
     let app = router(state);
 
     // Full GET streams the whole library file back, byte-for-byte.
@@ -583,21 +565,17 @@ async fn serves_whole_file_episode_in_place_from_the_library() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
     assert_eq!(body_bytes(resp).await.len(), 10, "range served 10 bytes");
-
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 #[tokio::test]
 async fn in_place_source_outside_the_library_is_a_404() {
-    if !ffmpeg_available() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-    let base = std::env::temp_dir().join("podspine-http-inplace-escape");
-    let _ = std::fs::remove_dir_all(&base);
+    skip_unless_ffmpeg!();
+    let base = scratch("http-inplace-escape");
     let library = base.join("library");
     let data = base.join("data");
     std::fs::create_dir_all(&library).unwrap();
+    // Both roots must exist before AppState::new (Config::validate's contract).
+    std::fs::create_dir_all(&data).unwrap();
 
     let index = Index::open_in_memory().unwrap();
     let input = synth_flat(&library);
@@ -614,16 +592,7 @@ async fn in_place_source_outside_the_library_is_a_404() {
     ep.file_path = outside.to_string_lossy().into_owned();
     index.upsert_episode(&ep).unwrap();
 
-    let state = AppState::new(
-        index,
-        "http://test".to_string(),
-        &data,
-        &library,
-        None,
-        false,
-        None,
-        None,
-    );
+    let state = test_state(index, &data, &library);
     let app = router(state);
     let resp = app
         .oneshot(
@@ -638,25 +607,19 @@ async fn in_place_source_outside_the_library_is_a_404() {
         StatusCode::NOT_FOUND,
         "in-place source outside the library root is rejected"
     );
-
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 #[tokio::test]
 async fn in_place_source_on_a_chaptered_episode_is_rejected() {
-    if !ffmpeg_available() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-    let base = std::env::temp_dir().join("podspine-http-corrupt-inplace");
-    let _ = std::fs::remove_dir_all(&base);
+    skip_unless_ffmpeg!();
+    let base = scratch("http-corrupt-inplace");
     let library = base.join("library");
     let data = base.join("data");
     std::fs::create_dir_all(&library).unwrap();
 
     let index = Index::open_in_memory().unwrap();
     // A chaptered container under the library, split into the data dir (full mode).
-    let input = synth_three_chapters(&library);
+    let input = synth_book(&library);
     let book = scan_book(&input, &data, &index).unwrap();
     let feed_id = book.feed_id.clone();
     let mut ep = index.episodes_for_book(&book.id).unwrap()[0].clone();
@@ -680,16 +643,7 @@ async fn in_place_source_on_a_chaptered_episode_is_rejected() {
     );
     index.upsert_episode(&ep).unwrap();
 
-    let state = AppState::new(
-        index,
-        "http://test".to_string(),
-        &data,
-        &library,
-        None,
-        false,
-        None,
-        None,
-    );
+    let state = test_state(index, &data, &library);
     let app = router(state);
     let resp = app
         .oneshot(
@@ -704,18 +658,12 @@ async fn in_place_source_on_a_chaptered_episode_is_rejected() {
         StatusCode::NOT_FOUND,
         "a chaptered episode with a stray source_path must not serve the container"
     );
-
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 #[tokio::test]
 async fn serves_a_remuxed_faststart_copy_on_demand() {
-    if !ffmpeg_available() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-    let base = std::env::temp_dir().join("podspine-http-remux");
-    let _ = std::fs::remove_dir_all(&base);
+    skip_unless_ffmpeg!();
+    let base = scratch("http-remux");
     let library = base.join("library");
     let data = base.join("data");
     std::fs::create_dir_all(&library).unwrap();
@@ -753,16 +701,7 @@ async fn serves_a_remuxed_faststart_copy_on_demand() {
     );
     let recorded_len = eps[0].byte_length;
 
-    let state = AppState::new(
-        index,
-        "http://test".to_string(),
-        &data,
-        &library,
-        None,
-        false,
-        None,
-        None,
-    );
+    let state = test_state(index, &data, &library);
     let app = router(state);
 
     // First request regenerates the remux and serves it; the body matches the
@@ -805,22 +744,16 @@ async fn serves_a_remuxed_faststart_copy_on_demand() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
     assert_eq!(body_bytes(resp).await.len(), 10, "range served 10 bytes");
-
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 #[tokio::test]
 async fn per_book_saver_serves_even_when_server_is_full() {
-    if !ffmpeg_available() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-    let base = std::env::temp_dir().join("podspine-http-perbook-saver");
-    let _ = std::fs::remove_dir_all(&base);
+    skip_unless_ffmpeg!();
+    let base = scratch("http-perbook-saver");
     let library = base.join("library");
     let data = base.join("data");
     std::fs::create_dir_all(&library).unwrap();
-    let input = synth_three_chapters(&library);
+    let input = synth_book(&library);
     // Per-book override: `saver`, even though the server below runs `full`.
     let side = input
         .canonicalize()
@@ -833,7 +766,11 @@ async fn per_book_saver_serves_even_when_server_is_full() {
     scan_library(&library, &data, &index, ScanOptions::default());
     let books = index.list_books().unwrap();
     assert_eq!(books.len(), 1);
-    assert_eq!(books[0].storage_mode, "saver", "per-book saver persisted");
+    assert_eq!(
+        books[0].storage_mode,
+        Some(StorageMode::Saver),
+        "per-book saver persisted"
+    );
     let feed_id = books[0].feed_id.clone();
     let eps = index.episodes_for_book(&books[0].id).unwrap();
     assert!(
@@ -843,16 +780,7 @@ async fn per_book_saver_serves_even_when_server_is_full() {
 
     // The server is FULL, but the per-book saver mode must still regenerate the
     // chapter on demand rather than 404.
-    let state = AppState::new(
-        index,
-        "http://test".to_string(),
-        &data,
-        &library,
-        None,
-        false,
-        None,
-        None,
-    );
+    let state = test_state(index, &data, &library);
     let app = router(state);
     let resp = app
         .oneshot(
@@ -868,28 +796,17 @@ async fn per_book_saver_serves_even_when_server_is_full() {
         "per-book saver regenerated despite the global full mode"
     );
     assert_eq!(body_bytes(resp).await.len() as i64, eps[0].byte_length);
-
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 #[tokio::test]
 async fn regenerate_rejects_an_invalid_slug() {
     // No ffmpeg: the slug is rejected before any DB/filesystem work.
-    let dir = std::env::temp_dir().join("podspine-http-regen-badslug");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch("http-regen-badslug");
     let data = dir.join("data");
+    // Both roots must exist before AppState::new (Config::validate's contract).
+    std::fs::create_dir_all(&data).unwrap();
     let index = Index::open_in_memory().unwrap();
-    let state = AppState::new(
-        index,
-        "http://test".to_string(),
-        &data,
-        &dir,
-        None,
-        false,
-        None,
-        None,
-    );
+    let state = test_state(index, &data, &dir);
     let app = router(state);
     // Same-origin (no cross-site header) but an invalid slug (uppercase) → 404.
     let resp = app
@@ -901,18 +818,12 @@ async fn regenerate_rejects_an_invalid_slug() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn cover_path_outside_the_data_dir_is_a_404() {
-    if !ffmpeg_available() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-    let dir = std::env::temp_dir().join("podspine-http-cover-escape");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    skip_unless_ffmpeg!();
+    let dir = scratch("http-cover-escape");
     let data = dir.join("data");
     let index = Index::open_in_memory().unwrap();
     let input = synth_with_cover(&dir);
@@ -926,16 +837,7 @@ async fn cover_path_outside_the_data_dir_is_a_404() {
     index.upsert_book(&book).unwrap();
     let feed_id = book.feed_id.clone();
 
-    let state = AppState::new(
-        index,
-        "http://test".to_string(),
-        &data,
-        &dir,
-        None,
-        false,
-        None,
-        None,
-    );
+    let state = test_state(index, &data, &dir);
     let app = router(state);
     let resp = app
         .oneshot(
@@ -946,17 +848,12 @@ async fn cover_path_outside_the_data_dir_is_a_404() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn remux_source_outside_the_library_is_a_404() {
-    if !ffmpeg_available() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-    let base = std::env::temp_dir().join("podspine-http-remux-escape");
-    let _ = std::fs::remove_dir_all(&base);
+    skip_unless_ffmpeg!();
+    let base = scratch("http-remux-escape");
     let library = base.join("library");
     let data = base.join("data");
     std::fs::create_dir_all(&library).unwrap();
@@ -985,16 +882,7 @@ async fn remux_source_outside_the_library_is_a_404() {
     ep.source_path = outside.to_string_lossy().into_owned();
     index.upsert_episode(&ep).unwrap();
 
-    let state = AppState::new(
-        index,
-        "http://test".to_string(),
-        &data,
-        &library,
-        None,
-        false,
-        None,
-        None,
-    );
+    let state = test_state(index, &data, &library);
     let app = router(state);
     let resp = app
         .oneshot(
@@ -1005,36 +893,21 @@ async fn remux_source_outside_the_library_is_a_404() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 #[tokio::test]
 async fn regenerate_rotates_the_capability() {
-    if !ffmpeg_available() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-    let dir = std::env::temp_dir().join("podspine-http-manage");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    skip_unless_ffmpeg!();
+    let dir = scratch("http-manage");
     let data = dir.join("data");
 
     let index = Index::open_in_memory().unwrap();
-    let input = synth_three_chapters(&dir);
+    let input = synth_book(&dir);
     let book = scan_book(&input, &data, &index).unwrap();
     let slug = book.slug.clone();
     let old_feed_id = book.feed_id.clone();
 
-    let state = AppState::new(
-        index,
-        "http://test".to_string(),
-        &data,
-        &dir,
-        None,
-        false,
-        None,
-        None,
-    );
+    let state = test_state(index, &data, &dir);
     let app = router(state);
 
     // Every feed is always blocked from directories.
@@ -1104,40 +977,24 @@ async fn regenerate_rotates_the_capability() {
         !page.contains(&old_feed_id),
         "book page shows the rotated feed_id, not the old one"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn serves_feed_and_range_audio() {
-    if !ffmpeg_available() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
+    skip_unless_ffmpeg!();
 
-    let dir = std::env::temp_dir().join("podspine-http-test");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch("http-test");
     let data = dir.join("data");
 
     let index = Index::open_in_memory().unwrap();
-    let input = synth_three_chapters(&dir);
+    let input = synth_book(&dir);
     let book = scan_book(&input, &data, &index).unwrap();
     let slug = book.slug.clone(); // human key → UI routes
     let feed_id = book.feed_id.clone(); // capability → feed/audio/cover
 
     // The synthetic book has no embedded cover, so configure a feed-level
     // fallback to exercise the Task 3.4 default-cover path.
-    let state = AppState::new(
-        index,
-        "http://test".to_string(),
-        &data,
-        &dir,
-        Some("http://test/default-cover.png".to_string()),
-        false,
-        None,
-        None,
-    );
+    let state = state_with_default_cover(index, &data, &dir, "http://test/default-cover.png");
     let app = router(state);
 
     // healthz
@@ -1334,8 +1191,6 @@ async fn serves_feed_and_range_audio() {
             "no leak in body for {uri}"
         );
     }
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The chapter dir is `<data_dir>/books/<book.id>`, and `book.id` is an opaque
@@ -1345,8 +1200,7 @@ async fn serves_feed_and_range_audio() {
 /// canonicalize.
 #[tokio::test]
 async fn audio_book_dir_outside_the_data_dir_is_a_404() {
-    let dir = std::env::temp_dir().join("podspine-http-audio-dir-escape");
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = scratch("http-audio-dir-escape");
     let data = dir.join("data");
     // `books` must exist: canonicalize resolves `..` against real components.
     std::fs::create_dir_all(data.join("books")).unwrap();
@@ -1361,16 +1215,7 @@ async fn audio_book_dir_outside_the_data_dir_is_a_404() {
     index.upsert_book(&book).unwrap();
     index.upsert_episode(&episode_row(&book.id, 0, 26)).unwrap();
 
-    let state = AppState::new(
-        index,
-        "http://test".to_string(),
-        &data,
-        &dir,
-        None,
-        false,
-        None,
-        None,
-    );
+    let state = test_state(index, &data, &dir);
     let resp = router(state)
         .oneshot(
             Request::get(format!("/audio/{feed_id}/1"))
@@ -1385,7 +1230,6 @@ async fn audio_book_dir_outside_the_data_dir_is_a_404() {
         body_bytes(resp).await.is_empty(),
         "a rejected path must not leak bytes or filesystem detail"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The feed self-check is the last line of defense against shipping a broken
@@ -1394,8 +1238,7 @@ async fn audio_book_dir_outside_the_data_dir_is_a_404() {
 /// that would misbehave in a client.
 #[tokio::test]
 async fn a_feed_failing_the_self_check_is_a_500_not_a_broken_feed() {
-    let dir = std::env::temp_dir().join("podspine-http-selfcheck-fail");
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = scratch("http-selfcheck-fail");
     let data = dir.join("data");
     std::fs::create_dir_all(&data).unwrap();
 
@@ -1407,16 +1250,7 @@ async fn a_feed_failing_the_self_check_is_a_500_not_a_broken_feed() {
     // to catch (an enclosure length must be the real file size, never 0).
     index.upsert_episode(&episode_row(&book.id, 0, 0)).unwrap();
 
-    let state = AppState::new(
-        index,
-        "http://test".to_string(),
-        &data,
-        &dir,
-        None,
-        false,
-        None,
-        None,
-    );
+    let state = test_state(index, &data, &dir);
     let resp = router(state)
         .oneshot(
             Request::get(format!("/feed/{feed_id}.xml"))
@@ -1432,7 +1266,6 @@ async fn a_feed_failing_the_self_check_is_a_500_not_a_broken_feed() {
         body.is_empty(),
         "the failure detail belongs in the log, not the response"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The saver-mode regen arm re-splits from `book.source_path`, an opaque DB
@@ -1444,8 +1277,7 @@ async fn a_feed_failing_the_self_check_is_a_500_not_a_broken_feed() {
 /// rejected it and not that the path merely failed to canonicalize.
 #[tokio::test]
 async fn saver_regen_source_outside_the_library_is_a_404() {
-    let dir = std::env::temp_dir().join("podspine-http-saver-regen-escape");
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = scratch("http-saver-regen-escape");
     let library = dir.join("library");
     let data = dir.join("data");
     let book_id = "saver-escape-book";
@@ -1460,7 +1292,7 @@ async fn saver_regen_source_outside_the_library_is_a_404() {
     let feed_id = "capabilityidforsaverescape";
     let mut book = book_row(book_id, feed_id);
     book.source_path = outside.to_string_lossy().into_owned();
-    book.storage_mode = "saver".to_string(); // per-book override; independent of the global flag
+    book.storage_mode = Some(StorageMode::Saver); // per-book override; independent of the global mode
     index.upsert_book(&book).unwrap();
     // A chaptered episode: empty source_path, so it takes the saver-regen arm
     // rather than the serve-in-place or faststart-remux arms.
@@ -1468,16 +1300,8 @@ async fn saver_regen_source_outside_the_library_is_a_404() {
         .upsert_episode(&episode_row(book_id, 0, 1024))
         .unwrap();
 
-    let state = AppState::new(
-        index,
-        "http://test".to_string(),
-        &data,
-        &library,
-        None,
-        false, // global full: the per-book "saver" override is what selects the arm
-        None,
-        None,
-    );
+    // Global full: the per-book "saver" override is what selects the arm.
+    let state = test_state(index, &data, &library);
     let resp = router(state)
         .oneshot(
             Request::get(format!("/audio/{feed_id}/1"))
@@ -1501,7 +1325,6 @@ async fn saver_regen_source_outside_the_library_is_a_404() {
         produced, 0,
         "no cache file may be regenerated from an escaped source"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The containment check must not break the legitimate path: a saver book whose
@@ -1509,8 +1332,7 @@ async fn saver_regen_source_outside_the_library_is_a_404() {
 /// exists, so it serves without invoking ffmpeg).
 #[tokio::test]
 async fn saver_source_inside_the_library_still_serves() {
-    let dir = std::env::temp_dir().join("podspine-http-saver-regen-ok");
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = scratch("http-saver-regen-ok");
     let library = dir.join("library");
     let data = dir.join("data");
     let book_id = "saver-ok-book";
@@ -1526,7 +1348,7 @@ async fn saver_source_inside_the_library_still_serves() {
     let feed_id = "capabilityidforsaverok";
     let mut book = book_row(book_id, feed_id);
     book.source_path = source.to_string_lossy().into_owned();
-    book.storage_mode = "saver".to_string();
+    book.storage_mode = Some(StorageMode::Saver);
     index.upsert_book(&book).unwrap();
     index
         .upsert_episode(&episode_row(
@@ -1536,16 +1358,7 @@ async fn saver_source_inside_the_library_still_serves() {
         ))
         .unwrap();
 
-    let state = AppState::new(
-        index,
-        "http://test".to_string(),
-        &data,
-        &library,
-        None,
-        false,
-        None,
-        None,
-    );
+    let state = test_state(index, &data, &library);
     let resp = router(state)
         .oneshot(
             Request::get(format!("/audio/{feed_id}/1"))
@@ -1557,7 +1370,6 @@ async fn saver_source_inside_the_library_still_serves() {
 
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(body_bytes(resp).await, b"cached chapter bytes");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Task 5.2 end-to-end: with transcoding on, a FLAC book serves as AAC/`audio/mp4`
@@ -1566,19 +1378,13 @@ async fn saver_source_inside_the_library_still_serves() {
 /// exactly what a client gets.
 #[tokio::test]
 async fn transcoded_flac_book_serves_as_aac_and_is_never_evicted() {
-    if !ffmpeg_available() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-    let dir = std::env::temp_dir().join("podspine-http-transcode");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    skip_unless_ffmpeg!();
+    let dir = scratch("http-transcode");
     let data = dir.join("data");
 
     let index = Index::open_in_memory().unwrap();
     let Some(input) = synth_flac_with_cue(&dir) else {
-        eprintln!("skipping: no flac encoder");
-        return;
+        skip!("no flac encoder");
     };
     let book = scan_book_as(
         &input,
@@ -1587,7 +1393,7 @@ async fn transcoded_flac_book_serves_as_aac_and_is_never_evicted() {
         &index,
         ScanOptions {
             // A saver server, deliberately: transcoding must override it per book.
-            saver: true,
+            storage: StorageMode::Saver,
             transcode: TranscodeMode::Aac,
             ..Default::default()
         },
@@ -1603,16 +1409,7 @@ async fn transcoded_flac_book_serves_as_aac_and_is_never_evicted() {
 
     // A tiny cache cap + a served request would evict a regenerable chapter here;
     // a transcoded one must survive.
-    let state = AppState::new(
-        index,
-        "http://test".to_string(),
-        &data,
-        &dir,
-        None,
-        true,
-        Some(1),
-        None,
-    );
+    let state = saver_state_capped(index, &data, &dir, 1);
     let app = router(state);
 
     let resp = app
@@ -1654,25 +1451,17 @@ async fn transcoded_flac_book_serves_as_aac_and_is_never_evicted() {
     let xml = String::from_utf8(body_bytes(resp).await).unwrap();
     assert!(xml.contains("type=\"audio/mp4\""), "{xml}");
     assert!(xml.contains(&format!("length=\"{recorded_len}\"")), "{xml}");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---- first-run scan readiness (issue 159): no ffmpeg needed ----
 
 /// A bare state over an empty in-memory index, used to drive the readiness gate
 /// without synthesizing audio. Defaults to `ready`; the tests flip it explicitly.
+/// The roots just need to exist (AppState::new canonicalizes them) — no file
+/// under them is ever touched, so the shared temp dir is fine on every OS.
 fn empty_state() -> AppState {
-    AppState::new(
-        Index::open_in_memory().unwrap(),
-        "http://test".to_string(),
-        Path::new("/tmp"),
-        Path::new("/tmp"),
-        None,
-        false,
-        None,
-        None,
-    )
+    let tmp = std::env::temp_dir();
+    test_state(Index::open_in_memory().unwrap(), &tmp, &tmp)
 }
 
 #[tokio::test]
@@ -1695,6 +1484,7 @@ async fn scanning_state_holds_the_browse_ui_and_503s_the_capability_routes() {
         "/feed/Xk9mQ2vP7nR4tB1cY6wZ8a.xml",
         "/audio/Xk9mQ2vP7nR4tB1cY6wZ8a/1",
         "/cover/Xk9mQ2vP7nR4tB1cY6wZ8a",
+        "/cover/Xk9mQ2vP7nR4tB1cY6wZ8a/thumb",
     ] {
         let resp = router(state.clone())
             .oneshot(Request::get(path).body(Body::empty()).unwrap())
@@ -1854,13 +1644,8 @@ async fn set_theme_redirects_back_even_when_ui_origin_differs() {
 
 #[tokio::test]
 async fn serves_scanner_generated_thumbnail_with_fallback() {
-    if !ffmpeg_available() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-    let dir = std::env::temp_dir().join("podspine-http-thumb");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    skip_unless_ffmpeg!();
+    let dir = scratch("http-thumb");
     let data = dir.join("data");
 
     let index = Index::open_in_memory().unwrap();
@@ -1872,16 +1657,7 @@ async fn serves_scanner_generated_thumbnail_with_fallback() {
     // The scan generates the thumbnail (the http layer only serves it).
     assert!(thumb.exists(), "the scan should have generated a thumbnail");
 
-    let state = AppState::new(
-        index,
-        "http://test".to_string(),
-        &data,
-        &dir,
-        None,
-        false,
-        None,
-        None,
-    );
+    let state = test_state(index, &data, &dir);
     let app = router(state);
     let get_thumb = || {
         app.clone().oneshot(
@@ -1914,8 +1690,6 @@ async fn serves_scanner_generated_thumbnail_with_fallback() {
         "falls back to the full cover"
     );
     assert!(!body_bytes(resp).await.is_empty());
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -1923,8 +1697,7 @@ async fn cover_thumb_falls_back_to_the_full_cover_when_absent() {
     // A book with a cover but no generated thumbnail (e.g. before a reconcile
     // backfills it): `/thumb` must serve the full cover file rather than 404.
     // ffmpeg-free — the handler only serves, it never generates.
-    let dir = std::env::temp_dir().join("podspine-http-thumb-fallback");
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = scratch("http-thumb-fallback");
     let data = dir.join("data");
     let book_dir = data.join("books").join("badcover");
     std::fs::create_dir_all(&book_dir).unwrap();
@@ -1937,16 +1710,7 @@ async fn cover_thumb_falls_back_to_the_full_cover_when_absent() {
     index.upsert_book(&row).unwrap();
     let feed_id = row.feed_id.clone();
 
-    let state = AppState::new(
-        index,
-        "http://test".to_string(),
-        &data,
-        &dir,
-        None,
-        false,
-        None,
-        None,
-    );
+    let state = test_state(index, &data, &dir);
     let resp = router(state)
         .oneshot(
             Request::get(format!("/cover/{feed_id}/thumb"))
@@ -1961,19 +1725,12 @@ async fn cover_thumb_falls_back_to_the_full_cover_when_absent() {
         "falls back to the full cover"
     );
     assert_eq!(body_bytes(resp).await, b"this is not an image");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn cover_conditional_get_honours_wildcard_and_weak_etag() {
-    if !ffmpeg_available() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-    let dir = std::env::temp_dir().join("podspine-http-cover-cond");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    skip_unless_ffmpeg!();
+    let dir = scratch("http-cover-cond");
     let data = dir.join("data");
 
     let index = Index::open_in_memory().unwrap();
@@ -1981,16 +1738,7 @@ async fn cover_conditional_get_honours_wildcard_and_weak_etag() {
     let book = scan_book(&input, &data, &index).unwrap();
     let feed_id = book.feed_id.clone();
 
-    let state = AppState::new(
-        index,
-        "http://test".to_string(),
-        &data,
-        &dir,
-        None,
-        false,
-        None,
-        None,
-    );
+    let state = test_state(index, &data, &dir);
     let app = router(state);
 
     // Grab the strong ETag from a normal request.
@@ -2038,6 +1786,4 @@ async fn cover_conditional_get_honours_wildcard_and_weak_etag() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_MODIFIED, "weak etag matches");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

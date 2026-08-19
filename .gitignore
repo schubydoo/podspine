@@ -23,6 +23,7 @@
 /.mcp.json
 /.mcp.json.lock
 /.serena/
+/.lean-ctx/
 
 # Release build output (per-arch binaries for the Docker image)
 /dist/

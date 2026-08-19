@@ -53,6 +53,9 @@ coverage:
 # tree; it carries enough headroom to absorb this ~0.8% of lines.)
 ignore:
   - "src/main.rs"
+  # Dev-only test scaffolding (skip!/scratch/ffmpeg synths) — it only ever runs
+  # inside tests, so "coverage" of it is noise, same reasoning as src/main.rs.
+  - "crates/test-support/src/lib.rs"
 
 # The per-line PR annotations are mostly visual clutter; the comment + dashboard
 # carry the signal.
@@ -118,7 +121,6 @@ component_management:
       paths:
         - crates/metrics/src/lib.rs
     - component_id: server_cli
-      name: server & cli
+      name: server
       paths:
         - src/main.rs
-        - crates/cli/src/main.rs
