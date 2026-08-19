@@ -139,7 +139,8 @@ override settings — `storage_mode`, `title`/`author`, `disabled`, and more —
 just that book. See **[per-book overrides](docs/DEPLOYMENT.md#per-book-overrides-podspinetoml)**.
 
 Each book's feed lives at an unguessable **capability URL** — `/feed/{feed_id}.xml`,
-with `/audio/{feed_id}/{n}` (episode audio, HTTP Range) and `/cover/{feed_id}`. The
+with `/audio/{feed_id}/{n}` (episode audio, HTTP Range), `/cover/{feed_id}`, and
+`/subscribe/{feed_id}` (the add-to-app helper page the QR opens). The
 browse UI (`/`, `/book/{slug}`) enumerates your library, so keep it on the LAN or
 behind proxy-auth while the capability routes are safe to expose — see
 **[exposing Podspine safely](docs/DEPLOYMENT.md#exposing-podspine-safely)**.

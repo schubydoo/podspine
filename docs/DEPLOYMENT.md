@@ -5,8 +5,9 @@ is enough; this page covers the production details: persistence, exposing it saf
 and running it as a service.
 
 > **Podspine has no built-in login.** It splits into two surfaces (see
-> [Exposing Podspine safely](#exposing-podspine-safely) below): the **feed/audio/cover**
-> routes are protected by an unguessable per-book **capability URL** and are safe to
+> [Exposing Podspine safely](#exposing-podspine-safely) below): the
+> **feed/audio/cover/subscribe** routes are protected by an unguessable per-book
+> **capability URL** and are safe to
 > expose to the internet, while the **browse UI** enumerates your whole library and
 > must stay on your LAN or behind proxy-auth. See [SECURITY.md](https://github.com/schubydoo/podspine/blob/main/SECURITY.md).
 
@@ -358,8 +359,8 @@ the browse UI private. Two hard requirements:
    Range to seek/scrub; stripping it breaks playback.
 2. Set `PODSPINE_BASE_URL` to the **public** URL so generated feed/audio links match.
 
-The configs below publish `/feed`, `/audio`, `/cover`, `/healthz` and refuse the
-browse UI (`/`, `/book/*`) — you use the UI over the LAN. (Prefer one authenticated
+The configs below publish `/feed`, `/audio`, `/cover`, `/subscribe`, `/healthz` and
+refuse the browse UI (`/`, `/book/*`) — you use the UI over the LAN. (Prefer one authenticated
 hostname instead? Drop the `@ui`/`location /` blocks and put `basicauth`/`auth_basic`
 on the whole server — just never require auth on `/feed`,`/audio`,`/cover`,
 `/subscribe`, since podcast apps (and a phone that just scanned a QR) can't log in.)
