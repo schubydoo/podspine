@@ -504,12 +504,11 @@ async fn cover(
 }
 
 /// `GET /cover/{feed_id}/thumb` — a small `cover_thumb.jpg` for the browse UI grid
-/// (the RSS feed and `/cover` keep the full-res image). The thumbnail is generated
-/// **on demand** from the full cover the first time it's requested and cached in the
-/// data dir, then served as a file thereafter — so existing books get a thumbnail on
-/// first view without a re-ingest, and a re-extracted cover refreshes it (the
-/// generator re-runs when the thumb is missing or older than the cover). If
-/// generation fails, it falls back to the full cover rather than 404ing.
+/// (the RSS feed and `/cover` keep the full-res image). Serving is read-only: the
+/// scanner generates the thumbnail alongside the cover, and this handler just serves
+/// it. If it hasn't been generated yet (the reconcile backfills a missing one on the
+/// next scan) or generation failed, it falls back to the full cover rather than
+/// 404ing.
 async fn cover_thumb(
     State(state): State<AppState>,
     Path(feed_id): Path<String>,
