@@ -221,6 +221,15 @@ pub enum CoverError {
         /// Where the cover was expected.
         path: PathBuf,
     },
+    /// The finished image could not be moved into place (the atomic publish).
+    #[error("could not publish cover to {path:?}: {source}")]
+    Publish {
+        /// The final path the image was being moved to.
+        path: PathBuf,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
     /// Could not create the output directory.
     #[error("could not create output directory {path:?}: {source}")]
     CreateDir {
@@ -350,31 +359,74 @@ fn run_ffmpeg_within(args: &[OsString], timeout: Duration) -> Result<(), RunErro
 /// **stream copy** (no re-encode), returning the written path. `ext` should match
 /// the cover codec (`"jpg"` for mjpeg, `"png"` for png). The source is only read.
 ///
-/// Maps only the first video (attached-picture) stream, so no audio is written.
+/// Maps only the first video (attached-picture) stream, so no audio is written. The
+/// write is atomic ([`extract_image`]), so a `/cover` or `/thumb` reader never sees
+/// a half-written cover while a rescan re-extracts it.
 pub fn extract_cover(input: &Path, out_dir: &Path, ext: &str) -> Result<PathBuf, CoverError> {
-    fs::create_dir_all(out_dir).map_err(|source| CoverError::CreateDir {
-        path: out_dir.to_path_buf(),
-        source,
-    })?;
-
     let out_path = out_dir.join(format!("cover.{ext}"));
-    let args = build_cover_args(input, &out_path);
+    extract_image(out_path, |part| build_cover_args(input, part))
+}
 
+/// Long-edge cap (px) for the cover thumbnail. 400 covers every browse-UI use —
+/// the grid (~150px), the detail cover (~200px) and the subscribe subcover (~96px)
+/// — at 2× density, while the full-res `/cover` is what the RSS feed advertises for
+/// podcatcher artwork.
+const COVER_THUMB_PX: u32 = 400;
+
+/// The path of a book's browse-UI cover thumbnail under `out_dir`. Centralized so
+/// the generator, the serve layer, and the scanner's invalidation all agree on it.
+pub fn cover_thumb_path(out_dir: &Path) -> PathBuf {
+    out_dir.join("cover_thumb.jpg")
+}
+
+/// Downscale an already-extracted cover into a small [`cover_thumb_path`] JPEG for
+/// the browse UI (the RSS feed keeps the full-res `/cover`). Bounded to
+/// [`COVER_THUMB_PX`] on the long edge and never upscaled; the source cover file is
+/// only read, and the write is atomic ([`extract_image`]).
+pub fn extract_cover_thumb(cover: &Path, out_dir: &Path) -> Result<PathBuf, CoverError> {
+    let out_path = cover_thumb_path(out_dir);
+    extract_image(out_path, |part| build_cover_thumb_args(cover, part))
+}
+
+/// Run ffmpeg to produce an image at `out_path` **atomically**: create the parent
+/// dir, write to a `.part` sibling, validate it's non-empty, then rename into place.
+/// A concurrent reader sees the old file or the new one, never a half-written one —
+/// which is what lets a rescan re-extract a cover while `/cover` and `/thumb` serve.
+fn extract_image(
+    out_path: PathBuf,
+    args_for: impl FnOnce(&Path) -> Vec<OsString>,
+) -> Result<PathBuf, CoverError> {
+    if let Some(dir) = out_path.parent() {
+        fs::create_dir_all(dir).map_err(|source| CoverError::CreateDir {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+    }
+
+    let part = part_path(&out_path);
+    let args = args_for(&part);
     match run_ffmpeg(&args) {
         Ok(()) => {}
         Err(RunError::Spawn(e)) => return Err(CoverError::Spawn(e)),
         Err(RunError::Failed { code, stderr }) => {
+            let _ = fs::remove_file(&part);
             return Err(CoverError::Ffmpeg { code, stderr });
         }
-        Err(RunError::TimedOut) => return Err(CoverError::TimedOut),
+        Err(RunError::TimedOut) => {
+            let _ = fs::remove_file(&part);
+            return Err(CoverError::TimedOut);
+        }
     }
 
-    let ok = fs::metadata(&out_path)
-        .map(|m| m.len() > 0)
-        .unwrap_or(false);
+    let ok = fs::metadata(&part).map(|m| m.len() > 0).unwrap_or(false);
     if !ok {
+        let _ = fs::remove_file(&part);
         return Err(CoverError::OutputMissing { path: out_path });
     }
+    fs::rename(&part, &out_path).map_err(|source| CoverError::Publish {
+        path: out_path.clone(),
+        source,
+    })?;
     Ok(out_path)
 }
 
@@ -395,6 +447,34 @@ fn build_cover_args(input: &Path, output: &Path) -> Vec<OsString> {
         "1".into(),
         "-c".into(),
         "copy".into(),
+        output.as_os_str().to_os_string(),
+    ]
+}
+
+/// Build the ffmpeg argv for the cover thumbnail: read the cover image, one frame,
+/// scale so the long edge is at most [`COVER_THUMB_PX`] (aspect preserved, never
+/// upscaled — `min(px, iw/ih)`), re-encode as JPEG. Argv vector, never a shell
+/// string. Factored out for a hermetic unit test.
+fn build_cover_thumb_args(input: &Path, output: &Path) -> Vec<OsString> {
+    vec![
+        "-nostdin".into(),
+        "-y".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-i".into(),
+        input.as_os_str().to_os_string(),
+        "-frames:v".into(),
+        "1".into(),
+        "-vf".into(),
+        format!(
+            "scale=w='min({px},iw)':h='min({px},ih)':force_original_aspect_ratio=decrease",
+            px = COVER_THUMB_PX
+        )
+        .into(),
+        "-c:v".into(),
+        "mjpeg".into(),
+        "-q:v".into(),
+        "4".into(),
         output.as_os_str().to_os_string(),
     ]
 }
@@ -1104,6 +1184,119 @@ mod tests {
     }
 
     #[test]
+    fn cover_thumb_args_scale_and_reencode_to_jpeg() {
+        let args: Vec<String> =
+            build_cover_thumb_args(Path::new("cover.png"), Path::new("out/cover_thumb.jpg"))
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+        let pair = |a: &str, b: &str| args.windows(2).any(|w| w[0] == a && w[1] == b);
+        assert!(pair("-c:v", "mjpeg"), "re-encode to JPEG");
+        assert!(pair("-frames:v", "1"), "one frame only");
+        // The scale filter caps the long edge and never upscales.
+        assert!(
+            args.iter()
+                .any(|a| a.contains("scale=") && a.contains("min(400,iw)")),
+            "must cap the long edge at 400px: {args:?}"
+        );
+        assert_eq!(args.last().unwrap(), "out/cover_thumb.jpg");
+    }
+
+    #[test]
+    fn cover_thumb_downscales_a_large_cover() {
+        if !have_ffmpeg() {
+            skip!("ffmpeg not available");
+        }
+        let dir = std::env::temp_dir().join("podspine-cover-thumb");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A large cover to downscale.
+        let cover = dir.join("cover.png");
+        let ok = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=blue:s=800x800:d=0.1",
+                "-frames:v",
+                "1",
+            ])
+            .arg(&cover)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "ffmpeg cover synth failed");
+
+        let thumb = extract_cover_thumb(&cover, &dir).expect("thumbnail");
+        assert_eq!(thumb, dir.join("cover_thumb.jpg"));
+        assert!(std::fs::metadata(&thumb).unwrap().len() > 0);
+
+        // Downscaled: the thumbnail's width is capped at 400 (the source is 800).
+        let width = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(&thumb)
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .expect("ffprobe the thumbnail width");
+        assert!(
+            width <= 400 && width > 0,
+            "thumbnail width {width} must be <= 400"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cover_extraction_reports_publish_when_a_directory_blocks_the_target() {
+        if !have_ffmpeg() {
+            skip!("ffmpeg not available");
+        }
+        // ffmpeg produces the `.part` fine, but a directory sitting at the final path
+        // blocks the atomic rename → CoverError::Publish (the image is never
+        // half-published; the blocker is left as-is).
+        let dir = std::env::temp_dir().join("podspine-cover-publish");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cover = dir.join("cover.png");
+        let ok = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:s=64x64:d=0.1",
+                "-frames:v",
+                "1",
+            ])
+            .arg(&cover)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "ffmpeg cover synth failed");
+
+        std::fs::create_dir_all(cover_thumb_path(&dir)).unwrap(); // a dir at the target
+        let err = extract_cover_thumb(&cover, &dir).expect_err("blocked rename must fail");
+        assert!(matches!(err, CoverError::Publish { .. }), "{err:?}");
+        assert!(cover_thumb_path(&dir).is_dir(), "the blocker is left as-is");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn semaphore_bounds_and_releases_permits() {
         let sem = Semaphore {
             permits: Mutex::new(1),
@@ -1723,6 +1916,29 @@ mod tests {
         let err =
             extract_cover(&bad, &dir.join("out"), "jpg").expect_err("no cover stream must fail");
         assert!(matches!(err, CoverError::Ffmpeg { .. }), "{err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_cover_thumb_maps_a_bad_input_to_a_cover_error() {
+        if !have_ffmpeg() {
+            skip!("ffmpeg not available");
+        }
+        // A non-image input -> ffmpeg can't decode it -> CoverError (Ffmpeg or the
+        // empty-output guard), never a panic.
+        let dir = std::env::temp_dir().join("podspine-thumb-fail");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bad = dir.join("notanimage.png");
+        std::fs::write(&bad, b"definitely not an image").unwrap();
+        let err = extract_cover_thumb(&bad, &dir.join("out")).expect_err("bad input must fail");
+        assert!(
+            matches!(
+                err,
+                CoverError::Ffmpeg { .. } | CoverError::OutputMissing { .. }
+            ),
+            "{err:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

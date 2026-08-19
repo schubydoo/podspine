@@ -277,7 +277,7 @@ fn cover(id: &str, title: &str, has_cover: bool, class: &str) -> Markup {
         .to_string();
     html! {
         @if has_cover {
-            img class=(class) src=(format!("/cover/{id}")) alt=(format!("Cover of {title}")) loading="lazy";
+            img class=(class) src=(format!("/cover/{id}/thumb")) alt=(format!("Cover of {title}")) loading="lazy";
         } @else {
             div class=(format!("{class} placeholder")) role="img" aria-label=(format!("No cover art for {title}")) {
                 span aria-hidden="true" { (initial) }
@@ -610,8 +610,8 @@ mod tests {
         assert!(html.contains("href=\"/book/dracula\""));
         assert!(html.contains("href=\"/book/solaris\""));
         // Cover present -> img with alt; absent -> labelled placeholder.
-        // Covers are served by capability id, not the slug.
-        assert!(html.contains("src=\"/cover/cap-dracula\""));
+        // The grid uses the small thumbnail, keyed by capability id (not the slug).
+        assert!(html.contains("src=\"/cover/cap-dracula/thumb\""));
         assert!(html.contains("alt=\"Cover of Dracula\""));
         assert!(html.contains("aria-label=\"No cover art for Solaris\""));
     }

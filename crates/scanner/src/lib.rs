@@ -39,8 +39,9 @@ use podspine_feed::{episode_guid, pubdate_epoch};
 use podspine_index::{BookRow, EpisodeRow, Index, IndexError};
 use podspine_prober::{ProbeError, needs_faststart, probe};
 use podspine_splitter::{
-    ChapterCut, Encoding, SplitEpisode, SplitError, extract_cover, remux_faststart,
-    split_book_encoded, split_chapter_encoded, transcode_whole,
+    ChapterCut, Encoding, SplitEpisode, SplitError, cover_thumb_path, extract_cover,
+    extract_cover_thumb, remux_faststart, split_book_encoded, split_chapter_encoded,
+    transcode_whole,
 };
 
 /// Extensions we refuse to ingest (DRM). Matched case-insensitively.
@@ -253,6 +254,16 @@ pub fn scan_book_as(
             && transcode_consistent
             && files_present
         {
+            // The book is up to date, but a browse-UI thumbnail may be missing — an
+            // existing library from before thumbnails, or one deleted from the cache.
+            // Backfill it from the already-extracted cover without a re-split, so the
+            // grid gets thumbnails on the next reconcile rather than a re-index.
+            if let Some(cover) = existing.cover_path.as_deref()
+                && !cover_thumb_path(&book_out).exists()
+                && let Err(err) = extract_cover_thumb(Path::new(cover), &book_out)
+            {
+                tracing::warn!(error = %err, id = %id, "cover thumbnail backfill failed; browse UI will use the full cover");
+            }
             return Ok(existing);
         }
     }
@@ -421,10 +432,43 @@ pub fn scan_book_as(
     let cover_path = if probed.has_cover {
         let ext = cover_ext(probed.cover_codec.as_deref());
         match extract_cover(input, &book_out, ext) {
-            Ok(path) => Some(path.to_string_lossy().into_owned()),
+            Ok(path) => {
+                // Regenerate the browse-UI thumbnail from the freshly-extracted cover,
+                // in this same (single) scanner thread and atomically, so it always
+                // matches the cover — the http layer only ever *serves* it, which is
+                // what keeps thumbnail and cover consistent with no cross-thread race.
+                //
+                // Delete the previous thumbnail FIRST: if regeneration then fails, the
+                // book is left with NO thumbnail (the serve layer falls back to the
+                // current full cover, and the next reconcile backfills it) rather than
+                // a stale one derived from the old cover.
+                let _ = std::fs::remove_file(cover_thumb_path(&book_out));
+                if let Err(err) = extract_cover_thumb(&path, &book_out) {
+                    tracing::warn!(error = %err, id = %id, "cover thumbnail failed; browse UI will use the full cover");
+                }
+                Some(path.to_string_lossy().into_owned())
+            }
             Err(err) => {
-                tracing::warn!(error = %err, id = %id, "cover extraction failed; serving no cover");
-                None
+                // `extract_cover` publishes atomically (writes a `.part` sibling,
+                // renames only on success), so a failed extraction leaves the
+                // previous `cover.jpg` — and its thumbnail — intact on disk. Keep
+                // the stored path rather than dropping it to None and orphaning
+                // that still-valid art: None would 404 both cover routes and block
+                // the reconcile thumbnail backfill, which is gated on a populated
+                // cover_path. `upsert_book` below hasn't run yet, so this still
+                // reads the prior row.
+                let kept = index
+                    .get_book(&id)
+                    .ok()
+                    .flatten()
+                    .and_then(|b| b.cover_path)
+                    .filter(|p| Path::new(p).exists());
+                if kept.is_some() {
+                    tracing::warn!(error = %err, id = %id, "cover extraction failed; keeping the previously extracted cover");
+                } else {
+                    tracing::warn!(error = %err, id = %id, "cover extraction failed; serving no cover");
+                }
+                kept
             }
         }
     } else {
@@ -4400,6 +4444,111 @@ mod tests {
             attrs: Default::default(),
         };
         assert!(watch_event_is_relevant(&hint, lib, data, None));
+    }
+
+    #[test]
+    fn scan_generates_a_thumbnail_and_reconcile_backfills_a_missing_one() {
+        if !ffmpeg_available() {
+            skip!("ffmpeg not available");
+        }
+        let dir = scratch("thumb-gen");
+        let data = dir.join("data");
+        let input = synth_with_cover(&dir);
+        let index = Index::open_in_memory().unwrap();
+        let scan = || {
+            scan_book_as(
+                &input,
+                "coverbook",
+                &data,
+                &index,
+                ScanOptions::default(),
+                &BookOverrides::default(),
+            )
+        };
+
+        // A scan generates the thumbnail alongside the cover.
+        let book = scan().unwrap();
+        let cover = PathBuf::from(book.cover_path.expect("cover extracted"));
+        let thumb = cover.parent().unwrap().join("cover_thumb.jpg");
+        assert!(thumb.exists(), "scan generates the thumbnail");
+
+        // Delete it and re-scan (idempotent, unchanged): the reconcile backfills a
+        // missing thumbnail without re-splitting the book.
+        std::fs::remove_file(&thumb).unwrap();
+        scan().unwrap();
+        assert!(thumb.exists(), "reconcile backfills a missing thumbnail");
+
+        // A re-ingest (mtime changed) deletes the old thumbnail and regenerates it,
+        // so nothing stale from the previous cover survives.
+        let before = std::fs::metadata(&thumb).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // A clearly-different source mtime forces a re-ingest (not the early-return).
+        std::fs::File::options()
+            .write(true)
+            .open(&input)
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+            )
+            .unwrap();
+        scan().unwrap();
+        let after = std::fs::metadata(&thumb).unwrap().modified().unwrap();
+        assert!(after > before, "a re-ingest regenerates the thumbnail");
+    }
+
+    #[test]
+    fn a_failed_cover_re_extraction_keeps_the_previous_cover() {
+        if !ffmpeg_available() {
+            skip!("ffmpeg not available");
+        }
+        let dir = scratch("cover-keep");
+        let data = dir.join("data");
+        let input = synth_with_cover(&dir);
+        let index = Index::open_in_memory().unwrap();
+        let scan = || {
+            scan_book_as(
+                &input,
+                "coverbook",
+                &data,
+                &index,
+                ScanOptions::default(),
+                &BookOverrides::default(),
+            )
+        };
+
+        // A first scan extracts the cover.
+        let book = scan().unwrap();
+        let cover = PathBuf::from(book.cover_path.expect("cover extracted"));
+        assert!(cover.exists(), "cover on disk");
+        let book_out = cover.parent().unwrap().to_path_buf();
+
+        // Block the atomic publish of any *replacement* cover: a directory sitting at
+        // the `.part` target makes ffmpeg's write fail, so `extract_cover` errors while
+        // the previously-published `cover.jpg` stays intact on disk — the exact case
+        // the fallback below must survive.
+        std::fs::create_dir_all(book_out.join("cover.part.jpg")).unwrap();
+
+        // Force a re-ingest (a distinct source mtime, not the idempotent early return).
+        std::fs::File::options()
+            .write(true)
+            .open(&input)
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+            )
+            .unwrap();
+
+        // The re-ingest keeps the still-present cover instead of orphaning it to None —
+        // otherwise both cover routes 404 and the thumbnail backfill can't recover it.
+        let reingested = scan().unwrap();
+        assert_eq!(
+            reingested.cover_path.as_deref(),
+            cover.to_str(),
+            "a failed cover re-extraction keeps the previous cover, not None"
+        );
+        assert!(cover.exists(), "the previous cover survives on disk");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

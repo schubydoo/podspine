@@ -1851,3 +1851,116 @@ async fn set_theme_redirects_back_even_when_ui_origin_differs() {
         "/book/dracula"
     );
 }
+
+#[tokio::test]
+async fn serves_scanner_generated_thumbnail_with_fallback() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+    let dir = std::env::temp_dir().join("podspine-http-thumb");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let data = dir.join("data");
+
+    let index = Index::open_in_memory().unwrap();
+    let input = synth_with_cover(&dir);
+    let book = scan_book(&input, &data, &index).unwrap();
+    let feed_id = book.feed_id.clone();
+    let cover = PathBuf::from(book.cover_path.clone().expect("cover extracted"));
+    let thumb = cover.with_file_name("cover_thumb.jpg");
+    // The scan generates the thumbnail (the http layer only serves it).
+    assert!(thumb.exists(), "the scan should have generated a thumbnail");
+
+    let state = AppState::new(
+        index,
+        "http://test".to_string(),
+        &data,
+        &dir,
+        None,
+        false,
+        None,
+        None,
+    );
+    let app = router(state);
+    let get_thumb = || {
+        app.clone().oneshot(
+            Request::get(format!("/cover/{feed_id}/thumb"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+    };
+
+    // The thumb route serves the scanner-made thumbnail (JPEG, cacheable).
+    let resp = get_thumb().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get(header::CONTENT_TYPE).unwrap(),
+        "image/jpeg"
+    );
+    assert!(
+        resp.headers().get(header::ETAG).is_some(),
+        "thumb is cacheable"
+    );
+    assert!(!body_bytes(resp).await.is_empty(), "thumbnail bytes served");
+
+    // Fallback: with no thumbnail on disk (before a reconcile backfills it), the
+    // route serves the full cover instead of 404ing.
+    std::fs::remove_file(&thumb).unwrap();
+    let resp = get_thumb().await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "falls back to the full cover"
+    );
+    assert!(!body_bytes(resp).await.is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn cover_thumb_falls_back_to_the_full_cover_when_absent() {
+    // A book with a cover but no generated thumbnail (e.g. before a reconcile
+    // backfills it): `/thumb` must serve the full cover file rather than 404.
+    // ffmpeg-free — the handler only serves, it never generates.
+    let dir = std::env::temp_dir().join("podspine-http-thumb-fallback");
+    let _ = std::fs::remove_dir_all(&dir);
+    let data = dir.join("data");
+    let book_dir = data.join("books").join("badcover");
+    std::fs::create_dir_all(&book_dir).unwrap();
+    let cover = book_dir.join("cover.jpg");
+    std::fs::write(&cover, b"this is not an image").unwrap();
+
+    let index = Index::open_in_memory().unwrap();
+    let mut row = book_row("badcover", "Xk9mQ2vP7nR4tB1cY6wZ8a");
+    row.cover_path = Some(cover.to_string_lossy().into_owned());
+    index.upsert_book(&row).unwrap();
+    let feed_id = row.feed_id.clone();
+
+    let state = AppState::new(
+        index,
+        "http://test".to_string(),
+        &data,
+        &dir,
+        None,
+        false,
+        None,
+        None,
+    );
+    let resp = router(state)
+        .oneshot(
+            Request::get(format!("/cover/{feed_id}/thumb"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "falls back to the full cover"
+    );
+    assert_eq!(body_bytes(resp).await, b"this is not an image");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
