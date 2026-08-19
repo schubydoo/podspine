@@ -474,19 +474,6 @@ impl Index {
         let n = self.conn.execute("DELETE FROM book WHERE id = ?1", [id])?;
         Ok(n > 0)
     }
-
-    /// Fetch an episode by guid.
-    pub fn get_episode(&self, guid: &str) -> Result<Option<EpisodeRow>, IndexError> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT guid, book_id, idx, title, file_path, byte_length, duration_sec, start_sec, pubdate_epoch, source_path, needs_faststart
-                 FROM episode WHERE guid = ?1",
-                [guid],
-                episode_from_row,
-            )
-            .optional()?)
-    }
 }
 
 /// Wall-clock **milliseconds** since the Unix epoch, for a book's first-seen time.
@@ -622,11 +609,7 @@ mod tests {
             vec![0, 1, 2],
             "episodes ordered by idx"
         );
-        assert_eq!(
-            idx.get_episode("b1-1").unwrap().as_ref(),
-            Some(&episode("b1", 1))
-        );
-        assert_eq!(idx.get_episode("missing").unwrap(), None);
+        assert_eq!(eps[1], episode("b1", 1), "upsert keeps the row content");
     }
 
     #[test]

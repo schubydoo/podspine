@@ -22,8 +22,6 @@ tokio = { version = "1.52", features = ["full"] }
 # feed
 rss = "2.1.0"
 time = { version = "0.3.47", features = ["formatting", "parsing"] } # >=0.3.47: RUSTSEC-2026-0009
-# probe / chapters (ffprobe is primary; mp4ameta is the pure-Rust fallback)
-mp4ameta = "0.13.0"
 # index / storage (bundled SQLite compiles into the static binary)
 rusqlite = { version = "0.40", features = ["bundled"] }
 # ui
@@ -35,7 +33,6 @@ base64 = "0.23"
 blake3 = "1.5"
 # scanning / watching
 notify = "8"
-walkdir = "2"
 # config / cli
 clap = { version = "4", features = ["derive", "env"] }
 toml = "1.0"

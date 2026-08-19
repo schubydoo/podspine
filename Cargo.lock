@@ -1225,17 +1225,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "podspine-cli"
-version = "1.7.0"
-dependencies = [
- "anyhow",
- "clap",
- "podspine-feed",
- "podspine-prober",
- "podspine-splitter",
-]
-
-[[package]]
 name = "podspine-config"
 version = "1.7.0"
 dependencies = [
@@ -1296,7 +1285,6 @@ dependencies = [
  "metrics-exporter-prometheus",
  "tokio",
  "tower",
- "tracing",
 ]
 
 [[package]]
