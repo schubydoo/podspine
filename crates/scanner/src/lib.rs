@@ -4552,6 +4552,30 @@ mod tests {
     }
 
     #[test]
+    fn watch_filter_ignores_output_under_the_canonical_data_dir() {
+        // The configured data dir can be spelled differently from where it resolves
+        // (a symlinked mount), so the filter also checks the canonical path. A write
+        // under the CANONICAL data dir is still our own split output and must be
+        // ignored even when it doesn't match the raw spelling.
+        let lib = Path::new("/lib");
+        let raw = Path::new("/lib/.podspine"); // as configured
+        let canon = Path::new("/mnt/real/podspine"); // where it resolves to
+        assert!(!watch_path_is_relevant(
+            Path::new("/mnt/real/podspine/BookX/001.m4a"),
+            lib,
+            raw,
+            Some(canon),
+        ));
+        // A real library file (under neither data dir) stays relevant.
+        assert!(watch_path_is_relevant(
+            Path::new("/lib/Author/Title/book.m4b"),
+            lib,
+            raw,
+            Some(canon),
+        ));
+    }
+
+    #[test]
     fn chapterless_file_becomes_a_single_episode() {
         if !ffmpeg_available() {
             skip!("ffmpeg not available");

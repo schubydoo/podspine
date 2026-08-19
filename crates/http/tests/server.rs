@@ -1964,3 +1964,80 @@ async fn cover_thumb_falls_back_to_the_full_cover_when_absent() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn cover_conditional_get_honours_wildcard_and_weak_etag() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+    let dir = std::env::temp_dir().join("podspine-http-cover-cond");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let data = dir.join("data");
+
+    let index = Index::open_in_memory().unwrap();
+    let input = synth_with_cover(&dir);
+    let book = scan_book(&input, &data, &index).unwrap();
+    let feed_id = book.feed_id.clone();
+
+    let state = AppState::new(
+        index,
+        "http://test".to_string(),
+        &data,
+        &dir,
+        None,
+        false,
+        None,
+        None,
+    );
+    let app = router(state);
+
+    // Grab the strong ETag from a normal request.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/cover/{feed_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let etag = resp
+        .headers()
+        .get(header::ETAG)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let _ = body_bytes(resp).await;
+
+    // A wildcard `If-None-Match: *` revalidates to 304.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/cover/{feed_id}"))
+                .header(header::IF_NONE_MATCH, "*")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED, "wildcard matches");
+
+    // A weak validator (`W/"…"`) matches the same resource and returns 304.
+    let weak = format!("W/{etag}");
+    let resp = app
+        .oneshot(
+            Request::get(format!("/cover/{feed_id}"))
+                .header(header::IF_NONE_MATCH, weak)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED, "weak etag matches");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
