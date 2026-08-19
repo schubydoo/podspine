@@ -29,7 +29,9 @@ crates/
 ├── index             # rusqlite (bundled) store
 ├── feed              # RSS 2.0 + itunes/podcast + self-check
 ├── http              # Axum router + middleware
-└── ui                # maud pages
+├── ui                # maud pages
+├── metrics           # optional Prometheus instrumentation (--metrics-bind)
+└── test-support      # dev-only test fixtures (skip! macros, ffmpeg synthesis)
 ```
 
 ## Common commands
@@ -38,7 +40,7 @@ crates/
 cargo build                                   # build the workspace
 cargo run -- --library ./sample-books         # run the server → http://localhost:8080
 cargo test --workspace                        # run all tests
-cargo clippy --all-targets -- -D warnings     # lint (warnings are errors)
+cargo clippy --workspace --all-targets --all-features -- -D warnings  # lint (matches CI's gate)
 cargo fmt                                      # format
 ```
 
@@ -55,6 +57,10 @@ audiobooks.)
   the pipeline. These are gated on tool availability: if `ffmpeg`/`ffprobe` — or a
   specific encoder — isn't present, the test prints a skip notice and returns rather
   than failing. Encoders used include `aac`, `libmp3lame`, `flac`, and `libopus`.
+  The shared machinery (the `skip!`/`skip_unless_ffmpeg!` macros, fixture synthesis,
+  scratch-dir guards) lives in the dev-only `crates/test-support` crate. CI runs the
+  suite through `cargo nextest run`; plain `cargo test` and local `cargo nextest run`
+  both work.
 
 Run with logs to see scan/serve behavior:
 
@@ -100,12 +106,17 @@ produces the per-arch binaries and lays them out under `dist/` — see
 ## Hooks & CI
 
 - **Pre-commit** (`.pre-commit-config.yaml`) runs `cargo fmt --check`, `clippy -D
-  warnings`, and the lib unit tests before a commit lands, plus hygiene checks
-  (trailing whitespace, large files, secret/private-key detection). Install with
-  `pre-commit install`.
-- **CI** (`.github/workflows/ci.yml`): a `quality` job (fmt · clippy · test with
-  ffmpeg installed) and a `supply-chain` job (`cargo audit` + `cargo deny`) on every
-  push/PR. Releases run separately on `v*` tags.
+  warnings`, the lib unit tests, and the changeset lint before a commit lands, plus
+  hygiene checks (trailing whitespace, large files, secret/private-key detection).
+  A **pre-push** stage additionally runs the full workspace suite plus `cargo audit`
+  and `cargo deny` — both binaries must be on `PATH` or the push hook fails. Install
+  with `pre-commit install --install-hooks -t pre-commit -t pre-push`.
+- **CI** (`.github/workflows/ci.yml`), on PRs and pushes to `main`: `lint`
+  (fmt · clippy), a `test` matrix (ubuntu + macos, `cargo nextest` emitting JUnit
+  that uploads to Codecov Test Analytics), an informational non-blocking Windows
+  leg, `coverage` (cargo-llvm-cov with a **90% line floor** + Codecov upload),
+  `supply-chain` (`cargo audit` + `cargo deny`), and a required-checks aggregator.
+  Releases run separately on `v*` tags.
 
-Please make sure `fmt`, `clippy -D warnings`, and `test --workspace` all pass before
-opening a PR — CI enforces the same gates.
+Please make sure `fmt`, `clippy` (with `--workspace --all-features`), and
+`test --workspace` all pass before opening a PR — CI enforces the same gates.

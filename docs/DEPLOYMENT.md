@@ -5,8 +5,9 @@ is enough; this page covers the production details: persistence, exposing it saf
 and running it as a service.
 
 > **Podspine has no built-in login.** It splits into two surfaces (see
-> [Exposing Podspine safely](#exposing-podspine-safely) below): the **feed/audio/cover**
-> routes are protected by an unguessable per-book **capability URL** and are safe to
+> [Exposing Podspine safely](#exposing-podspine-safely) below): the
+> **feed/audio/cover/subscribe** routes are protected by an unguessable per-book
+> **capability URL** and are safe to
 > expose to the internet, while the **browse UI** enumerates your whole library and
 > must stay on your LAN or behind proxy-auth. See [SECURITY.md](https://github.com/schubydoo/podspine/blob/main/SECURITY.md).
 
@@ -236,8 +237,8 @@ Podspine has two kinds of routes, and they want different exposure:
 
 | Surface | Routes | Keyed by | Expose to the internet? |
 |---|---|---|---|
-| **Capability** | `GET /feed/{id}.xml`, `/audio/{id}/{n}`, `/cover/{id}`, `/healthz` | a random, unguessable per-book `feed_id` | **Yes** — a guessed id just 404s, and feeds carry `itunes:block` + `X-Robots-Tag: noindex` so they aren't listed or crawled |
-| **Browse UI** | `GET /`, `/book/{slug}`, `POST /book/{slug}/regenerate` | the human `slug` | **No** — `GET /` lists every book, handing out the "unguessable" URLs. Keep it on the LAN or behind proxy-auth |
+| **Capability** | `GET /feed/{id}.xml`, `/audio/{id}/{n}`, `/cover/{id}`, `/cover/{id}/thumb`, `/subscribe/{id}`, `/healthz` | a random, unguessable per-book `feed_id` | **Yes** — a guessed id just 404s, and feeds carry `itunes:block` + `X-Robots-Tag: noindex` so they aren't listed or crawled. `/subscribe` must be public in a split deployment: the QR on the (LAN-only) book page points your phone at `base_url/subscribe/{feed_id}`, and it exposes only that one book's links |
+| **Browse UI** | `GET /`, `/book/{slug}`, `POST /book/{slug}/regenerate`, `POST /theme/{mode}` | the human `slug` | **No** — `GET /` lists every book, handing out the "unguessable" URLs. Keep it on the LAN or behind proxy-auth |
 
 This is what lets you subscribe to a book and stream it **on the road without a VPN**:
 you copy the capability feed URL (or scan its QR) from the book page **on your LAN**,
@@ -358,18 +359,18 @@ the browse UI private. Two hard requirements:
    Range to seek/scrub; stripping it breaks playback.
 2. Set `PODSPINE_BASE_URL` to the **public** URL so generated feed/audio links match.
 
-The configs below publish `/feed`, `/audio`, `/cover`, `/healthz` and refuse the
-browse UI (`/`, `/book/*`) — you use the UI over the LAN. (Prefer one authenticated
+The configs below publish `/feed`, `/audio`, `/cover`, `/subscribe`, `/healthz` and
+refuse the browse UI (`/`, `/book/*`) — you use the UI over the LAN. (Prefer one authenticated
 hostname instead? Drop the `@ui`/`location /` blocks and put `basicauth`/`auth_basic`
-on the whole server — just never require auth on `/feed`,`/audio`,`/cover`, since
-podcast apps can't log in.)
+on the whole server — just never require auth on `/feed`,`/audio`,`/cover`,
+`/subscribe`, since podcast apps (and a phone that just scanned a QR) can't log in.)
 
 **Caddy** (Range passes through automatically):
 
 ```caddy
 podspine.example.com {
     # Public: the capability surface only (unguessable per-book URLs).
-    @capability path /feed/* /audio/* /cover/* /healthz
+    @capability path /feed/* /audio/* /cover/* /subscribe/* /healthz
     handle @capability {
         reverse_proxy 127.0.0.1:8080
     }
@@ -386,8 +387,8 @@ podspine.example.com {
 server {
     server_name podspine.example.com;
 
-    # Public capability surface: feeds, cover, and audio (with Range).
-    location ~ ^/(feed|audio|cover)/ {
+    # Public capability surface: feeds, cover, audio (with Range), and subscribe.
+    location ~ ^/(feed|audio|cover|subscribe)/ {
         proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host $host;
         proxy_set_header Range $http_range;               # forward seek requests

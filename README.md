@@ -87,8 +87,9 @@ Windows (PowerShell):
 irm https://raw.githubusercontent.com/schubydoo/podspine/main/install.ps1 | iex
 ```
 
-Or a package manager — `brew install schubydoo/podspine/podspine`, `scoop install
-podspine`, `nix profile install github:schubydoo/podspine`,
+Or a package manager — `brew install schubydoo/podspine/podspine`,
+`scoop bucket add podspine https://github.com/schubydoo/scoop-podspine && scoop install podspine`,
+`nix profile install github:schubydoo/podspine`,
 or `cargo binstall --git https://github.com/schubydoo/podspine podspine`.
 `ffmpeg`/`ffprobe` must be on your `PATH`. Full matrix,
 version pinning, uninstall, and signature verification: **[Installing](https://schubydoo.github.io/podspine/latest/installation/)**.
@@ -138,7 +139,8 @@ override settings — `storage_mode`, `title`/`author`, `disabled`, and more —
 just that book. See **[per-book overrides](docs/DEPLOYMENT.md#per-book-overrides-podspinetoml)**.
 
 Each book's feed lives at an unguessable **capability URL** — `/feed/{feed_id}.xml`,
-with `/audio/{feed_id}/{n}` (episode audio, HTTP Range) and `/cover/{feed_id}`. The
+with `/audio/{feed_id}/{n}` (episode audio, HTTP Range), `/cover/{feed_id}`, and
+`/subscribe/{feed_id}` (the add-to-app helper page the QR opens). The
 browse UI (`/`, `/book/{slug}`) enumerates your library, so keep it on the LAN or
 behind proxy-auth while the capability routes are safe to expose — see
 **[exposing Podspine safely](docs/DEPLOYMENT.md#exposing-podspine-safely)**.
