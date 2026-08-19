@@ -979,8 +979,12 @@ fn resolve_book_overrides(source: &Path, library_root: &Path) -> BookOverrides {
 /// canonicalizable paths also means an unmounted library (every source missing)
 /// collapses nothing. Best-effort: a failed lookup leaves the index untouched.
 fn collapse_duplicate_source_rows(index: &Index, data_dir: &Path) {
-    let Ok(identities) = index.book_source_identities() else {
-        return;
+    let identities = match index.book_source_identities() {
+        Ok(identities) => identities,
+        Err(err) => {
+            tracing::warn!(error = %err, "duplicate-row collapse skipped: identity listing failed");
+            return;
+        }
     };
     // `book_source_identities` is ordered oldest-first (created_at asc), so the
     // FIRST row seen for a source is the earliest-created — the feed subscribers
@@ -1042,12 +1046,19 @@ pub fn scan_library(
     // that was suffixed because a now-pruned stale row occupied its base id would,
     // on the next scan, ALSO be indexed under the freed base id: one audiobook
     // under two capability feeds (Greptile). Reuse makes the id stable per source.
-    let existing_by_source: HashMap<PathBuf, String> = index
-        .list_books()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|b| (PathBuf::from(b.source_path), b.id))
-        .collect();
+    let existing_by_source: HashMap<PathBuf, String> = match index.list_books() {
+        Ok(books) => books
+            .into_iter()
+            .map(|b| (PathBuf::from(b.source_path), b.id))
+            .collect(),
+        Err(err) => {
+            // Proceed with an empty map (same behavior as before), but say so:
+            // id reuse — the primary feed-URL stability mechanism — is skipped
+            // for this scan, leaving only the owns_a_different_source guard.
+            tracing::warn!(error = %err, "listing books failed; id reuse skipped this scan");
+            HashMap::new()
+        }
+    };
 
     let mut seen = HashSet::new();
     let mut summary = ScanSummary::default();
@@ -1088,8 +1099,11 @@ pub fn scan_library(
         // `disabled` (a `.podspine.toml` troubleshooting knob): drop the book from
         // every surface — prune it if it was previously indexed, and skip.
         if overrides.disabled == Some(true) {
-            if matches!(index.get_book(&slug), Ok(Some(_))) {
-                let _ = index.delete_book(&slug);
+            // `delete_book` reports via its bool whether a row existed, so no
+            // pre-check is needed; a failed delete must be surfaced — the book
+            // would silently stay indexed and keep serving its feed.
+            if let Err(err) = index.delete_book(&slug) {
+                tracing::warn!(slug = %slug, error = %err, "failed to prune disabled book");
             }
             tracing::info!(slug = %slug, "book disabled by .podspine.toml — skipped");
             summary.skipped += 1;

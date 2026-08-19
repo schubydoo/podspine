@@ -570,7 +570,12 @@ fn qr_svg_sized(data: &str, px: u32) -> String {
             .min_dimensions(px, px)
             .quiet_zone(true)
             .build(),
-        Err(_) => String::new(),
+        // Practically unreachable (QR capacity ~2.9 KB; feed URLs are far
+        // shorter) — logged so the impossible is noticed if it ever happens.
+        Err(err) => {
+            tracing::warn!(error = %err, "QR encoding failed; rendering without a code");
+            String::new()
+        }
     }
 }
 

@@ -95,6 +95,12 @@ pub fn pubdate_epoch(anchor: i64, idx: usize, n: usize) -> i64 {
 }
 
 /// Format an epoch as an RFC 2822 date string (RSS `<pubDate>` format).
+///
+/// The empty-string fallback is unreachable with real mtimes: every epoch in
+/// 0..now is well inside `OffsetDateTime`'s range, and Rfc2822 formats any such
+/// datetime. Item-level dates are additionally guarded by selfcheck's
+/// `BadPubDate`; channel-level dates are not, which is why this stays a plain
+/// fallback rather than an `Option`.
 fn format_rfc2822(epoch: i64) -> String {
     OffsetDateTime::from_unix_timestamp(epoch)
         .ok()

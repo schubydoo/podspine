@@ -1033,6 +1033,7 @@ async fn enforce_cache(state: &AppState, keep: &FsPath) {
     // without holding the lock across the `is_file` stats.
     let sources: Vec<(String, bool)> = {
         let Ok(index) = state.index.lock() else {
+            tracing::warn!("cache eviction skipped: index lock poisoned");
             return;
         };
         match index.list_books() {
@@ -1045,7 +1046,10 @@ async fn enforce_cache(state: &AppState, keep: &FsPath) {
                     (b.id, regen)
                 })
                 .collect(),
-            Err(_) => return,
+            Err(err) => {
+                tracing::warn!(error = %err, "cache eviction skipped: listing books failed");
+                return;
+            }
         }
     };
     let regenerable: HashSet<PathBuf> = sources
@@ -1054,7 +1058,11 @@ async fn enforce_cache(state: &AppState, keep: &FsPath) {
         .map(|(id, _)| books.join(id))
         .collect();
     let keep = keep.to_path_buf();
-    let _ = tokio::task::spawn_blocking(move || evict(&books, cap, ttl, &keep, &regenerable)).await;
+    if let Err(err) =
+        tokio::task::spawn_blocking(move || evict(&books, cap, ttl, &keep, &regenerable)).await
+    {
+        tracing::warn!(error = %err, "cache eviction task failed");
+    }
 }
 
 /// Collect cached chapter files (numeric stems under `books/*/`) from
@@ -1167,8 +1175,10 @@ enum AppError {
 }
 
 impl AppError {
-    /// Collapse any error into `Internal` (the detail is logged elsewhere).
-    fn internal<E>(_e: E) -> Self {
+    /// Collapse any error into `Internal`, logging the detail — the client sees
+    /// only a 500, but the operator gets the cause.
+    fn internal<E: std::fmt::Display>(e: E) -> Self {
+        tracing::error!(error = %e, "internal error");
         AppError::Internal
     }
 }

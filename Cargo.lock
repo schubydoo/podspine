@@ -1328,6 +1328,7 @@ version = "1.7.0"
 dependencies = [
  "maud",
  "qrcode",
+ "tracing",
 ]
 
 [[package]]
