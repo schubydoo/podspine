@@ -17,6 +17,11 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
+// Re-exported so downstream crates (http) can consume the typed
+// `storage_mode`/`transcode` columns without a `podspine-config` dependency of
+// their own.
+pub use podspine_config::{StorageMode, TranscodeMode};
+
 /// Capability-id generation: an unguessable, URL-safe feed id. Stored raw (it is
 /// the owner's own retrievable link, shown in the UI and QR — not a hashed
 /// per-subscriber secret).
@@ -49,7 +54,6 @@ CREATE TABLE IF NOT EXISTS book (
     cover_path   TEXT,
     source_path  TEXT NOT NULL,
     source_mtime INTEGER NOT NULL,
-    status       TEXT NOT NULL,
     storage_mode TEXT NOT NULL DEFAULT '',
     default_cover_url TEXT,
     force_embedded INTEGER NOT NULL DEFAULT 0,
@@ -92,13 +96,11 @@ pub struct BookRow {
     pub source_path: String,
     /// Source mtime (epoch seconds).
     pub source_mtime: i64,
-    /// Processing status (e.g. `ready`).
-    pub status: String,
-    /// Effective per-book storage mode as a string (`"full"`/`"saver"`), or `""`
-    /// to follow the global config (a pre-6.4 row, until re-scanned). Persisted so
-    /// the serve/evict layers honor a per-book `.podspine.toml` override without
-    /// the sidecar (Sprint 6.4).
-    pub storage_mode: String,
+    /// Effective per-book storage mode, or `None` to follow the global config
+    /// (a pre-6.4 row, until re-scanned). Persisted so the serve/evict layers
+    /// honor a per-book `.podspine.toml` override without the sidecar
+    /// (Sprint 6.4). Stored as TEXT (`"full"`/`"saver"`, `None` = `""`).
+    pub storage_mode: Option<StorageMode>,
     /// Per-book feed cover fallback (a `.podspine.toml` override), tried before
     /// the server-wide `default_cover_url`.
     pub default_cover_url: Option<String>,
@@ -106,11 +108,12 @@ pub struct BookRow {
     /// override). Persisted only so a scan can detect a toggle and re-ingest;
     /// not read at serve time.
     pub force_embedded: bool,
-    /// Effective transcode mode at last ingest (`""`/`"off"`/`"aac"`/`"mp3"`,
-    /// Task 5.2). Persisted only so a scan can detect a `PODSPINE_TRANSCODE`
-    /// toggle — which changes the episode container and every `byte_length` — and
-    /// re-ingest the book; not read at serve time. `""` is a pre-5.2 row.
-    pub transcode: String,
+    /// Effective transcode mode at last ingest (Task 5.2). Persisted so a scan
+    /// can detect a `PODSPINE_TRANSCODE` toggle — which changes the episode
+    /// container and every `byte_length` — and re-ingest the book. `None` is a
+    /// pre-5.2 row, which was necessarily stream-copied. Stored as TEXT
+    /// (`"off"`/`"aac"`/`"mp3"`, `None` = `""`).
+    pub transcode: Option<TranscodeMode>,
 }
 
 /// One episode (a split chapter). Numeric fields are stored as SQLite integers.
@@ -243,6 +246,13 @@ impl Index {
         if add_column_if_missing(conn, "book", "created_at", "INTEGER NOT NULL DEFAULT 0")? {
             conn.execute("UPDATE book SET created_at = rowid", [])?;
         }
+        // `book.status` is gone: it was write-only — always `"ready"`, never read
+        // anywhere in the workspace — so it was dead weight in every SELECT and
+        // struct literal. A database created by an older Podspine still carries
+        // the column (with `NOT NULL`, which would break the column-less INSERT
+        // in `upsert_book`), so drop it rather than leave fresh and migrated
+        // schemas divergent.
+        drop_column_if_present(conn, "book", "status")?;
         Ok(())
     }
 
@@ -255,12 +265,12 @@ impl Index {
     pub fn upsert_book(&self, b: &BookRow) -> Result<(), IndexError> {
         self.conn.execute(
             "INSERT INTO book
-               (id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status, storage_mode, default_cover_url, force_embedded, transcode, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+               (id, slug, feed_id, title, author, cover_path, source_path, source_mtime, storage_mode, default_cover_url, force_embedded, transcode, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(id) DO UPDATE SET
                slug=excluded.slug, title=excluded.title, author=excluded.author,
                cover_path=excluded.cover_path, source_path=excluded.source_path,
-               source_mtime=excluded.source_mtime, status=excluded.status,
+               source_mtime=excluded.source_mtime,
                storage_mode=excluded.storage_mode, default_cover_url=excluded.default_cover_url,
                force_embedded=excluded.force_embedded, transcode=excluded.transcode",
             // created_at is set on first insert and deliberately absent from the
@@ -275,11 +285,13 @@ impl Index {
                 b.cover_path,
                 b.source_path,
                 b.source_mtime,
-                b.status,
-                b.storage_mode,
+                // The enum↔TEXT boundary (write side): `None` persists as `""`,
+                // a known mode as its canonical label — byte-identical to what
+                // pre-typed builds wrote, so a re-scan never churns rows.
+                b.storage_mode.map_or("", StorageMode::label),
                 b.default_cover_url,
                 b.force_embedded,
-                b.transcode,
+                b.transcode.map_or("", TranscodeMode::label),
                 now_epoch_millis(),
             ],
         )?;
@@ -431,6 +443,23 @@ fn add_column_if_missing(
     Ok(false)
 }
 
+/// Drop `column` from `table` if present — [`add_column_if_missing`]'s inverse,
+/// for retiring a column an older Podspine wrote that nothing reads anymore.
+/// Same `pragma_table_info` probe; `ALTER TABLE … DROP COLUMN` needs SQLite ≥
+/// 3.35, and the bundled SQLite in rusqlite 0.40 is far past that.
+fn drop_column_if_present(conn: &Connection, table: &str, column: &str) -> Result<(), IndexError> {
+    let present: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+        params![table, column],
+        |r| r.get(0),
+    )?;
+    if present > 0 {
+        // table/column are compile-time literals from `migrate` — safe to splice.
+        conn.execute(&format!("ALTER TABLE {table} DROP COLUMN {column}"), [])?;
+    }
+    Ok(())
+}
+
 /// Wall-clock **milliseconds** since the Unix epoch, for a book's first-seen time.
 /// Milliseconds (not seconds) so two books indexed close together still order
 /// distinctly. A clock before 1970 (unset RTC) clamps to 0 rather than panicking.
@@ -443,7 +472,7 @@ fn now_epoch_millis() -> i64 {
 
 /// The `book` SELECT column list. Order must match `book_from_row`'s ordinals —
 /// one definition so adding a column edits exactly one string and one mapper.
-const BOOK_COLUMNS: &str = "id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status, storage_mode, default_cover_url, force_embedded, transcode";
+const BOOK_COLUMNS: &str = "id, slug, feed_id, title, author, cover_path, source_path, source_mtime, storage_mode, default_cover_url, force_embedded, transcode";
 
 fn book_from_row(row: &Row) -> rusqlite::Result<BookRow> {
     Ok(BookRow {
@@ -455,11 +484,14 @@ fn book_from_row(row: &Row) -> rusqlite::Result<BookRow> {
         cover_path: row.get(5)?,
         source_path: row.get(6)?,
         source_mtime: row.get(7)?,
-        status: row.get(8)?,
-        storage_mode: row.get(9)?,
-        default_cover_url: row.get(10)?,
-        force_embedded: row.get(11)?,
-        transcode: row.get(12)?,
+        // The enum↔TEXT boundary (read side): `""` — a pre-6.4/pre-5.2 row — and
+        // any unrecognized value both map to `None`, preserving the historical
+        // fall-through-to-global behavior (a typo'd or future mode can never
+        // crash a serve; it just follows the server config until re-scanned).
+        storage_mode: StorageMode::from_label(&row.get::<_, String>(8)?),
+        default_cover_url: row.get(9)?,
+        force_embedded: row.get(10)?,
+        transcode: TranscodeMode::from_label(&row.get::<_, String>(11)?),
     })
 }
 
@@ -494,11 +526,10 @@ mod tests {
             cover_path: None,
             source_path: format!("/library/{id}.m4b"),
             source_mtime: 1_700_000_000,
-            status: "ready".to_string(),
-            storage_mode: String::new(),
+            storage_mode: None,
             default_cover_url: None,
             force_embedded: false,
-            transcode: String::new(),
+            transcode: None,
         }
     }
 
@@ -660,8 +691,20 @@ mod tests {
         );
         let book = idx.get_book("b1").unwrap().unwrap();
         assert_eq!(
-            book.transcode, "",
-            "migrated rows default to an empty transcode mode (pre-5.2, not transcoded)"
+            book.transcode, None,
+            "migrated rows default to no transcode mode (pre-5.2, not transcoded)"
+        );
+        let status_present: i64 = idx
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('book') WHERE name = 'status'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status_present, 0,
+            "the write-only status column is dropped by the migration"
         );
         let (_, _, created_at) = idx
             .book_source_identities()

@@ -37,6 +37,28 @@ pub enum StorageMode {
     Saver,
 }
 
+impl StorageMode {
+    /// The canonical label for this mode (`"full"`/`"saver"`) — the TOML/CLI
+    /// spelling, and the TEXT the index persists in `book.storage_mode`.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            StorageMode::Full => "full",
+            StorageMode::Saver => "saver",
+        }
+    }
+
+    /// Inverse of [`StorageMode::label`]; `None` for anything else.
+    #[must_use]
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "full" => Some(StorageMode::Full),
+            "saver" => Some(StorageMode::Saver),
+            _ => None,
+        }
+    }
+}
+
 /// Whether to re-encode sources no podcatcher can play, and to what (Task 5.2).
 ///
 /// Off by default: Podspine is copy-first, and a re-encode both costs CPU at
@@ -66,6 +88,28 @@ impl TranscodeMode {
     #[must_use]
     pub fn is_on(self) -> bool {
         !matches!(self, TranscodeMode::Off)
+    }
+
+    /// The canonical label for this mode (`"off"`/`"aac"`/`"mp3"`) — the
+    /// TOML/CLI spelling, and the TEXT the index persists in `book.transcode`.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            TranscodeMode::Off => "off",
+            TranscodeMode::Aac => "aac",
+            TranscodeMode::Mp3 => "mp3",
+        }
+    }
+
+    /// Inverse of [`TranscodeMode::label`]; `None` for anything else.
+    #[must_use]
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "off" => Some(TranscodeMode::Off),
+            "aac" => Some(TranscodeMode::Aac),
+            "mp3" => Some(TranscodeMode::Mp3),
+            _ => None,
+        }
     }
 }
 
@@ -916,6 +960,30 @@ mod tests {
             Config::resolve(&cl, &file).unwrap().transcode,
             TranscodeMode::Mp3
         );
+    }
+
+    #[test]
+    fn mode_labels_are_pinned_and_round_trip() {
+        // These labels are persisted in the index (`book.storage_mode` /
+        // `book.transcode`), so changing one would re-ingest every library on
+        // upgrade — pin all values.
+        for (mode, label) in [(StorageMode::Full, "full"), (StorageMode::Saver, "saver")] {
+            assert_eq!(mode.label(), label);
+            assert_eq!(StorageMode::from_label(label), Some(mode));
+        }
+        for (mode, label) in [
+            (TranscodeMode::Off, "off"),
+            (TranscodeMode::Aac, "aac"),
+            (TranscodeMode::Mp3, "mp3"),
+        ] {
+            assert_eq!(mode.label(), label);
+            assert_eq!(TranscodeMode::from_label(label), Some(mode));
+        }
+        // Unknown or empty labels don't parse (the index reads them as None).
+        assert_eq!(StorageMode::from_label(""), None);
+        assert_eq!(StorageMode::from_label("Saver"), None);
+        assert_eq!(TranscodeMode::from_label(""), None);
+        assert_eq!(TranscodeMode::from_label("flac"), None);
     }
 
     #[test]

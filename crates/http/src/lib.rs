@@ -48,7 +48,7 @@ use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 use podspine_feed::{FeedBook, FeedEpisode, render_checked};
-use podspine_index::{BookRow, Index};
+use podspine_index::{BookRow, Index, StorageMode, TranscodeMode};
 use podspine_splitter::{ChapterCut, cover_thumb_path, remux_faststart, split_chapter};
 use podspine_ui::{
     BookCard, BookDetail, Theme, book_page, index_page, scanning_page, subscribe_page,
@@ -154,9 +154,10 @@ pub struct AppState {
     pub library_dir: PathBuf,
     /// Feed-level fallback cover URL for books with no embedded art.
     pub default_cover_url: Option<String>,
-    /// `saver` storage mode: episode files aren't pre-split — the audio handler
-    /// regenerates a chapter on demand and caches it. `false` = pre-split.
-    pub saver: bool,
+    /// Server-default storage mode. Under [`StorageMode::Saver`], episode files
+    /// aren't pre-split — the audio handler regenerates a chapter on demand and
+    /// caches it; `Full` = pre-split. A book carrying its own mode overrides it.
+    pub storage: StorageMode,
     /// `saver`-mode cache cap in bytes (`None` = unbounded).
     pub cache_size_bytes: Option<u64>,
     /// `saver`-mode cache TTL (`None` = size-only eviction).
@@ -177,8 +178,8 @@ pub struct AppState {
 impl AppState {
     /// Build state, canonicalizing the data dir **and** the library root for the
     /// path-safety checks (served files must stay under one of them). The
-    /// `saver`/cache args come from [`podspine_config::Config`] (pre-split
-    /// defaults: `saver=false`).
+    /// storage/cache args come from [`podspine_config::Config`] (pre-split
+    /// default: `StorageMode::Full`).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         index: Index,
@@ -186,7 +187,7 @@ impl AppState {
         data_dir: &FsPath,
         library_dir: &FsPath,
         default_cover_url: Option<String>,
-        saver: bool,
+        storage: StorageMode,
         cache_size_bytes: Option<u64>,
         cache_ttl: Option<Duration>,
     ) -> Self {
@@ -202,7 +203,7 @@ impl AppState {
             data_dir,
             library_dir,
             default_cover_url,
-            saver,
+            storage,
             cache_size_bytes,
             cache_ttl,
             inflight: Arc::new(Mutex::new(HashMap::new())),
@@ -729,26 +730,22 @@ fn build_feed_xml(state: &AppState, feed_id: &str) -> Result<String, AppError> {
 /// What `/audio` needs: the canonical target file (which may not exist yet in
 /// `saver` mode) and, in `saver` mode, everything to regenerate it on demand.
 /// Whether a book's effective storage mode is `saver`: its per-book
-/// `.podspine.toml` override (Sprint 6.4) if set, else the server default. An
-/// empty string is a pre-6.4 row that follows the server config until re-scanned.
+/// `.podspine.toml` override (Sprint 6.4) if set, else the server default. A
+/// `None` is a pre-6.4 row that follows the server config until re-scanned.
 /// Whether this book's episodes were **re-encoded** at ingest (Task 5.2).
 ///
 /// A re-encode is not byte-reproducible across ffmpeg builds, so such an episode
 /// must never be regenerated on demand (the rebuilt file's length could no longer
 /// match the `enclosure length` already published in the feed) and must never be
 /// evicted (nothing could rebuild it). Both callers below therefore treat a
-/// transcoded book as `full`, whatever its `storage_mode` says. `""` is a pre-5.2
-/// row, which was necessarily stream-copied.
+/// transcoded book as `full`, whatever its `storage_mode` says. `None` is a
+/// pre-5.2 row, which was necessarily stream-copied.
 fn book_is_transcoded(book: &BookRow) -> bool {
-    !matches!(book.transcode.as_str(), "" | "off")
+    book.transcode.is_some_and(TranscodeMode::is_on)
 }
 
-fn book_is_saver(book: &BookRow, global_saver: bool) -> bool {
-    match book.storage_mode.as_str() {
-        "saver" => true,
-        "full" => false,
-        _ => global_saver,
-    }
+fn book_is_saver(book: &BookRow, global: StorageMode) -> bool {
+    book.storage_mode.unwrap_or(global) == StorageMode::Saver
 }
 
 struct AudioTarget {
@@ -910,7 +907,7 @@ fn resolve_audio_target(
                 duration_sec: ep.duration_sec,
             },
         })
-    } else if book_is_saver(&book, state.saver)
+    } else if book_is_saver(&book, state.storage)
         && !book_is_transcoded(&book)
         && FsPath::new(&book.source_path).is_file()
     {
@@ -1040,7 +1037,7 @@ async fn enforce_cache(state: &AppState, keep: &FsPath) {
             Ok(bs) => bs
                 .into_iter()
                 .map(|b| {
-                    let regen = book_is_saver(&b, state.saver)
+                    let regen = book_is_saver(&b, state.storage)
                         && !book_is_transcoded(&b)
                         && FsPath::new(&b.source_path).is_file();
                     (b.id, regen)
@@ -1217,7 +1214,7 @@ mod tests {
 
     #[test]
     fn book_is_saver_follows_per_book_then_global() {
-        let mk = |mode: &str| BookRow {
+        let mk = |mode: Option<StorageMode>| BookRow {
             id: "b".into(),
             slug: "b".into(),
             feed_id: "cap".into(),
@@ -1226,23 +1223,28 @@ mod tests {
             cover_path: None,
             source_path: "/x".into(),
             source_mtime: 0,
-            status: "ready".into(),
-            storage_mode: mode.into(),
+            storage_mode: mode,
             default_cover_url: None,
             force_embedded: false,
-            transcode: String::new(),
+            transcode: None,
         };
         // An explicit per-book mode wins regardless of the server default.
-        assert!(book_is_saver(&mk("saver"), false));
-        assert!(!book_is_saver(&mk("full"), true));
-        // An empty mode (a pre-6.4 row) follows the server default.
-        assert!(book_is_saver(&mk(""), true));
-        assert!(!book_is_saver(&mk(""), false));
+        assert!(book_is_saver(
+            &mk(Some(StorageMode::Saver)),
+            StorageMode::Full
+        ));
+        assert!(!book_is_saver(
+            &mk(Some(StorageMode::Full)),
+            StorageMode::Saver
+        ));
+        // No mode (a pre-6.4 row) follows the server default.
+        assert!(book_is_saver(&mk(None), StorageMode::Saver));
+        assert!(!book_is_saver(&mk(None), StorageMode::Full));
     }
 
     #[test]
     fn a_transcoded_book_is_never_treated_as_regenerable() {
-        let mk = |storage: &str, transcode: &str| BookRow {
+        let mk = |storage: Option<StorageMode>, transcode: Option<TranscodeMode>| BookRow {
             id: "b".into(),
             slug: "b".into(),
             feed_id: "cap".into(),
@@ -1251,20 +1253,23 @@ mod tests {
             cover_path: None,
             source_path: "/x".into(),
             source_mtime: 0,
-            status: "ready".into(),
-            storage_mode: storage.into(),
+            storage_mode: storage,
             default_cover_url: None,
             force_embedded: false,
-            transcode: transcode.into(),
+            transcode,
         };
+        let saver = Some(StorageMode::Saver);
         // A re-encode can't be rebuilt byte-for-byte, so `saver` must not apply.
-        assert!(book_is_transcoded(&mk("saver", "aac")));
-        assert!(book_is_transcoded(&mk("saver", "mp3")));
+        assert!(book_is_transcoded(&mk(saver, Some(TranscodeMode::Aac))));
+        assert!(book_is_transcoded(&mk(saver, Some(TranscodeMode::Mp3))));
         // Stream-copied books (and pre-5.2 rows) stay regenerable.
-        assert!(!book_is_transcoded(&mk("saver", "off")));
-        assert!(!book_is_transcoded(&mk("saver", "")));
+        assert!(!book_is_transcoded(&mk(saver, Some(TranscodeMode::Off))));
+        assert!(!book_is_transcoded(&mk(saver, None)));
         // The two predicates compose: still a saver book, but not a regenerable one.
-        assert!(book_is_saver(&mk("saver", "aac"), false));
+        assert!(book_is_saver(
+            &mk(saver, Some(TranscodeMode::Aac)),
+            StorageMode::Full
+        ));
     }
 
     #[test]

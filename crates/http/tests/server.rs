@@ -12,7 +12,7 @@ use tower::ServiceExt;
 use podspine_http::{AppState, router};
 use podspine_index::{BookRow, EpisodeRow, Index};
 use podspine_scanner::{
-    BookOverrides, ScanOptions, TranscodeMode, scan_book, scan_book_as, scan_library,
+    BookOverrides, ScanOptions, StorageMode, TranscodeMode, scan_book, scan_book_as, scan_library,
 };
 use podspine_test_support::{
     scratch, skip, skip_unless_ffmpeg, synth_sine, synth_three_chapters, synth_with_cover,
@@ -32,11 +32,10 @@ fn book_row(id: &str, feed_id: &str) -> BookRow {
         cover_path: None,
         source_path: "/nonexistent/source.m4b".to_string(),
         source_mtime: 0,
-        status: "ready".to_string(),
-        storage_mode: String::new(),
+        storage_mode: None,
         default_cover_url: None,
         force_embedded: false,
-        transcode: String::new(),
+        transcode: None,
     }
 }
 
@@ -74,7 +73,7 @@ fn test_state(index: Index, data: &Path, library: &Path) -> AppState {
         data,
         library,
         None,
-        false,
+        StorageMode::Full,
         None,
         None,
     )
@@ -88,7 +87,7 @@ fn saver_state(index: Index, data: &Path, library: &Path) -> AppState {
         data,
         library,
         None,
-        true,
+        StorageMode::Saver,
         None,
         None,
     )
@@ -102,7 +101,7 @@ fn saver_state_capped(index: Index, data: &Path, library: &Path, cap_bytes: u64)
         data,
         library,
         None,
-        true,
+        StorageMode::Saver,
         Some(cap_bytes),
         None,
     )
@@ -121,7 +120,7 @@ fn state_with_default_cover(
         data,
         library,
         Some(cover_url.to_string()),
-        false,
+        StorageMode::Full,
         None,
         None,
     )
@@ -274,7 +273,7 @@ async fn saver_mode_regenerates_a_chapter_on_demand() {
         &data,
         &index,
         ScanOptions {
-            saver: true,
+            storage: StorageMode::Saver,
             ..Default::default()
         },
         &BookOverrides::default(),
@@ -344,7 +343,7 @@ async fn saver_cache_evicts_over_the_size_cap() {
         &data,
         &index,
         ScanOptions {
-            saver: true,
+            storage: StorageMode::Saver,
             ..Default::default()
         },
         &BookOverrides::default(),
@@ -685,7 +684,11 @@ async fn per_book_saver_serves_even_when_server_is_full() {
     scan_library(&library, &data, &index, ScanOptions::default());
     let books = index.list_books().unwrap();
     assert_eq!(books.len(), 1);
-    assert_eq!(books[0].storage_mode, "saver", "per-book saver persisted");
+    assert_eq!(
+        books[0].storage_mode,
+        Some(StorageMode::Saver),
+        "per-book saver persisted"
+    );
     let feed_id = books[0].feed_id.clone();
     let eps = index.episodes_for_book(&books[0].id).unwrap();
     assert!(
@@ -1205,7 +1208,7 @@ async fn saver_regen_source_outside_the_library_is_a_404() {
     let feed_id = "capabilityidforsaverescape";
     let mut book = book_row(book_id, feed_id);
     book.source_path = outside.to_string_lossy().into_owned();
-    book.storage_mode = "saver".to_string(); // per-book override; independent of the global flag
+    book.storage_mode = Some(StorageMode::Saver); // per-book override; independent of the global mode
     index.upsert_book(&book).unwrap();
     // A chaptered episode: empty source_path, so it takes the saver-regen arm
     // rather than the serve-in-place or faststart-remux arms.
@@ -1261,7 +1264,7 @@ async fn saver_source_inside_the_library_still_serves() {
     let feed_id = "capabilityidforsaverok";
     let mut book = book_row(book_id, feed_id);
     book.source_path = source.to_string_lossy().into_owned();
-    book.storage_mode = "saver".to_string();
+    book.storage_mode = Some(StorageMode::Saver);
     index.upsert_book(&book).unwrap();
     index
         .upsert_episode(&episode_row(
@@ -1306,7 +1309,7 @@ async fn transcoded_flac_book_serves_as_aac_and_is_never_evicted() {
         &index,
         ScanOptions {
             // A saver server, deliberately: transcoding must override it per book.
-            saver: true,
+            storage: StorageMode::Saver,
             transcode: TranscodeMode::Aac,
             ..Default::default()
         },

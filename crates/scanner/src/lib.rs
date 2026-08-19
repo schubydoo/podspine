@@ -31,10 +31,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-// Re-exported: both are part of this crate's public surface — `BookOverrides` is a
-// parameter of the scan API and `TranscodeMode` a field of [`ScanOptions`].
-pub use podspine_config::{BookOverrides, TranscodeMode};
-use podspine_config::{StorageMode, book_overrides};
+// Re-exported: all three are part of this crate's public surface — `BookOverrides`
+// is a parameter of the scan API, `StorageMode`/`TranscodeMode` fields of
+// [`ScanOptions`].
+use podspine_config::book_overrides;
+pub use podspine_config::{BookOverrides, StorageMode, TranscodeMode};
 use podspine_feed::{episode_guid, pubdate_epoch};
 use podspine_index::{BookRow, EpisodeRow, Index, IndexError};
 use podspine_prober::{ProbeError, needs_faststart, probe};
@@ -55,9 +56,10 @@ const DRM_EXTENSIONS: &[&str] = &["aax", "aaxc", "aa", "odm"];
 pub struct ScanOptions {
     /// Ignore any `.cue`/`.ffmeta` sidecar and use embedded chapters (Task 3.8).
     pub force_embedded: bool,
-    /// `saver` storage for chaptered books: split at ingest to record each real
-    /// `byte_length`, then delete and regenerate on demand (Sprint 5.1).
-    pub saver: bool,
+    /// Storage strategy for chaptered books (Sprint 5.1): `Saver` splits at
+    /// ingest to record each real `byte_length`, then deletes and regenerates on
+    /// demand; `Full` (the default) pre-splits and keeps the files.
+    pub storage: StorageMode,
     /// Remux a non-faststart whole-file mp4 to a faststart cache copy instead of
     /// serving it in place (Sprint 6.3).
     pub remux_non_faststart: bool,
@@ -163,11 +165,8 @@ pub fn scan_book_as(
     let remux_non_faststart = overrides
         .remux_non_faststart
         .unwrap_or(opts.remux_non_faststart);
-    let saver = match overrides.storage_mode {
-        Some(StorageMode::Saver) => true,
-        Some(StorageMode::Full) => false,
-        None => opts.saver,
-    };
+    let storage = overrides.storage_mode.unwrap_or(opts.storage);
+    let saver = storage == StorageMode::Saver;
     let force_reingest = overrides.force_reingest == Some(true);
 
     // Effective per-book metadata (override → default). Computed up here so the
@@ -175,7 +174,6 @@ pub fn scan_book_as(
     // audio mtime) and re-ingest, and so the BookRow build below reuses it.
     let eff_title = overrides.title.clone().unwrap_or_else(|| file_stem(input));
     let eff_author = overrides.author.clone();
-    let eff_storage_mode = if saver { "saver" } else { "full" }.to_string();
     let eff_cover = overrides.default_cover_url.clone();
 
     let id = id.to_string();
@@ -225,7 +223,7 @@ pub fn scan_book_as(
         // guids stay stable (no spurious client re-downloads).
         let metadata_consistent = existing.title == eff_title
             && existing.author == eff_author
-            && existing.storage_mode == eff_storage_mode
+            && existing.storage_mode == Some(storage)
             && existing.default_cover_url == eff_cover
             // `force_embedded_chapters` changes the chapter SOURCE (embedded vs a
             // `.cue`/`.ffmeta` sidecar) without touching the fields above, so a
@@ -234,14 +232,10 @@ pub fn scan_book_as(
         // Transcode toggle guard (Task 5.2): flipping `PODSPINE_TRANSCODE` changes
         // the episode container AND every recorded `byte_length`, and touches no
         // source mtime — so re-ingest when the persisted mode no longer matches
-        // what this setting would produce. A pre-5.2 row (`""`) was produced by a
-        // stream copy, which is exactly what `"off"` means, so it is not a
+        // what this setting would produce. A pre-5.2 row (`None`) was produced by
+        // a stream copy, which is exactly what `Off` means, so it is not a
         // mismatch and doesn't re-split anyone's library on upgrade.
-        let stored_transcode = if existing.transcode.is_empty() {
-            "off"
-        } else {
-            existing.transcode.as_str()
-        };
+        let stored_transcode = existing.transcode.unwrap_or(TranscodeMode::Off);
         let transcode_consistent = expected_transcode(input, opts.transcode)
             .is_none_or(|expected| stored_transcode == expected);
         // `force_reingest` (a troubleshooting knob) always skips the early return
@@ -287,7 +281,7 @@ pub fn scan_book_as(
         tracing::info!(
             id = %id,
             codec = probed.audio_codec.as_deref().unwrap_or("unknown"),
-            target = mode_label(opts.transcode),
+            target = opts.transcode.label(),
             "re-encoding a non-podcast-safe source (transcoding is on)"
         );
     }
@@ -486,19 +480,18 @@ pub fn scan_book_as(
         cover_path,
         source_path: input.to_string_lossy().into_owned(),
         source_mtime,
-        status: "ready".to_string(),
         // Persist the effective mode so serve/evict honor it without the sidecar.
-        storage_mode: eff_storage_mode,
+        storage_mode: Some(storage),
         default_cover_url: eff_cover,
         force_embedded,
-        // What actually happened to this book's audio (Task 5.2): `"off"` when it
+        // What actually happened to this book's audio (Task 5.2): `Off` when it
         // was stream-copied. Read by the serve/evict layers (a transcoded book is
         // never regenerated) and by the toggle guard above.
-        transcode: if transcoding {
-            mode_label(opts.transcode).to_string()
+        transcode: Some(if transcoding {
+            opts.transcode
         } else {
-            "off".to_string()
-        },
+            TranscodeMode::Off
+        }),
     };
     index.upsert_book(&book)?;
 
@@ -726,19 +719,18 @@ fn scan_mp3_folder(
         // Per-book overrides (Sprint 6.4), computed above and re-checked by the
         // idempotency guard so a sidecar edit re-persists them. storage_mode/remux/
         // force_embedded are no-ops for MP3 folders (tracks are served in place),
-        // so persist storage_mode as `""` (follow global).
+        // so persist no storage_mode (`None` = follow global).
         title: eff_title,
         author: eff_author,
         cover_path: None,
         source_path: dir.to_string_lossy().into_owned(),
         source_mtime,
-        status: "ready".to_string(),
-        storage_mode: String::new(),
+        storage_mode: None,
         default_cover_url: eff_cover,
         // No chapters in an MP3 folder, so force_embedded never applies.
         force_embedded: false,
         // MP3 is podcast-safe: an MP3 folder is never re-encoded (Task 5.2).
-        transcode: "off".to_string(),
+        transcode: Some(TranscodeMode::Off),
     };
     index.upsert_book(&book)?;
 
@@ -1758,15 +1750,6 @@ fn episode_ext(codec: Option<&str>, enc: Encoding) -> &'static str {
     }
 }
 
-/// The persisted label for a transcode mode (`book.transcode`).
-fn mode_label(mode: TranscodeMode) -> &'static str {
-    match mode {
-        TranscodeMode::Off => "off",
-        TranscodeMode::Aac => "aac",
-        TranscodeMode::Mp3 => "mp3",
-    }
-}
-
 /// The `book.transcode` value an already-indexed book *should* carry under the
 /// current setting, judged from its file extension alone — the idempotency guard
 /// runs before the probe and must not force one.
@@ -1777,16 +1760,16 @@ fn mode_label(mode: TranscodeMode) -> &'static str {
 /// the book on every single scan. An ALAC book therefore keeps its existing
 /// episodes until its source changes; `force_reingest = true` in its
 /// `.podspine.toml` picks up the new setting immediately.
-fn expected_transcode(input: &Path, mode: TranscodeMode) -> Option<&'static str> {
+fn expected_transcode(input: &Path, mode: TranscodeMode) -> Option<TranscodeMode> {
     if !mode.is_on() {
         // Nothing may stay transcoded once the flag is off.
-        return Some("off");
+        return Some(TranscodeMode::Off);
     }
     match ext_lower(input).as_deref() {
         // Tier-2 containers: never podcast-safe, so they get the target codec.
-        Some("flac" | "ogg" | "oga" | "opus") => Some(mode_label(mode)),
+        Some("flac" | "ogg" | "oga" | "opus") => Some(mode),
         // MP3 is podcast-safe and never re-encoded.
-        Some("mp3") => Some("off"),
+        Some("mp3") => Some(TranscodeMode::Off),
         _ => None,
     }
 }
@@ -2084,7 +2067,7 @@ mod tests {
             &data,
             &index,
             ScanOptions {
-                saver: true,
+                storage: StorageMode::Saver,
                 ..Default::default()
             },
             &podspine_config::BookOverrides::default(),
@@ -2118,7 +2101,7 @@ mod tests {
             &data,
             &index,
             ScanOptions {
-                saver: true,
+                storage: StorageMode::Saver,
                 ..Default::default()
             },
             &podspine_config::BookOverrides::default(),
@@ -2170,7 +2153,7 @@ mod tests {
             &data,
             &index,
             ScanOptions {
-                saver: true,
+                storage: StorageMode::Saver,
                 ..Default::default()
             },
             &podspine_config::BookOverrides::default(),
@@ -2256,23 +2239,36 @@ mod tests {
 
     #[test]
     fn expected_transcode_guards_a_toggle_without_probing() {
-        assert_eq!(mode_label(TranscodeMode::Off), "off");
-        assert_eq!(mode_label(TranscodeMode::Aac), "aac");
-        assert_eq!(mode_label(TranscodeMode::Mp3), "mp3");
+        // The persisted labels, via the canonical methods (all values pinned).
+        assert_eq!(TranscodeMode::Off.label(), "off");
+        assert_eq!(TranscodeMode::Aac.label(), "aac");
+        assert_eq!(TranscodeMode::Mp3.label(), "mp3");
         let flac = Path::new("/lib/book.flac");
         let m4b = Path::new("/lib/book.m4b");
         let mp3 = Path::new("/lib/book.mp3");
         // Flag off: nothing may stay transcoded, whatever the container.
-        assert_eq!(expected_transcode(flac, TranscodeMode::Off), Some("off"));
-        assert_eq!(expected_transcode(m4b, TranscodeMode::Off), Some("off"));
+        assert_eq!(
+            expected_transcode(flac, TranscodeMode::Off),
+            Some(TranscodeMode::Off)
+        );
+        assert_eq!(
+            expected_transcode(m4b, TranscodeMode::Off),
+            Some(TranscodeMode::Off)
+        );
         // Flag on: a Tier-2 container is definitely re-encoded...
-        assert_eq!(expected_transcode(flac, TranscodeMode::Aac), Some("aac"));
+        assert_eq!(
+            expected_transcode(flac, TranscodeMode::Aac),
+            Some(TranscodeMode::Aac)
+        );
         assert_eq!(
             expected_transcode(Path::new("/lib/b.opus"), TranscodeMode::Mp3),
-            Some("mp3")
+            Some(TranscodeMode::Mp3)
         );
         // ...MP3 definitely isn't...
-        assert_eq!(expected_transcode(mp3, TranscodeMode::Aac), Some("off"));
+        assert_eq!(
+            expected_transcode(mp3, TranscodeMode::Aac),
+            Some(TranscodeMode::Off)
+        );
         // ...and an mp4-family file is unknowable without a probe (AAC or ALAC), so
         // the guard abstains rather than re-ingesting the book on every scan.
         assert_eq!(expected_transcode(m4b, TranscodeMode::Aac), None);
@@ -2309,7 +2305,11 @@ mod tests {
             &BookOverrides::default(),
         )
         .unwrap();
-        assert_eq!(book.transcode, "aac", "the effective mode is persisted");
+        assert_eq!(
+            book.transcode,
+            Some(TranscodeMode::Aac),
+            "the effective mode is persisted"
+        );
 
         let eps = index.episodes_for_book(&book.id).unwrap();
         assert_eq!(eps.len(), 2, "cue defines two chapters");
@@ -2404,7 +2404,7 @@ mod tests {
             &BookOverrides::default(),
         )
         .unwrap();
-        assert_eq!(book.transcode, "mp3");
+        assert_eq!(book.transcode, Some(TranscodeMode::Mp3));
         let eps = index.episodes_for_book(&book.id).unwrap();
         let e = &eps[0];
         assert!(e.file_path.ends_with(".mp3"), "{}", e.file_path);
@@ -2447,7 +2447,7 @@ mod tests {
             &data,
             &index,
             ScanOptions {
-                saver: true,
+                storage: StorageMode::Saver,
                 transcode: TranscodeMode::Aac,
                 ..Default::default()
             },
@@ -2455,10 +2455,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            book.storage_mode, "saver",
+            book.storage_mode,
+            Some(StorageMode::Saver),
             "the requested mode is still recorded"
         );
-        assert_eq!(book.transcode, "aac");
+        assert_eq!(book.transcode, Some(TranscodeMode::Aac));
         for e in index.episodes_for_book(&book.id).unwrap() {
             assert!(
                 Path::new(&e.file_path).exists(),
@@ -2642,8 +2643,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A book indexed before Task 5.2 carries `transcode = ""`. It was necessarily
-    /// stream-copied, which is what `"off"` means — so it must NOT be re-ingested
+    /// A book indexed before Task 5.2 carries `transcode = None`. It was necessarily
+    /// stream-copied, which is what `Off` means — so it must NOT be re-ingested
     /// on upgrade, while a genuinely stale mode must be.
     #[test]
     fn a_pre_transcode_row_is_not_reingested_but_a_stale_mode_is() {
@@ -2673,11 +2674,11 @@ mod tests {
             )
             .unwrap()
         };
-        let stored_mode = |mode: &str| {
+        let stored_mode = |mode: Option<TranscodeMode>| {
             let book = index.get_book("u").unwrap().unwrap();
             index
                 .upsert_book(&BookRow {
-                    transcode: mode.to_string(),
+                    transcode: mode,
                     ..book
                 })
                 .unwrap();
@@ -2688,13 +2689,13 @@ mod tests {
         let survived = |ep: &str| std::fs::read(ep).unwrap() == b"sentinel";
 
         let book = scan();
-        assert_eq!(book.transcode, "off");
+        assert_eq!(book.transcode, Some(TranscodeMode::Off));
         let ep = index.episodes_for_book(&book.id).unwrap()[0]
             .file_path
             .clone();
 
-        // Pre-5.2 row: `""` means the same thing as `"off"` — no re-split.
-        stored_mode("");
+        // Pre-5.2 row: `None` means the same thing as `Off` — no re-split.
+        stored_mode(None);
         sentinel(&ep);
         scan();
         assert!(
@@ -2703,14 +2704,14 @@ mod tests {
         );
 
         // A row claiming a transcode while the flag is off is genuinely stale.
-        stored_mode("aac");
+        stored_mode(Some(TranscodeMode::Aac));
         sentinel(&ep);
         let back = scan();
         assert!(
             !survived(&ep),
             "a stale transcode mode must force a re-ingest"
         );
-        assert_eq!(back.transcode, "off");
+        assert_eq!(back.transcode, Some(TranscodeMode::Off));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2732,7 +2733,7 @@ mod tests {
 
         // Copy-first by default: a .flac episode.
         let off = scan(ScanOptions::default());
-        assert_eq!(off.transcode, "off");
+        assert_eq!(off.transcode, Some(TranscodeMode::Off));
         let before = index.episodes_for_book(&off.id).unwrap();
         assert!(before[0].file_path.ends_with(".flac"));
 
@@ -2741,7 +2742,7 @@ mod tests {
             transcode: TranscodeMode::Aac,
             ..Default::default()
         });
-        assert_eq!(on.transcode, "aac");
+        assert_eq!(on.transcode, Some(TranscodeMode::Aac));
         let after = index.episodes_for_book(&on.id).unwrap();
         assert!(
             after[0].file_path.ends_with(".m4a"),
@@ -2769,7 +2770,7 @@ mod tests {
         // transcoded copy under the data dir reclaimed rather than orphaned.
         let transcoded_copy = after[0].file_path.clone();
         let back = scan(ScanOptions::default());
-        assert_eq!(back.transcode, "off");
+        assert_eq!(back.transcode, Some(TranscodeMode::Off));
         let now = index.episodes_for_book(&back.id).unwrap();
         assert!(now[0].file_path.ends_with(".flac"));
         assert_eq!(
@@ -3093,11 +3094,10 @@ mod tests {
             cover_path: None,
             source_path: source_str.clone(),
             source_mtime: 1,
-            status: "ready".into(),
-            storage_mode: String::new(),
+            storage_mode: None,
             default_cover_url: None,
             force_embedded: false,
-            transcode: "off".into(),
+            transcode: Some(TranscodeMode::Off),
         };
         // The ESTABLISHED feed is the suffixed `book-2` (indexed first, so earlier
         // created_at); the later duplicate is the base `book`. The survivor must be
@@ -3154,11 +3154,10 @@ mod tests {
                     cover_path: None,
                     source_path: missing.clone(),
                     source_mtime: 1,
-                    status: "ready".into(),
-                    storage_mode: String::new(),
+                    storage_mode: None,
                     default_cover_url: None,
                     force_embedded: false,
-                    transcode: "off".into(),
+                    transcode: Some(TranscodeMode::Off),
                 })
                 .unwrap();
         }
@@ -3194,11 +3193,10 @@ mod tests {
                 cover_path: None,
                 source_path: root.join("gone.m4b").to_string_lossy().into_owned(),
                 source_mtime: 1,
-                status: "ready".into(),
-                storage_mode: String::new(),
+                storage_mode: None,
                 default_cover_url: None,
                 force_embedded: false,
-                transcode: "off".into(),
+                transcode: Some(TranscodeMode::Off),
             })
             .unwrap();
 
@@ -3259,11 +3257,10 @@ mod tests {
                     .to_string_lossy()
                     .into_owned(),
                 source_mtime: 1,
-                status: "ready".into(),
-                storage_mode: String::new(),
+                storage_mode: None,
                 default_cover_url: None,
                 force_embedded: false,
-                transcode: "off".into(),
+                transcode: Some(TranscodeMode::Off),
             })
             .unwrap();
 
@@ -3755,7 +3752,6 @@ mod tests {
         let index = Index::open_in_memory().unwrap();
 
         let book = scan_book(&input, &data, &index).unwrap();
-        assert_eq!(book.status, "ready");
 
         let eps = index.episodes_for_book(&book.id).unwrap();
         assert_eq!(eps.len(), 3, "3 chapters -> 3 episodes");
@@ -3995,7 +3991,8 @@ mod tests {
         assert_eq!(books[0].title, "My Override");
         assert_eq!(books[0].author.as_deref(), Some("Someone"));
         assert_eq!(
-            books[0].storage_mode, "saver",
+            books[0].storage_mode,
+            Some(StorageMode::Saver),
             "per-book storage_mode is persisted for serve/evict"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -4012,7 +4009,7 @@ mod tests {
         // First scan: no sidecar → default title, `full`.
         scan_library(&root, &data, &index, ScanOptions::default());
         let before = index.list_books().unwrap().remove(0);
-        assert_eq!(before.storage_mode, "full");
+        assert_eq!(before.storage_mode, Some(StorageMode::Full));
         let guid_before = index.episodes_for_book(&before.id).unwrap()[0].guid.clone();
 
         // Edit the sidecar — the AUDIO file is untouched (same mtime). The edit
@@ -4026,7 +4023,11 @@ mod tests {
 
         let after = index.get_book(&before.id).unwrap().unwrap();
         assert_eq!(after.title, "Edited", "sidecar title applied on re-scan");
-        assert_eq!(after.storage_mode, "saver", "sidecar storage_mode applied");
+        assert_eq!(
+            after.storage_mode,
+            Some(StorageMode::Saver),
+            "sidecar storage_mode applied"
+        );
         // source_mtime is unchanged, so the episode guid is stable — a metadata
         // edit doesn't make podcast clients re-download.
         let guid_after = index.episodes_for_book(&before.id).unwrap()[0].guid.clone();
@@ -4112,13 +4113,14 @@ mod tests {
             &data,
             &index,
             ScanOptions {
-                saver: true,
+                storage: StorageMode::Saver,
                 ..Default::default()
             },
         );
         let b = index.list_books().unwrap().remove(0);
         assert_eq!(
-            b.storage_mode, "full",
+            b.storage_mode,
+            Some(StorageMode::Full),
             "sidecar full overrides global saver"
         );
         let eps = index.episodes_for_book(&b.id).unwrap();
@@ -4167,7 +4169,10 @@ mod tests {
             scan_library(&root2, &data2, &index2, ScanOptions::default()).indexed,
             1
         );
-        assert_eq!(index2.list_books().unwrap().remove(0).storage_mode, "full");
+        assert_eq!(
+            index2.list_books().unwrap().remove(0).storage_mode,
+            Some(StorageMode::Full)
+        );
         let _ = std::fs::remove_dir_all(&root2);
     }
 

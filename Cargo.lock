@@ -1274,6 +1274,7 @@ version = "1.7.0"
 dependencies = [
  "base64 0.23.1",
  "getrandom 0.4.3",
+ "podspine-config",
  "podspine-test-support",
  "rusqlite",
  "thiserror",
