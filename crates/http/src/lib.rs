@@ -529,12 +529,18 @@ async fn cover_thumb(
     // missing one) or generation failed — so a book with art never 404s. Serving is
     // read-only: generation lives in the scanner (single-threaded, atomic), which is
     // what keeps a thumbnail consistent with its cover with no cross-thread race.
+    //
+    // Fall back to the cover when the thumbnail *serve* fails too, not just when it
+    // can't be resolved: a re-ingest deletes the old thumb before regenerating it, so
+    // it can vanish between canonicalize and read — the cover is only ever atomically
+    // replaced (never absent), so serving it is always safe.
     if let Some(dir) = cover.parent() {
         let thumb = cover_thumb_path(dir);
         if let Ok(canonical) =
             resolve_under_data_dir(&thumb.to_string_lossy(), &state.data_dir, &feed_id)
+            && let Ok(resp) = serve_image(&canonical, &headers).await
         {
-            return serve_image(&canonical, &headers).await;
+            return Ok(resp);
         }
     }
     serve_image(&cover, &headers).await
