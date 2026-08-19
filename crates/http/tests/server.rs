@@ -1853,7 +1853,7 @@ async fn set_theme_redirects_back_even_when_ui_origin_differs() {
 }
 
 #[tokio::test]
-async fn cover_thumbnail_is_generated_on_demand_and_refreshes_when_stale() {
+async fn cover_thumbnail_is_generated_on_demand_and_cached() {
     if !ffmpeg_available() {
         eprintln!("skipping: ffmpeg not available");
         return;
@@ -1886,7 +1886,6 @@ async fn cover_thumbnail_is_generated_on_demand_and_refreshes_when_stale() {
         None,
     );
     let app = router(state);
-
     let get_thumb = || {
         app.clone().oneshot(
             Request::get(format!("/cover/{feed_id}/thumb"))
@@ -1909,24 +1908,11 @@ async fn cover_thumbnail_is_generated_on_demand_and_refreshes_when_stale() {
     assert!(!body_bytes(resp).await.is_empty(), "thumbnail bytes served");
     assert!(thumb.exists(), "first request caches the thumbnail to disk");
 
-    // A re-extracted cover (newer mtime) makes the cached thumb stale — the next
-    // request regenerates it so the thumbnail is at least as new as the cover again.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    let cover_bytes = std::fs::read(&cover).unwrap();
-    std::fs::write(&cover, &cover_bytes).unwrap(); // rewrite bumps the cover's mtime
-    let cover_mtime = std::fs::metadata(&cover).unwrap().modified().unwrap();
-    assert!(
-        std::fs::metadata(&thumb).unwrap().modified().unwrap() < cover_mtime,
-        "precondition: the cached thumb is now older than the cover"
-    );
-
+    // A second request is served from the cached file (freshness is handled by the
+    // scanner deleting the thumb on a cover re-extraction, not by this handler).
     let resp = get_thumb().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let _ = body_bytes(resp).await;
-    assert!(
-        std::fs::metadata(&thumb).unwrap().modified().unwrap() >= cover_mtime,
-        "a stale thumbnail is regenerated on the next request"
-    );
+    assert!(!body_bytes(resp).await.is_empty());
 
     let _ = std::fs::remove_dir_all(&dir);
 }

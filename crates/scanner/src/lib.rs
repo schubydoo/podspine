@@ -39,8 +39,8 @@ use podspine_feed::{episode_guid, pubdate_epoch};
 use podspine_index::{BookRow, EpisodeRow, Index, IndexError};
 use podspine_prober::{ProbeError, needs_faststart, probe};
 use podspine_splitter::{
-    ChapterCut, Encoding, SplitEpisode, SplitError, extract_cover, remux_faststart,
-    split_book_encoded, split_chapter_encoded, transcode_whole,
+    ChapterCut, Encoding, SplitEpisode, SplitError, cover_thumb_path, extract_cover,
+    remux_faststart, split_book_encoded, split_chapter_encoded, transcode_whole,
 };
 
 /// Extensions we refuse to ingest (DRM). Matched case-insensitively.
@@ -421,7 +421,13 @@ pub fn scan_book_as(
     let cover_path = if probed.has_cover {
         let ext = cover_ext(probed.cover_codec.as_deref());
         match extract_cover(input, &book_out, ext) {
-            Ok(path) => Some(path.to_string_lossy().into_owned()),
+            Ok(path) => {
+                // Invalidate any cached browse-UI thumbnail: it was derived from the
+                // previous cover. The `/cover/{id}/thumb` handler regenerates it on
+                // demand from this freshly-extracted cover on the next view.
+                let _ = std::fs::remove_file(cover_thumb_path(&book_out));
+                Some(path.to_string_lossy().into_owned())
+            }
             Err(err) => {
                 tracing::warn!(error = %err, id = %id, "cover extraction failed; serving no cover");
                 None
@@ -4400,6 +4406,61 @@ mod tests {
             attrs: Default::default(),
         };
         assert!(watch_event_is_relevant(&hint, lib, data, None));
+    }
+
+    #[test]
+    fn a_reingest_invalidates_the_cached_cover_thumbnail() {
+        if !ffmpeg_available() {
+            skip!("ffmpeg not available");
+        }
+        let dir = scratch("thumb-invalidate");
+        let data = dir.join("data");
+        let input = synth_with_cover(&dir);
+        let index = Index::open_in_memory().unwrap();
+
+        let book = scan_book_as(
+            &input,
+            "coverbook",
+            &data,
+            &index,
+            ScanOptions::default(),
+            &BookOverrides::default(),
+        )
+        .unwrap();
+        let cover = PathBuf::from(book.cover_path.expect("cover extracted"));
+        let book_out = cover.parent().unwrap();
+
+        // Stand in for a thumbnail the /thumb handler cached on demand.
+        let thumb = book_out.join("cover_thumb.jpg");
+        std::fs::write(&thumb, b"stale thumb").unwrap();
+        assert!(thumb.exists());
+
+        // Change the source mtime so the next scan re-ingests (rather than taking
+        // the idempotency early-return) and re-extracts the cover.
+        std::fs::File::options()
+            .write(true)
+            .open(&input)
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000),
+            )
+            .unwrap();
+
+        // The re-ingest re-extracts the cover and must invalidate the thumb, so the
+        // handler regenerates it from the fresh cover on the next view.
+        scan_book_as(
+            &input,
+            "coverbook",
+            &data,
+            &index,
+            ScanOptions::default(),
+            &BookOverrides::default(),
+        )
+        .unwrap();
+        assert!(
+            !thumb.exists(),
+            "re-ingest must delete the stale cached thumbnail"
+        );
     }
 
     #[test]

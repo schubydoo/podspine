@@ -221,6 +221,15 @@ pub enum CoverError {
         /// Where the cover was expected.
         path: PathBuf,
     },
+    /// The finished image could not be moved into place (the atomic publish).
+    #[error("could not publish cover to {path:?}: {source}")]
+    Publish {
+        /// The final path the image was being moved to.
+        path: PathBuf,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
     /// Could not create the output directory.
     #[error("could not create output directory {path:?}: {source}")]
     CreateDir {
@@ -350,32 +359,12 @@ fn run_ffmpeg_within(args: &[OsString], timeout: Duration) -> Result<(), RunErro
 /// **stream copy** (no re-encode), returning the written path. `ext` should match
 /// the cover codec (`"jpg"` for mjpeg, `"png"` for png). The source is only read.
 ///
-/// Maps only the first video (attached-picture) stream, so no audio is written.
+/// Maps only the first video (attached-picture) stream, so no audio is written. The
+/// write is atomic ([`extract_image`]), so a `/cover` or `/thumb` reader never sees
+/// a half-written cover while a rescan re-extracts it.
 pub fn extract_cover(input: &Path, out_dir: &Path, ext: &str) -> Result<PathBuf, CoverError> {
-    fs::create_dir_all(out_dir).map_err(|source| CoverError::CreateDir {
-        path: out_dir.to_path_buf(),
-        source,
-    })?;
-
     let out_path = out_dir.join(format!("cover.{ext}"));
-    let args = build_cover_args(input, &out_path);
-
-    match run_ffmpeg(&args) {
-        Ok(()) => {}
-        Err(RunError::Spawn(e)) => return Err(CoverError::Spawn(e)),
-        Err(RunError::Failed { code, stderr }) => {
-            return Err(CoverError::Ffmpeg { code, stderr });
-        }
-        Err(RunError::TimedOut) => return Err(CoverError::TimedOut),
-    }
-
-    let ok = fs::metadata(&out_path)
-        .map(|m| m.len() > 0)
-        .unwrap_or(false);
-    if !ok {
-        return Err(CoverError::OutputMissing { path: out_path });
-    }
-    Ok(out_path)
+    extract_image(out_path, |part| build_cover_args(input, part))
 }
 
 /// Long-edge cap (px) for the cover thumbnail. 400 covers every browse-UI use —
@@ -384,35 +373,60 @@ pub fn extract_cover(input: &Path, out_dir: &Path, ext: &str) -> Result<PathBuf,
 /// podcatcher artwork.
 const COVER_THUMB_PX: u32 = 400;
 
-/// Downscale an already-extracted cover into a small `cover_thumb.jpg` for the
-/// browse UI (the RSS feed keeps the full-res `/cover`). Re-encodes to JPEG, bounded
-/// to [`COVER_THUMB_PX`] on the long edge and never upscaled; the source cover file
-/// is only read. A failure is non-fatal to ingest — the serve layer falls back to
-/// the full cover.
+/// The path of a book's browse-UI cover thumbnail under `out_dir`. Centralized so
+/// the generator, the serve layer, and the scanner's invalidation all agree on it.
+pub fn cover_thumb_path(out_dir: &Path) -> PathBuf {
+    out_dir.join("cover_thumb.jpg")
+}
+
+/// Downscale an already-extracted cover into a small [`cover_thumb_path`] JPEG for
+/// the browse UI (the RSS feed keeps the full-res `/cover`). Bounded to
+/// [`COVER_THUMB_PX`] on the long edge and never upscaled; the source cover file is
+/// only read, and the write is atomic ([`extract_image`]).
 pub fn extract_cover_thumb(cover: &Path, out_dir: &Path) -> Result<PathBuf, CoverError> {
-    fs::create_dir_all(out_dir).map_err(|source| CoverError::CreateDir {
-        path: out_dir.to_path_buf(),
-        source,
-    })?;
+    let out_path = cover_thumb_path(out_dir);
+    extract_image(out_path, |part| build_cover_thumb_args(cover, part))
+}
 
-    let out_path = out_dir.join("cover_thumb.jpg");
-    let args = build_cover_thumb_args(cover, &out_path);
+/// Run ffmpeg to produce an image at `out_path` **atomically**: create the parent
+/// dir, write to a `.part` sibling, validate it's non-empty, then rename into place.
+/// A concurrent reader sees the old file or the new one, never a half-written one —
+/// which is what lets a rescan re-extract a cover while `/cover` and `/thumb` serve.
+fn extract_image(
+    out_path: PathBuf,
+    args_for: impl FnOnce(&Path) -> Vec<OsString>,
+) -> Result<PathBuf, CoverError> {
+    if let Some(dir) = out_path.parent() {
+        fs::create_dir_all(dir).map_err(|source| CoverError::CreateDir {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+    }
 
+    let part = part_path(&out_path);
+    let args = args_for(&part);
     match run_ffmpeg(&args) {
         Ok(()) => {}
         Err(RunError::Spawn(e)) => return Err(CoverError::Spawn(e)),
         Err(RunError::Failed { code, stderr }) => {
+            let _ = fs::remove_file(&part);
             return Err(CoverError::Ffmpeg { code, stderr });
         }
-        Err(RunError::TimedOut) => return Err(CoverError::TimedOut),
+        Err(RunError::TimedOut) => {
+            let _ = fs::remove_file(&part);
+            return Err(CoverError::TimedOut);
+        }
     }
 
-    let ok = fs::metadata(&out_path)
-        .map(|m| m.len() > 0)
-        .unwrap_or(false);
+    let ok = fs::metadata(&part).map(|m| m.len() > 0).unwrap_or(false);
     if !ok {
+        let _ = fs::remove_file(&part);
         return Err(CoverError::OutputMissing { path: out_path });
     }
+    fs::rename(&part, &out_path).map_err(|source| CoverError::Publish {
+        path: out_path.clone(),
+        source,
+    })?;
     Ok(out_path)
 }
 

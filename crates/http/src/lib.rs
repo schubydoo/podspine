@@ -49,7 +49,9 @@ use tower_http::trace::TraceLayer;
 
 use podspine_feed::{FeedBook, FeedEpisode, render_checked};
 use podspine_index::{BookRow, Index};
-use podspine_splitter::{ChapterCut, extract_cover_thumb, remux_faststart, split_chapter};
+use podspine_splitter::{
+    ChapterCut, cover_thumb_path, extract_cover_thumb, remux_faststart, split_chapter,
+};
 use podspine_ui::{
     BookCard, BookDetail, Theme, book_page, index_page, scanning_page, subscribe_page,
 };
@@ -524,7 +526,10 @@ async fn cover_thumb(
     let cover_path = book_cover_path(&state, &feed_id)?;
     // The full cover is the source of truth (must exist, under the data dir).
     let cover = resolve_under_data_dir(&cover_path, &state.data_dir, &feed_id)?;
-    let thumb = cover.with_file_name("cover_thumb.jpg");
+    let thumb = cover
+        .parent()
+        .map(cover_thumb_path)
+        .ok_or(AppError::NotFound)?;
 
     match ensure_thumb(&state, &cover, &thumb).await {
         Ok(()) => serve_image(&thumb, &headers).await,
@@ -533,13 +538,20 @@ async fn cover_thumb(
     }
 }
 
-/// Ensure the cover thumbnail at `thumb` exists and is current, (re)generating it
-/// from `cover` when it's missing or older than the cover — so a re-extracted cover
-/// refreshes the thumbnail on the next view, with no re-ingest and no persisted
-/// thumbnail at scan time. Single-flighted per path like [`ensure_cached`] so
-/// concurrent first-requests run ffmpeg once; the blocking work runs off the async
-/// runtime.
+/// Ensure the cover thumbnail at `thumb` exists, generating it from `cover` when
+/// missing. Freshness is handled by explicit invalidation, not mtime: the scanner
+/// deletes the cached thumbnail whenever it re-extracts a cover, so an existing
+/// thumb is always current and a changed cover regenerates here on the next view —
+/// no re-ingest, no persisted thumbnail at scan time, and no dependence on
+/// filesystem timestamp resolution. Single-flighted per path like [`ensure_cached`]
+/// so concurrent first-requests run ffmpeg once; the blocking work runs off the
+/// async runtime.
 async fn ensure_thumb(state: &AppState, cover: &FsPath, thumb: &FsPath) -> Result<(), AppError> {
+    // Fast path: already cached.
+    if thumb.exists() {
+        return Ok(());
+    }
+
     let lock = {
         let mut map = state.inflight.lock().map_err(AppError::internal)?;
         map.entry(thumb.to_path_buf())
@@ -549,8 +561,8 @@ async fn ensure_thumb(state: &AppState, cover: &FsPath, thumb: &FsPath) -> Resul
     let _guard = lock.lock().await;
 
     let outcome = async {
-        // A concurrent request may have produced a fresh thumb while we waited.
-        if thumb_is_fresh(thumb, cover) {
+        // A concurrent request may have produced it while we waited on the lock.
+        if thumb.exists() {
             return Ok(());
         }
         let cover = cover.to_path_buf();
@@ -574,19 +586,6 @@ async fn ensure_thumb(state: &AppState, cover: &FsPath, thumb: &FsPath) -> Resul
         map.remove(thumb);
     }
     outcome
-}
-
-/// Whether the thumbnail exists and is at least as new as the cover it derives from.
-/// A missing thumb, or one older than the cover (a re-extraction bumped the cover's
-/// mtime), is stale and must be regenerated.
-fn thumb_is_fresh(thumb: &FsPath, cover: &FsPath) -> bool {
-    match (
-        std::fs::metadata(thumb).and_then(|m| m.modified()),
-        std::fs::metadata(cover).and_then(|m| m.modified()),
-    ) {
-        (Ok(thumb_mtime), Ok(cover_mtime)) => thumb_mtime >= cover_mtime,
-        _ => false,
-    }
 }
 
 /// The book's stored (full) cover path, or `NotFound` when the book/cover is absent.
