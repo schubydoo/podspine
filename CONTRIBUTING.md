@@ -32,8 +32,8 @@ cargo run -- --library ./sample-books   # → http://localhost:8080
 
 ```bash
 cargo fmt --all --check
-cargo clippy --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
 ```
 
 Please run these locally before opening a PR. Tests that need ffmpeg are gated on

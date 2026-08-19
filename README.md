@@ -87,8 +87,9 @@ Windows (PowerShell):
 irm https://raw.githubusercontent.com/schubydoo/podspine/main/install.ps1 | iex
 ```
 
-Or a package manager — `brew install schubydoo/podspine/podspine`, `scoop install
-podspine`, `nix profile install github:schubydoo/podspine`,
+Or a package manager — `brew install schubydoo/podspine/podspine`,
+`scoop bucket add podspine https://github.com/schubydoo/scoop-podspine && scoop install podspine`,
+`nix profile install github:schubydoo/podspine`,
 or `cargo binstall --git https://github.com/schubydoo/podspine podspine`.
 `ffmpeg`/`ffprobe` must be on your `PATH`. Full matrix,
 version pinning, uninstall, and signature verification: **[Installing](https://schubydoo.github.io/podspine/latest/installation/)**.

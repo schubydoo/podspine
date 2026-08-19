@@ -14,8 +14,8 @@ disclosure and credit you, if you'd like.
 
 ## Supported versions
 
-Podspine is pre-1.0 and under active development; only the latest release
-receives security fixes.
+Podspine is under active development; only the latest release receives
+security fixes.
 
 ## Scope & threat model
 

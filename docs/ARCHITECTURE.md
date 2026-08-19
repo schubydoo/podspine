@@ -37,14 +37,15 @@ The crates are described below; the pipeline runs left to right, with the SQLite
 | `prober` | Thin `ffprobe` wrapper → `ProbedBook` (duration, audio codec, cover presence/codec, track/title tags, embedded chapters). Parsing is separated from the subprocess call so it's unit-testable. |
 | `chapters` | Resolve the chapter source: a sibling `.cue` (75 fps `INDEX 01`) or `.ffmeta` sidecar wins over embedded markers (priority `.cue` > `.ffmeta` > embedded). `.opf`/`.nfo`/`.odm` are never chapter sources. |
 | `splitter` | `ffmpeg` wrapper: stream-copy each chapter into a codec-matching container (no re-encode). Bounds concurrency with a semaphore and enforces a per-child timeout/kill. Also extracts cover art. |
-| `index` | `rusqlite` (bundled SQLite) store for `book`, `episode`, and `feed_token` rows, with idempotent upserts keyed on stable ids. |
+| `index` | `rusqlite` (bundled SQLite) store for `book` and `episode` rows (the per-book `feed_id` capability token is a column on `book`), with idempotent upserts keyed on stable ids. |
 | `feed` | Build one RSS 2.0 channel (itunes + podcast namespaces) per book, and a self-check that refuses to serve a malformed feed. |
 | `http` | Axum router: UI, feed, cover, and Range audio routes, plus the security/DoS middleware. |
 | `ui` | `maud` server-rendered pages: book grid, per-book copy-URL + QR + regenerate, and the per-book **subscribe page** (one-tap "Open in…" deep links + per-app QRs). Pure presentation — no DB or HTTP dependency. |
 | `metrics` | Optional Prometheus instrumentation: metric names, the recorder, the helpers other crates record through, and a standalone `/metrics` listener bound separately from the feed server. A no-op unless `--metrics-bind` is set. |
 
 Plus the `podspine` server binary (`src/main.rs`, wiring config → scan → watch →
-serve).
+serve) and a dev-only `test-support` crate (shared test fixtures: ffmpeg skip
+gates, synthetic-audio generation, scratch-dir guards — never shipped).
 
 ## Ingest data flow
 
@@ -116,7 +117,7 @@ details.
 
 ```
 <data_dir>/
-├── podspine.db              # SQLite index (book, episode, feed_token)
+├── podspine.db              # SQLite index (book, episode)
 └── books/
     └── <slug>/
         ├── 001.m4a          # per-chapter episode files (NNN.<ext>)
@@ -125,9 +126,11 @@ details.
         └── cover.jpg        # extracted cover, if present
 ```
 
-Everything the HTTP layer serves lives under `<data_dir>` — a single trusted root
-that the path-safety check enforces. `book` and `episode` rows carry the on-disk
-`file_path` written at scan time; the server never builds a path from request input.
+Everything the HTTP layer serves lives under one of two trusted roots — `<data_dir>`
+(extracted chapters, covers) or the read-only library (whole-file episodes served in
+place) — and the path-safety check asserts containment in whichever root the row
+recorded. `book` and `episode` rows carry the on-disk `file_path` written at scan
+time; the server never builds a path from request input.
 
 ## HTTP surface
 
@@ -145,7 +148,9 @@ safe to expose externally (a guessed id 404s); see
 | `GET /subscribe/{feed_id}` | capability | "Add to a podcast app" helper page: one-tap "Open in…" deep links + per-app QRs. |
 | `GET /feed/{feed_id}.xml` | capability | The podcast feed (built from the index, passed through the self-check); always `itunes:block` + `X-Robots-Tag: noindex`. |
 | `GET /audio/{feed_id}/{n}` | capability | Episode audio with HTTP Range (206 / `Content-Range` / 416) via `axum-range`. |
-| `GET /cover/{feed_id}` | capability | Book cover image. |
+| `GET /cover/{feed_id}` | capability | Book cover image (full resolution — this is what feeds embed). |
+| `GET /cover/{feed_id}/thumb` | capability | Small scanner-generated cover thumbnail for the browse grid; falls back to the full cover. |
+| `POST /theme/{mode}` | UI (slug) | Set the light/dark/system theme cookie; same-origin-guarded. |
 | `GET /healthz` | — | Liveness. |
 
 `GET /metrics` is deliberately **not** in this table: when enabled it lives on a
@@ -170,13 +175,16 @@ split the way they are.
   the above is violated.
 
 **Audio fidelity:**
-- Never re-encoded: chapters are extracted by stream copy and whole files are served
-  untouched, so there's no quality loss.
+- Never re-encoded by default: chapters are extracted by stream copy and whole files
+  are served untouched, so there's no quality loss. The one exception is opt-in —
+  `PODSPINE_TRANSCODE=aac|mp3` re-encodes sources no podcatcher can play (FLAC,
+  Vorbis, Opus, ALAC) once at ingest; everything else stays stream-copied.
 
 **Security (see [SECURITY.md](https://github.com/schubydoo/podspine/blob/main/SECURITY.md) for the threat model):**
 - Book/episode ids are **opaque index keys**. Slugs are validated against an
   allow-list charset and rejected with 404; the resolved audio path is canonicalized
-  and asserted to stay under `<data_dir>`. A path is never built from user input.
+  and asserted to stay under a trusted root (`<data_dir>` or the read-only library).
+  A path is never built from user input.
 - `ffmpeg`/`ffprobe` are invoked with an **argv vector, never a shell string** —
   chapter titles and filenames are untrusted.
 - Bounded `ffmpeg` concurrency (a semaphore sized to the CPU count) with a per-child

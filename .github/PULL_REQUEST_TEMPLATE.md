@@ -17,10 +17,12 @@ Fixes #(issue number)
 ## Checklist
 
 - [ ] `cargo fmt --all --check` passes
-- [ ] `cargo clippy --all-targets -- -D warnings` passes
+- [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings` passes
 - [ ] `cargo test --workspace` passes (with `ffmpeg`/`ffprobe` on PATH)
 - [ ] Added or updated tests for the change
-- [ ] Updated docs (`README.md` / `docs/`) and `CHANGELOG.md` if user-visible
+- [ ] Added a `.changeset/<slug>.md` fragment (or the `no-changelog` label applies)
+      and updated docs (`README.md` / `docs/`) if user-visible — `CHANGELOG.md`
+      itself is generated, never hand-edited
 - [ ] Commits follow Conventional Commits; PR targets `main`
 - [ ] Kept Podspine's invariants (argv-vector ffmpeg calls, opaque ids under the
       data dir, sequential feed `pubDate`s, DRM-free-only)

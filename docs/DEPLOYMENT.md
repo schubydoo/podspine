@@ -236,8 +236,8 @@ Podspine has two kinds of routes, and they want different exposure:
 
 | Surface | Routes | Keyed by | Expose to the internet? |
 |---|---|---|---|
-| **Capability** | `GET /feed/{id}.xml`, `/audio/{id}/{n}`, `/cover/{id}`, `/healthz` | a random, unguessable per-book `feed_id` | **Yes** — a guessed id just 404s, and feeds carry `itunes:block` + `X-Robots-Tag: noindex` so they aren't listed or crawled |
-| **Browse UI** | `GET /`, `/book/{slug}`, `POST /book/{slug}/regenerate` | the human `slug` | **No** — `GET /` lists every book, handing out the "unguessable" URLs. Keep it on the LAN or behind proxy-auth |
+| **Capability** | `GET /feed/{id}.xml`, `/audio/{id}/{n}`, `/cover/{id}`, `/cover/{id}/thumb`, `/subscribe/{id}`, `/healthz` | a random, unguessable per-book `feed_id` | **Yes** — a guessed id just 404s, and feeds carry `itunes:block` + `X-Robots-Tag: noindex` so they aren't listed or crawled. (The proxy snippets below deliberately don't publish `/subscribe` — it's used from the LAN book page.) |
+| **Browse UI** | `GET /`, `/book/{slug}`, `POST /book/{slug}/regenerate`, `POST /theme/{mode}` | the human `slug` | **No** — `GET /` lists every book, handing out the "unguessable" URLs. Keep it on the LAN or behind proxy-auth |
 
 This is what lets you subscribe to a book and stream it **on the road without a VPN**:
 you copy the capability feed URL (or scan its QR) from the book page **on your LAN**,

@@ -7,9 +7,11 @@ This is the measurement half of the Sprint 5 performance-validation work — it
 checks Podspine against the four performance targets in the [table below](#targets)
 (ingest time, feed render p95, audio time-to-first-byte, and idle memory).
 The point is not to publish a leaderboard — it is to answer one question before
-any v2 efficiency work (on-the-fly splitting, transcoding) is built: **are the
-NFR targets already met, or is there a real bottleneck to fix?** Run the harness
-on the box you actually deploy to and let the numbers decide.
+any further efficiency work is built: **are the NFR targets already met, or is
+there a real bottleneck to fix?** (Opt-in transcoding — `PODSPINE_TRANSCODE` —
+and `saver` mode's regenerate-on-demand chapter cache have since shipped; what
+remains hypothetical is byte-range chapter serving with no split files at all.)
+Run the harness on the box you actually deploy to and let the numbers decide.
 
 ## Targets
 
@@ -67,30 +69,35 @@ DURATION_SEC=3600 CHAPTERS=40 N_FEED=500 scripts/bench.sh
 
 ## Reference run
 
-Illustrative only — captured in a Linux x86_64 CI-class sandbox, loopback, with a
-synthetic 300s / 8-chapter book. **Your hardware will differ**; re-run locally.
+Illustrative only — captured 2026-08-19 on a Linux x86_64 host, loopback, with a
+synthetic 300s / 8-chapter book, after the parallel chapter split (v1.7.0).
+**Your hardware will differ**; re-run locally.
 
 | NFR | Metric                   | Measured           | Target      | Result |
 |-----|--------------------------|--------------------|-------------|--------|
-| P1  | Ingest (this book, 300s) | 0.91 s             | —           | —      |
-| P1  | Ingest → 10h (extrap.)   | ~109 s             | ≤ 120 s     | PASS   |
-| P2  | Feed p50/p95/p99         | 2.0 / 2.2 / 2.4 ms | p95 < 200ms | PASS   |
-| P3  | Audio TTFB p50/p95/p99   | 2.4 / 2.7 / 2.8 ms | p95 < 300ms | PASS   |
-| P4  | Idle RSS                 | 8.3 MB             | < 50 MB     | PASS   |
+| P1  | Ingest (this book, 300s) | 0.24 s             | —           | —      |
+| P1  | Ingest → 10h (extrap.)   | ~29 s              | ≤ 120 s     | PASS   |
+| P2  | Feed p50/p95/p99         | 1.3 / 2.3 / 2.5 ms | p95 < 200ms | PASS   |
+| P3  | Audio TTFB p50/p95/p99   | 0.7 / 0.8 / 0.9 ms | p95 < 300ms | PASS   |
+| P4  | Idle RSS                 | 9.5 MB             | < 50 MB     | PASS   |
 
 ### Reading the reference run
 
 All four targets clear with wide margins — feed render and audio TTFB sit ~100×
-under budget, and idle memory is ~6× under. The only figure worth watching is
-**P1**: pre-split ingest is I/O-bound (`ffmpeg -c copy` per chapter), so on slow
-storage or a many-chapter book it will rise. This applies only to **chaptered**
-books — whole-file episodes (MP3-folder tracks, chapterless singles) are served in
-place from the library and skip the split entirely (Sprint 6.2). Because the
-extrapolation folds in fixed startup cost it is pessimistic, but if a real 10h
-chaptered book on your disk lands near the 2-minute ceiling, that is the signal
-that avoiding the pre-split for chaptered books too (on-the-fly byte-range chapter
-serving, no duplicate split files) is worth the complexity — otherwise premature.
+under budget, and idle memory is ~5× under. **P1** used to be the figure to
+watch, and it improved substantially in v1.7.0: chapters are now split in
+parallel, bounded by a CPU-sized ffmpeg gate (measured ~9× on a 20-core host for
+a 40-chapter book), so many-chapter books scale far better than a linear
+per-chapter model suggests. Pre-split ingest remains I/O-bound on slow storage.
+This applies only to **chaptered** books — whole-file episodes (MP3-folder
+tracks, chapterless singles) are served in place from the library and skip the
+split entirely (Sprint 6.2), and `saver` mode trades the persistent split set
+for a regenerate-on-demand cache. Because the extrapolation folds in fixed
+startup cost it is pessimistic, but if a real 10h chaptered book on your disk
+still lands near the 2-minute ceiling, that is the signal that on-the-fly
+byte-range chapter serving (no split files at all) is worth the complexity —
+otherwise premature.
 
-The optional `/metrics` endpoint (Prometheus counters/histograms) is intentionally
-not part of this harness; it adds a runtime dependency and an opt-in config flag,
-which is a separate change.
+The optional `/metrics` endpoint (Prometheus counters/histograms, enabled with
+`--metrics-bind` on its own listener) is intentionally not part of this harness —
+the harness measures the serving path, not the exporter.
