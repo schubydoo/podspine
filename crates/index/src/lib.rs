@@ -195,94 +195,36 @@ impl Index {
     /// Existing episodes get `start_sec = 0`; that value is only read for
     /// `saver`-mode regeneration and is corrected on the next re-scan.
     fn migrate(conn: &Connection) -> Result<(), IndexError> {
-        let has_start_sec: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('episode') WHERE name = 'start_sec'",
-            [],
-            |r| r.get(0),
+        // `episode.start_sec` (saver-mode regeneration). Existing rows get 0;
+        // corrected on the next re-scan.
+        add_column_if_missing(conn, "episode", "start_sec", "REAL NOT NULL DEFAULT 0")?;
+        // `episode.source_path` (serve-in-place, Sprint 6.2). Existing rows
+        // default to `''` (extracted/copied under `<data_dir>`, as before); a
+        // re-scan flips whole-file books to in-place serving and reclaims their
+        // copies.
+        add_column_if_missing(conn, "episode", "source_path", "TEXT NOT NULL DEFAULT ''")?;
+        // `episode.needs_faststart` (faststart detection, Sprint 6.3). Existing
+        // rows default to `0`; a re-scan re-detects and records it per
+        // whole-file mp4.
+        add_column_if_missing(
+            conn,
+            "episode",
+            "needs_faststart",
+            "INTEGER NOT NULL DEFAULT 0",
         )?;
-        if has_start_sec == 0 {
-            conn.execute(
-                "ALTER TABLE episode ADD COLUMN start_sec REAL NOT NULL DEFAULT 0",
-                [],
-            )?;
-        }
-        // `source_path` (serve-in-place, Sprint 6.2). Existing rows default to
-        // `''` (extracted/copied under `<data_dir>`, as before); a re-scan flips
-        // whole-file books to in-place serving and reclaims their copies.
-        let has_source_path: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('episode') WHERE name = 'source_path'",
-            [],
-            |r| r.get(0),
-        )?;
-        if has_source_path == 0 {
-            conn.execute(
-                "ALTER TABLE episode ADD COLUMN source_path TEXT NOT NULL DEFAULT ''",
-                [],
-            )?;
-        }
-        // `needs_faststart` (faststart detection, Sprint 6.3). Existing rows
-        // default to `0`; a re-scan re-detects and records it per whole-file mp4.
-        let has_needs_faststart: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('episode') WHERE name = 'needs_faststart'",
-            [],
-            |r| r.get(0),
-        )?;
-        if has_needs_faststart == 0 {
-            conn.execute(
-                "ALTER TABLE episode ADD COLUMN needs_faststart INTEGER NOT NULL DEFAULT 0",
-                [],
-            )?;
-        }
         // `book.storage_mode` + `book.default_cover_url` (per-book overrides,
         // Sprint 6.4). Existing rows default to `''`/NULL, meaning "follow the
         // global config"; a re-scan records the effective per-book value.
-        let has_book_storage_mode: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('book') WHERE name = 'storage_mode'",
-            [],
-            |r| r.get(0),
-        )?;
-        if has_book_storage_mode == 0 {
-            conn.execute(
-                "ALTER TABLE book ADD COLUMN storage_mode TEXT NOT NULL DEFAULT ''",
-                [],
-            )?;
-        }
-        let has_book_cover_url: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('book') WHERE name = 'default_cover_url'",
-            [],
-            |r| r.get(0),
-        )?;
-        if has_book_cover_url == 0 {
-            conn.execute("ALTER TABLE book ADD COLUMN default_cover_url TEXT", [])?;
-        }
+        add_column_if_missing(conn, "book", "storage_mode", "TEXT NOT NULL DEFAULT ''")?;
+        add_column_if_missing(conn, "book", "default_cover_url", "TEXT")?;
         // `book.force_embedded` (per-book overrides, 6.4). Recorded so a scan can
         // detect a `.podspine.toml` `force_embedded_chapters` toggle (which changes
         // the chapter source without changing the audio mtime) and re-ingest.
-        let has_force_embedded: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('book') WHERE name = 'force_embedded'",
-            [],
-            |r| r.get(0),
-        )?;
-        if has_force_embedded == 0 {
-            conn.execute(
-                "ALTER TABLE book ADD COLUMN force_embedded INTEGER NOT NULL DEFAULT 0",
-                [],
-            )?;
-        }
+        add_column_if_missing(conn, "book", "force_embedded", "INTEGER NOT NULL DEFAULT 0")?;
         // `book.transcode` (opt-in re-encoding, Task 5.2). Existing rows default
         // to `''` — "unknown, pre-5.2" — which a scan treats as "not transcoded",
         // matching how every pre-5.2 book was actually produced.
-        let has_book_transcode: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('book') WHERE name = 'transcode'",
-            [],
-            |r| r.get(0),
-        )?;
-        if has_book_transcode == 0 {
-            conn.execute(
-                "ALTER TABLE book ADD COLUMN transcode TEXT NOT NULL DEFAULT ''",
-                [],
-            )?;
-        }
+        add_column_if_missing(conn, "book", "transcode", "TEXT NOT NULL DEFAULT ''")?;
         // `book.created_at` (first-seen time, epoch millis). Its only use is
         // picking the survivor when healing a database that holds two rows for one
         // source: the earliest-created row is the feed subscribers have held
@@ -298,16 +240,7 @@ impl Index {
         // are tiny next to the epoch-millis stamps new rows get, so a migrated row
         // always sorts before any row written afterwards — still correct, since it
         // is genuinely older.
-        let has_book_created_at: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('book') WHERE name = 'created_at'",
-            [],
-            |r| r.get(0),
-        )?;
-        if has_book_created_at == 0 {
-            conn.execute(
-                "ALTER TABLE book ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0",
-                [],
-            )?;
+        if add_column_if_missing(conn, "book", "created_at", "INTEGER NOT NULL DEFAULT 0")? {
             conn.execute("UPDATE book SET created_at = rowid", [])?;
         }
         Ok(())
@@ -387,8 +320,7 @@ impl Index {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status, storage_mode, default_cover_url, force_embedded, transcode
-                 FROM book WHERE id = ?1",
+                &format!("SELECT {BOOK_COLUMNS} FROM book WHERE id = ?1"),
                 [id],
                 book_from_row,
             )
@@ -400,8 +332,7 @@ impl Index {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status, storage_mode, default_cover_url, force_embedded, transcode
-                 FROM book WHERE slug = ?1",
+                &format!("SELECT {BOOK_COLUMNS} FROM book WHERE slug = ?1"),
                 [slug],
                 book_from_row,
             )
@@ -410,10 +341,9 @@ impl Index {
 
     /// All books, ordered by title.
     pub fn list_books(&self) -> Result<Vec<BookRow>, IndexError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status, storage_mode, default_cover_url, force_embedded, transcode
-             FROM book ORDER BY title",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT {BOOK_COLUMNS} FROM book ORDER BY title"))?;
         let rows = stmt.query_map([], book_from_row)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
@@ -447,8 +377,7 @@ impl Index {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status, storage_mode, default_cover_url, force_embedded, transcode
-                 FROM book WHERE feed_id = ?1",
+                &format!("SELECT {BOOK_COLUMNS} FROM book WHERE feed_id = ?1"),
                 [feed_id],
                 book_from_row,
             )
@@ -476,6 +405,32 @@ impl Index {
     }
 }
 
+/// Add `column` to `table` if it is missing; `ddl` is the type + constraints
+/// clause. Returns whether the column was added, so a migration can run a
+/// one-time backfill on exactly the databases that migrated.
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    ddl: &str,
+) -> Result<bool, IndexError> {
+    let present: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+        params![table, column],
+        |r| r.get(0),
+    )?;
+    if present == 0 {
+        // table/column/ddl are compile-time literals from `migrate`, never user
+        // input — safe to splice.
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {ddl}"),
+            [],
+        )?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 /// Wall-clock **milliseconds** since the Unix epoch, for a book's first-seen time.
 /// Milliseconds (not seconds) so two books indexed close together still order
 /// distinctly. A clock before 1970 (unset RTC) clamps to 0 rather than panicking.
@@ -485,6 +440,10 @@ fn now_epoch_millis() -> i64 {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
+
+/// The `book` SELECT column list. Order must match `book_from_row`'s ordinals —
+/// one definition so adding a column edits exactly one string and one mapper.
+const BOOK_COLUMNS: &str = "id, slug, feed_id, title, author, cover_path, source_path, source_mtime, status, storage_mode, default_cover_url, force_embedded, transcode";
 
 fn book_from_row(row: &Row) -> rusqlite::Result<BookRow> {
     Ok(BookRow {
