@@ -1869,6 +1869,29 @@ mod tests {
     }
 
     #[test]
+    fn extract_cover_thumb_maps_a_bad_input_to_a_cover_error() {
+        if !have_ffmpeg() {
+            skip!("ffmpeg not available");
+        }
+        // A non-image input -> ffmpeg can't decode it -> CoverError (Ffmpeg or the
+        // empty-output guard), never a panic.
+        let dir = std::env::temp_dir().join("podspine-thumb-fail");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bad = dir.join("notanimage.png");
+        std::fs::write(&bad, b"definitely not an image").unwrap();
+        let err = extract_cover_thumb(&bad, &dir.join("out")).expect_err("bad input must fail");
+        assert!(
+            matches!(
+                err,
+                CoverError::Ffmpeg { .. } | CoverError::OutputMissing { .. }
+            ),
+            "{err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn extract_cover_reports_create_dir_when_out_dir_is_a_file() {
         // out_dir is an existing regular file -> create_dir_all fails BEFORE any
         // ffmpeg spawn -> CoverError::CreateDir. ffmpeg-free, so it runs everywhere.

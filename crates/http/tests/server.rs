@@ -1930,3 +1930,51 @@ async fn cover_thumbnail_is_generated_on_demand_and_refreshes_when_stale() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn cover_thumb_falls_back_to_the_full_cover_when_generation_fails() {
+    // A book whose "cover" is not a decodable image: thumbnail generation fails, so
+    // `/thumb` must serve the full cover file rather than 404. Exercises the handler
+    // fallback path without depending on ffmpeg (a missing ffmpeg fails generation
+    // just the same, still hitting the fallback).
+    let dir = std::env::temp_dir().join("podspine-http-thumb-fallback");
+    let _ = std::fs::remove_dir_all(&dir);
+    let data = dir.join("data");
+    let book_dir = data.join("books").join("badcover");
+    std::fs::create_dir_all(&book_dir).unwrap();
+    let cover = book_dir.join("cover.jpg");
+    std::fs::write(&cover, b"this is not an image").unwrap();
+
+    let index = Index::open_in_memory().unwrap();
+    let mut row = book_row("badcover", "Xk9mQ2vP7nR4tB1cY6wZ8a");
+    row.cover_path = Some(cover.to_string_lossy().into_owned());
+    index.upsert_book(&row).unwrap();
+    let feed_id = row.feed_id.clone();
+
+    let state = AppState::new(
+        index,
+        "http://test".to_string(),
+        &data,
+        &dir,
+        None,
+        false,
+        None,
+        None,
+    );
+    let resp = router(state)
+        .oneshot(
+            Request::get(format!("/cover/{feed_id}/thumb"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "falls back to the full cover"
+    );
+    assert_eq!(body_bytes(resp).await, b"this is not an image");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
