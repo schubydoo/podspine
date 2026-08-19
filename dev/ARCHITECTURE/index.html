@@ -859,7 +859,7 @@ restart.</p>
 </tr>
 <tr>
 <td><code>index</code></td>
-<td><code>rusqlite</code> (bundled SQLite) store for <code>book</code>, <code>episode</code>, and <code>feed_token</code> rows, with idempotent upserts keyed on stable ids.</td>
+<td><code>rusqlite</code> (bundled SQLite) store for <code>book</code> and <code>episode</code> rows (the per-book <code>feed_id</code> capability token is a column on <code>book</code>), with idempotent upserts keyed on stable ids.</td>
 </tr>
 <tr>
 <td><code>feed</code></td>
@@ -880,7 +880,8 @@ restart.</p>
 </tbody>
 </table>
 <p>Plus the <code>podspine</code> server binary (<code>src/main.rs</code>, wiring config → scan → watch →
-serve).</p>
+serve) and a dev-only <code>test-support</code> crate (shared test fixtures: ffmpeg skip
+gates, synthetic-audio generation, scratch-dir guards — never shipped).</p>
 <h2 id="ingest-data-flow">Ingest data flow<a class="headerlink" href="#ingest-data-flow" title="Permanent link">&para;</a></h2>
 <p>Per book, the scanner runs:</p>
 <pre class="mermaid"><code>flowchart TD
@@ -943,7 +944,7 @@ books cost only their index row and any extracted cover. See
 <a href="../DEPLOYMENT/#storage-mode-full-vs-saver">DEPLOYMENT.md</a> for the disk-budget
 details.</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>&lt;data_dir&gt;/
-<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>├── podspine.db              # SQLite index (book, episode, feed_token)
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>├── podspine.db              # SQLite index (book, episode)
 <a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>└── books/
 <a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>    └── &lt;slug&gt;/
 <a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>        ├── 001.m4a          # per-chapter episode files (NNN.&lt;ext&gt;)
@@ -951,9 +952,11 @@ details.</p>
 <a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>        ├── ...
 <a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>        └── cover.jpg        # extracted cover, if present
 </code></pre></div>
-<p>Everything the HTTP layer serves lives under <code>&lt;data_dir&gt;</code> — a single trusted root
-that the path-safety check enforces. <code>book</code> and <code>episode</code> rows carry the on-disk
-<code>file_path</code> written at scan time; the server never builds a path from request input.</p>
+<p>Everything the HTTP layer serves lives under one of two trusted roots — <code>&lt;data_dir&gt;</code>
+(extracted chapters, covers) or the read-only library (whole-file episodes served in
+place) — and the path-safety check asserts containment in whichever root the row
+recorded. <code>book</code> and <code>episode</code> rows carry the on-disk <code>file_path</code> written at scan
+time; the server never builds a path from request input.</p>
 <h2 id="http-surface">HTTP surface<a class="headerlink" href="#http-surface" title="Permanent link">&para;</a></h2>
 <p>Routes split into two surfaces. The <strong>browse UI</strong> is keyed by the human <code>slug</code> and
 enumerates the library, so it's meant for the LAN / behind proxy-auth. The
@@ -1002,7 +1005,17 @@ safe to expose externally (a guessed id 404s); see
 <tr>
 <td><code>GET /cover/{feed_id}</code></td>
 <td>capability</td>
-<td>Book cover image.</td>
+<td>Book cover image (full resolution — this is what feeds embed).</td>
+</tr>
+<tr>
+<td><code>GET /cover/{feed_id}/thumb</code></td>
+<td>capability</td>
+<td>Small scanner-generated cover thumbnail for the browse grid; falls back to the full cover.</td>
+</tr>
+<tr>
+<td><code>POST /theme/{mode}</code></td>
+<td>UI (slug)</td>
+<td>Set the light/dark/system theme cookie; same-origin-guarded.</td>
 </tr>
 <tr>
 <td><code>GET /healthz</code></td>
@@ -1029,12 +1042,15 @@ split the way they are.</p>
 - A generated feed is rejected by the self-check before it can be served if any of
   the above is violated.</p>
 <p><strong>Audio fidelity:</strong>
-- Never re-encoded: chapters are extracted by stream copy and whole files are served
-  untouched, so there's no quality loss.</p>
+- Never re-encoded by default: chapters are extracted by stream copy and whole files
+  are served untouched, so there's no quality loss. The one exception is opt-in —
+  <code>PODSPINE_TRANSCODE=aac|mp3</code> re-encodes sources no podcatcher can play (FLAC,
+  Vorbis, Opus, ALAC) once at ingest; everything else stays stream-copied.</p>
 <p><strong>Security (see <a href="https://github.com/schubydoo/podspine/blob/main/SECURITY.md">SECURITY.md</a> for the threat model):</strong>
 - Book/episode ids are <strong>opaque index keys</strong>. Slugs are validated against an
   allow-list charset and rejected with 404; the resolved audio path is canonicalized
-  and asserted to stay under <code>&lt;data_dir&gt;</code>. A path is never built from user input.
+  and asserted to stay under a trusted root (<code>&lt;data_dir&gt;</code> or the read-only library).
+  A path is never built from user input.
 - <code>ffmpeg</code>/<code>ffprobe</code> are invoked with an <strong>argv vector, never a shell string</strong> —
   chapter titles and filenames are untrusted.
 - Bounded <code>ffmpeg</code> concurrency (a semaphore sized to the CPU count) with a per-child

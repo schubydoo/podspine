@@ -1035,8 +1035,9 @@ is enough; this page covers the production details: persistence, exposing it saf
 and running it as a service.</p>
 <blockquote>
 <p><strong>Podspine has no built-in login.</strong> It splits into two surfaces (see
-<a href="#exposing-podspine-safely">Exposing Podspine safely</a> below): the <strong>feed/audio/cover</strong>
-routes are protected by an unguessable per-book <strong>capability URL</strong> and are safe to
+<a href="#exposing-podspine-safely">Exposing Podspine safely</a> below): the
+<strong>feed/audio/cover/subscribe</strong> routes are protected by an unguessable per-book
+<strong>capability URL</strong> and are safe to
 expose to the internet, while the <strong>browse UI</strong> enumerates your whole library and
 must stay on your LAN or behind proxy-auth. See <a href="https://github.com/schubydoo/podspine/blob/main/SECURITY.md">SECURITY.md</a>.</p>
 </blockquote>
@@ -1356,13 +1357,13 @@ skipped for that book; it never aborts the scan.</p>
 <tbody>
 <tr>
 <td><strong>Capability</strong></td>
-<td><code>GET /feed/{id}.xml</code>, <code>/audio/{id}/{n}</code>, <code>/cover/{id}</code>, <code>/healthz</code></td>
+<td><code>GET /feed/{id}.xml</code>, <code>/audio/{id}/{n}</code>, <code>/cover/{id}</code>, <code>/cover/{id}/thumb</code>, <code>/subscribe/{id}</code>, <code>/healthz</code></td>
 <td>a random, unguessable per-book <code>feed_id</code></td>
-<td><strong>Yes</strong> — a guessed id just 404s, and feeds carry <code>itunes:block</code> + <code>X-Robots-Tag: noindex</code> so they aren't listed or crawled</td>
+<td><strong>Yes</strong> — a guessed id just 404s, and feeds carry <code>itunes:block</code> + <code>X-Robots-Tag: noindex</code> so they aren't listed or crawled. <code>/subscribe</code> must be public in a split deployment: the QR on the (LAN-only) book page points your phone at <code>base_url/subscribe/{feed_id}</code>, and it exposes only that one book's links</td>
 </tr>
 <tr>
 <td><strong>Browse UI</strong></td>
-<td><code>GET /</code>, <code>/book/{slug}</code>, <code>POST /book/{slug}/regenerate</code></td>
+<td><code>GET /</code>, <code>/book/{slug}</code>, <code>POST /book/{slug}/regenerate</code>, <code>POST /theme/{mode}</code></td>
 <td>the human <code>slug</code></td>
 <td><strong>No</strong> — <code>GET /</code> lists every book, handing out the "unguessable" URLs. Keep it on the LAN or behind proxy-auth</td>
 </tr>
@@ -1469,15 +1470,15 @@ the browse UI private. Two hard requirements:</p>
    Range to seek/scrub; stripping it breaks playback.</li>
 <li>Set <code>PODSPINE_BASE_URL</code> to the <strong>public</strong> URL so generated feed/audio links match.</li>
 </ol>
-<p>The configs below publish <code>/feed</code>, <code>/audio</code>, <code>/cover</code>, <code>/healthz</code> and refuse the
-browse UI (<code>/</code>, <code>/book/*</code>) — you use the UI over the LAN. (Prefer one authenticated
+<p>The configs below publish <code>/feed</code>, <code>/audio</code>, <code>/cover</code>, <code>/subscribe</code>, <code>/healthz</code> and
+refuse the browse UI (<code>/</code>, <code>/book/*</code>) — you use the UI over the LAN. (Prefer one authenticated
 hostname instead? Drop the <code>@ui</code>/<code>location /</code> blocks and put <code>basicauth</code>/<code>auth_basic</code>
-on the whole server — just never require auth on <code>/feed</code>,<code>/audio</code>,<code>/cover</code>, since
-podcast apps can't log in.)</p>
+on the whole server — just never require auth on <code>/feed</code>,<code>/audio</code>,<code>/cover</code>,
+<code>/subscribe</code>, since podcast apps (and a phone that just scanned a QR) can't log in.)</p>
 <p><strong>Caddy</strong> (Range passes through automatically):</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>podspine.example.com<span class="w"> </span><span class="p">{</span>
 <a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="w">    </span><span class="c1"># Public: the capability surface only (unguessable per-book URLs).</span>
-<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="w">    </span><span class="nd">@capability</span><span class="w"> </span>path<span class="w"> </span>/feed/*<span class="w"> </span>/audio/*<span class="w"> </span>/cover/*<span class="w"> </span>/healthz
+<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="w">    </span><span class="nd">@capability</span><span class="w"> </span>path<span class="w"> </span>/feed/*<span class="w"> </span>/audio/*<span class="w"> </span>/cover/*<span class="w"> </span>/subscribe/*<span class="w"> </span>/healthz
 <a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a><span class="w">    </span><span class="k">handle</span><span class="w"> </span><span class="nd">@capability</span><span class="w"> </span><span class="p">{</span>
 <a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a><span class="w">        </span><span class="k">reverse_proxy</span><span class="w"> </span>127.0.0.1:8080
 <a id="__codelineno-7-6" name="__codelineno-7-6" href="#__codelineno-7-6"></a><span class="w">    </span><span class="p">}</span>
@@ -1491,8 +1492,8 @@ podcast apps can't log in.)</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="k">server</span><span class="w"> </span><span class="p">{</span>
 <a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="w">    </span><span class="kn">server_name</span><span class="w"> </span><span class="s">podspine.example.com</span><span class="p">;</span>
 <a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a>
-<a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a><span class="w">    </span><span class="c1"># Public capability surface: feeds, cover, and audio (with Range).</span>
-<a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a><span class="w">    </span><span class="kn">location</span><span class="w"> </span><span class="p">~</span><span class="w"> </span><span class="sr">^/(feed|audio|cover)/</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a><span class="w">    </span><span class="c1"># Public capability surface: feeds, cover, audio (with Range), and subscribe.</span>
+<a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a><span class="w">    </span><span class="kn">location</span><span class="w"> </span><span class="p">~</span><span class="w"> </span><span class="sr">^/(feed|audio|cover|subscribe)/</span><span class="w"> </span><span class="p">{</span>
 <a id="__codelineno-8-6" name="__codelineno-8-6" href="#__codelineno-8-6"></a><span class="w">        </span><span class="kn">proxy_pass</span><span class="w"> </span><span class="s">http://127.0.0.1:8080</span><span class="p">;</span>
 <a id="__codelineno-8-7" name="__codelineno-8-7" href="#__codelineno-8-7"></a><span class="w">        </span><span class="kn">proxy_set_header</span><span class="w"> </span><span class="s">Host</span><span class="w"> </span><span class="nv">$host</span><span class="p">;</span>
 <a id="__codelineno-8-8" name="__codelineno-8-8" href="#__codelineno-8-8"></a><span class="w">        </span><span class="kn">proxy_set_header</span><span class="w"> </span><span class="s">Range</span><span class="w"> </span><span class="nv">$http_range</span><span class="p">;</span><span class="w">               </span><span class="c1"># forward seek requests</span>
