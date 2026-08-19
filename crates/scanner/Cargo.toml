@@ -24,3 +24,6 @@ notify = { workspace = true }
 
 [dev-dependencies]
 podspine-test-support = { path = "../test-support" }
+# Fault injection: a second connection to the same SQLite file, to break the
+# schema out from under a live Index.
+rusqlite = { workspace = true }

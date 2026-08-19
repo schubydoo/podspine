@@ -1262,6 +1262,7 @@ dependencies = [
  "podspine-splitter",
  "podspine-test-support",
  "podspine-ui",
+ "rusqlite",
  "tokio",
  "tower",
  "tower-http",
@@ -1314,6 +1315,7 @@ dependencies = [
  "podspine-prober",
  "podspine-splitter",
  "podspine-test-support",
+ "rusqlite",
  "thiserror",
  "tracing",
 ]

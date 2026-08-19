@@ -1236,6 +1236,42 @@ mod tests {
         assert_eq!(mime_for("/x/blob"), "audio/mp4");
     }
 
+    /// Eviction is best-effort and must never panic or fail a request — fault-
+    /// inject both abandon paths: a database failure (the `book` table dropped
+    /// out from under a live [`Index`] by a second connection) and a poisoned
+    /// index lock. Each returns quietly after logging a warn.
+    #[tokio::test]
+    async fn enforce_cache_survives_a_broken_index_and_a_poisoned_lock() {
+        let dir = scratch("http-enforce-cache-faults");
+        let db = dir.path().join("test.db");
+        let state = AppState::new(
+            Index::open(&db).unwrap(),
+            "http://test".to_string(),
+            dir.path(),
+            dir.path(),
+            None,
+            StorageMode::Saver,
+            Some(1), // a cap, so eviction doesn't no-op before the fault
+            None,
+        )
+        .expect("test dirs canonicalize");
+
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute("DROP TABLE book", [])
+            .unwrap();
+        enforce_cache(&state, FsPath::new("/keep")).await; // DB error: skipped, logged
+
+        let poison = state.clone();
+        std::thread::spawn(move || {
+            let _guard = poison.index.lock().unwrap();
+            panic!("poison the index lock");
+        })
+        .join()
+        .expect_err("the poisoning thread must panic");
+        enforce_cache(&state, FsPath::new("/keep")).await; // poisoned lock: skipped, logged
+    }
+
     #[test]
     fn book_is_saver_follows_per_book_then_global() {
         let mk = |mode: Option<StorageMode>| BookRow {

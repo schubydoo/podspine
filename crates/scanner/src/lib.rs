@@ -4059,6 +4059,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A database failure mid-scan is survived and logged, never a panic —
+    /// fault-inject by dropping the `book` table out from under a live [`Index`]
+    /// via a second connection. One scan then exercises every skipped-with-a-warn
+    /// arm: the duplicate-row collapse, the id-reuse map, and the disabled-book
+    /// prune (the disabled path never probes, so no ffmpeg is needed).
+    #[test]
+    fn scan_survives_a_broken_index() {
+        let root = scratch("scan-broken-index");
+        let data = root.join("data");
+        std::fs::write(root.join("book.m4b"), b"").unwrap();
+        std::fs::write(root.join("book.podspine.toml"), b"disabled = true").unwrap();
+
+        let db = root.join("test.db");
+        let index = Index::open(&db).unwrap();
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute("DROP TABLE book", [])
+            .unwrap();
+
+        let summary = scan_library(&root, &data, &index, ScanOptions::default());
+        assert_eq!(
+            summary.skipped, 1,
+            "disabled book is still skipped when every index call fails"
+        );
+    }
+
     #[test]
     fn per_book_disabled_skips_and_prunes() {
         skip_unless_ffmpeg!();

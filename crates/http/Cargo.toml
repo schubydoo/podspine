@@ -27,6 +27,9 @@ blake3 = { workspace = true }
 [dev-dependencies]
 podspine-scanner = { path = "../scanner" }
 podspine-test-support = { path = "../test-support" }
+# Fault injection: a second connection to the same SQLite file, to break the
+# schema out from under a live Index.
+rusqlite = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 tower = { version = "=0.5.3", features = ["util"] }
