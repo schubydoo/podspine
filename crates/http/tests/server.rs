@@ -1408,12 +1408,11 @@ async fn transcoded_flac_book_serves_as_aac_and_is_never_evicted() {
 
 /// A bare state over an empty in-memory index, used to drive the readiness gate
 /// without synthesizing audio. Defaults to `ready`; the tests flip it explicitly.
+/// The roots just need to exist (AppState::new canonicalizes them) — no file
+/// under them is ever touched, so the shared temp dir is fine on every OS.
 fn empty_state() -> AppState {
-    test_state(
-        Index::open_in_memory().unwrap(),
-        Path::new("/tmp"),
-        Path::new("/tmp"),
-    )
+    let tmp = std::env::temp_dir();
+    test_state(Index::open_in_memory().unwrap(), &tmp, &tmp)
 }
 
 #[tokio::test]
