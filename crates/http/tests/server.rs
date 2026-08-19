@@ -1853,7 +1853,7 @@ async fn set_theme_redirects_back_even_when_ui_origin_differs() {
 }
 
 #[tokio::test]
-async fn cover_thumbnail_is_generated_on_demand_and_cached() {
+async fn serves_scanner_generated_thumbnail_with_fallback() {
     if !ffmpeg_available() {
         eprintln!("skipping: ffmpeg not available");
         return;
@@ -1869,11 +1869,8 @@ async fn cover_thumbnail_is_generated_on_demand_and_cached() {
     let feed_id = book.feed_id.clone();
     let cover = PathBuf::from(book.cover_path.clone().expect("cover extracted"));
     let thumb = cover.with_file_name("cover_thumb.jpg");
-    // Thumbnails are made on demand, not at ingest.
-    assert!(
-        !thumb.exists(),
-        "the scan must not pre-generate a thumbnail"
-    );
+    // The scan generates the thumbnail (the http layer only serves it).
+    assert!(thumb.exists(), "the scan should have generated a thumbnail");
 
     let state = AppState::new(
         index,
@@ -1894,7 +1891,7 @@ async fn cover_thumbnail_is_generated_on_demand_and_cached() {
         )
     };
 
-    // First request generates the thumbnail, caches it to disk, and serves JPEG.
+    // The thumb route serves the scanner-made thumbnail (JPEG, cacheable).
     let resp = get_thumb().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
@@ -1906,23 +1903,26 @@ async fn cover_thumbnail_is_generated_on_demand_and_cached() {
         "thumb is cacheable"
     );
     assert!(!body_bytes(resp).await.is_empty(), "thumbnail bytes served");
-    assert!(thumb.exists(), "first request caches the thumbnail to disk");
 
-    // A second request is served from the cached file (freshness is handled by the
-    // scanner deleting the thumb on a cover re-extraction, not by this handler).
+    // Fallback: with no thumbnail on disk (before a reconcile backfills it), the
+    // route serves the full cover instead of 404ing.
+    std::fs::remove_file(&thumb).unwrap();
     let resp = get_thumb().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "falls back to the full cover"
+    );
     assert!(!body_bytes(resp).await.is_empty());
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
-async fn cover_thumb_falls_back_to_the_full_cover_when_generation_fails() {
-    // A book whose "cover" is not a decodable image: thumbnail generation fails, so
-    // `/thumb` must serve the full cover file rather than 404. Exercises the handler
-    // fallback path without depending on ffmpeg (a missing ffmpeg fails generation
-    // just the same, still hitting the fallback).
+async fn cover_thumb_falls_back_to_the_full_cover_when_absent() {
+    // A book with a cover but no generated thumbnail (e.g. before a reconcile
+    // backfills it): `/thumb` must serve the full cover file rather than 404.
+    // ffmpeg-free — the handler only serves, it never generates.
     let dir = std::env::temp_dir().join("podspine-http-thumb-fallback");
     let _ = std::fs::remove_dir_all(&dir);
     let data = dir.join("data");

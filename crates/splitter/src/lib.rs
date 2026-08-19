@@ -1260,6 +1260,43 @@ mod tests {
     }
 
     #[test]
+    fn cover_extraction_reports_publish_when_a_directory_blocks_the_target() {
+        if !have_ffmpeg() {
+            skip!("ffmpeg not available");
+        }
+        // ffmpeg produces the `.part` fine, but a directory sitting at the final path
+        // blocks the atomic rename → CoverError::Publish (the image is never
+        // half-published; the blocker is left as-is).
+        let dir = std::env::temp_dir().join("podspine-cover-publish");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cover = dir.join("cover.png");
+        let ok = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:s=64x64:d=0.1",
+                "-frames:v",
+                "1",
+            ])
+            .arg(&cover)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "ffmpeg cover synth failed");
+
+        std::fs::create_dir_all(cover_thumb_path(&dir)).unwrap(); // a dir at the target
+        let err = extract_cover_thumb(&cover, &dir).expect_err("blocked rename must fail");
+        assert!(matches!(err, CoverError::Publish { .. }), "{err:?}");
+        assert!(cover_thumb_path(&dir).is_dir(), "the blocker is left as-is");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn semaphore_bounds_and_releases_permits() {
         let sem = Semaphore {
             permits: Mutex::new(1),

@@ -49,9 +49,7 @@ use tower_http::trace::TraceLayer;
 
 use podspine_feed::{FeedBook, FeedEpisode, render_checked};
 use podspine_index::{BookRow, Index};
-use podspine_splitter::{
-    ChapterCut, cover_thumb_path, extract_cover_thumb, remux_faststart, split_chapter,
-};
+use podspine_splitter::{ChapterCut, cover_thumb_path, remux_faststart, split_chapter};
 use podspine_ui::{
     BookCard, BookDetail, Theme, book_page, index_page, scanning_page, subscribe_page,
 };
@@ -526,66 +524,21 @@ async fn cover_thumb(
     let cover_path = book_cover_path(&state, &feed_id)?;
     // The full cover is the source of truth (must exist, under the data dir).
     let cover = resolve_under_data_dir(&cover_path, &state.data_dir, &feed_id)?;
-    let thumb = cover
-        .parent()
-        .map(cover_thumb_path)
-        .ok_or(AppError::NotFound)?;
 
-    match ensure_thumb(&state, &cover, &thumb).await {
-        Ok(()) => serve_image(&thumb, &headers).await,
-        // Generation failed — serve the full cover so a book with art never 404s.
-        Err(_) => serve_image(&cover, &headers).await,
-    }
-}
-
-/// Ensure the cover thumbnail at `thumb` exists, generating it from `cover` when
-/// missing. Freshness is handled by explicit invalidation, not mtime: the scanner
-/// deletes the cached thumbnail whenever it re-extracts a cover, so an existing
-/// thumb is always current and a changed cover regenerates here on the next view —
-/// no re-ingest, no persisted thumbnail at scan time, and no dependence on
-/// filesystem timestamp resolution. Single-flighted per path like [`ensure_cached`]
-/// so concurrent first-requests run ffmpeg once; the blocking work runs off the
-/// async runtime.
-async fn ensure_thumb(state: &AppState, cover: &FsPath, thumb: &FsPath) -> Result<(), AppError> {
-    // Fast path: already cached.
-    if thumb.exists() {
-        return Ok(());
-    }
-
-    let lock = {
-        let mut map = state.inflight.lock().map_err(AppError::internal)?;
-        map.entry(thumb.to_path_buf())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
-    };
-    let _guard = lock.lock().await;
-
-    let outcome = async {
-        // A concurrent request may have produced it while we waited on the lock.
-        if thumb.exists() {
-            return Ok(());
+    // Prefer the scanner-generated thumbnail sitting next to the cover; fall back to
+    // the full cover if it hasn't been generated yet (the reconcile backfills a
+    // missing one) or generation failed — so a book with art never 404s. Serving is
+    // read-only: generation lives in the scanner (single-threaded, atomic), which is
+    // what keeps a thumbnail consistent with its cover with no cross-thread race.
+    if let Some(dir) = cover.parent() {
+        let thumb = cover_thumb_path(dir);
+        if let Ok(canonical) =
+            resolve_under_data_dir(&thumb.to_string_lossy(), &state.data_dir, &feed_id)
+        {
+            return serve_image(&canonical, &headers).await;
         }
-        let cover = cover.to_path_buf();
-        let out_dir = cover
-            .parent()
-            .map(|p| p.to_path_buf())
-            .ok_or(AppError::NotFound)?;
-        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-            extract_cover_thumb(&cover, &out_dir).map_err(std::io::Error::other)?;
-            Ok(())
-        })
-        .await
-        .map_err(AppError::internal)?
-        .map_err(AppError::internal)?;
-        Ok(())
     }
-    .await;
-
-    // Drop the single-flight entry (see [`ensure_cached`] for why this is race-free).
-    if let Ok(mut map) = state.inflight.lock() {
-        map.remove(thumb);
-    }
-    outcome
+    serve_image(&cover, &headers).await
 }
 
 /// The book's stored (full) cover path, or `NotFound` when the book/cover is absent.
