@@ -236,7 +236,7 @@ Podspine has two kinds of routes, and they want different exposure:
 
 | Surface | Routes | Keyed by | Expose to the internet? |
 |---|---|---|---|
-| **Capability** | `GET /feed/{id}.xml`, `/audio/{id}/{n}`, `/cover/{id}`, `/cover/{id}/thumb`, `/subscribe/{id}`, `/healthz` | a random, unguessable per-book `feed_id` | **Yes** — a guessed id just 404s, and feeds carry `itunes:block` + `X-Robots-Tag: noindex` so they aren't listed or crawled. (The proxy snippets below deliberately don't publish `/subscribe` — it's used from the LAN book page.) |
+| **Capability** | `GET /feed/{id}.xml`, `/audio/{id}/{n}`, `/cover/{id}`, `/cover/{id}/thumb`, `/subscribe/{id}`, `/healthz` | a random, unguessable per-book `feed_id` | **Yes** — a guessed id just 404s, and feeds carry `itunes:block` + `X-Robots-Tag: noindex` so they aren't listed or crawled. `/subscribe` must be public in a split deployment: the QR on the (LAN-only) book page points your phone at `base_url/subscribe/{feed_id}`, and it exposes only that one book's links |
 | **Browse UI** | `GET /`, `/book/{slug}`, `POST /book/{slug}/regenerate`, `POST /theme/{mode}` | the human `slug` | **No** — `GET /` lists every book, handing out the "unguessable" URLs. Keep it on the LAN or behind proxy-auth |
 
 This is what lets you subscribe to a book and stream it **on the road without a VPN**:
@@ -361,15 +361,15 @@ the browse UI private. Two hard requirements:
 The configs below publish `/feed`, `/audio`, `/cover`, `/healthz` and refuse the
 browse UI (`/`, `/book/*`) — you use the UI over the LAN. (Prefer one authenticated
 hostname instead? Drop the `@ui`/`location /` blocks and put `basicauth`/`auth_basic`
-on the whole server — just never require auth on `/feed`,`/audio`,`/cover`, since
-podcast apps can't log in.)
+on the whole server — just never require auth on `/feed`,`/audio`,`/cover`,
+`/subscribe`, since podcast apps (and a phone that just scanned a QR) can't log in.)
 
 **Caddy** (Range passes through automatically):
 
 ```caddy
 podspine.example.com {
     # Public: the capability surface only (unguessable per-book URLs).
-    @capability path /feed/* /audio/* /cover/* /healthz
+    @capability path /feed/* /audio/* /cover/* /subscribe/* /healthz
     handle @capability {
         reverse_proxy 127.0.0.1:8080
     }
@@ -386,8 +386,8 @@ podspine.example.com {
 server {
     server_name podspine.example.com;
 
-    # Public capability surface: feeds, cover, and audio (with Range).
-    location ~ ^/(feed|audio|cover)/ {
+    # Public capability surface: feeds, cover, audio (with Range), and subscribe.
+    location ~ ^/(feed|audio|cover|subscribe)/ {
         proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host $host;
         proxy_set_header Range $http_range;               # forward seek requests
