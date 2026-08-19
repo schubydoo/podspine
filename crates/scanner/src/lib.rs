@@ -433,11 +433,16 @@ pub fn scan_book_as(
         let ext = cover_ext(probed.cover_codec.as_deref());
         match extract_cover(input, &book_out, ext) {
             Ok(path) => {
-                // Generate the browse-UI thumbnail from the freshly-extracted cover,
+                // Regenerate the browse-UI thumbnail from the freshly-extracted cover,
                 // in this same (single) scanner thread and atomically, so it always
                 // matches the cover — the http layer only ever *serves* it, which is
                 // what keeps thumbnail and cover consistent with no cross-thread race.
-                // Non-fatal: the serve layer falls back to the full cover if missing.
+                //
+                // Delete the previous thumbnail FIRST: if regeneration then fails, the
+                // book is left with NO thumbnail (the serve layer falls back to the
+                // current full cover, and the next reconcile backfills it) rather than
+                // a stale one derived from the old cover.
+                let _ = std::fs::remove_file(cover_thumb_path(&book_out));
                 if let Err(err) = extract_cover_thumb(&path, &book_out) {
                     tracing::warn!(error = %err, id = %id, "cover thumbnail failed; browse UI will use the full cover");
                 }
@@ -4454,6 +4459,23 @@ mod tests {
         std::fs::remove_file(&thumb).unwrap();
         scan().unwrap();
         assert!(thumb.exists(), "reconcile backfills a missing thumbnail");
+
+        // A re-ingest (mtime changed) deletes the old thumbnail and regenerates it,
+        // so nothing stale from the previous cover survives.
+        let before = std::fs::metadata(&thumb).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // A clearly-different source mtime forces a re-ingest (not the early-return).
+        std::fs::File::options()
+            .write(true)
+            .open(&input)
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+            )
+            .unwrap();
+        scan().unwrap();
+        let after = std::fs::metadata(&thumb).unwrap().modified().unwrap();
+        assert!(after > before, "a re-ingest regenerates the thumbnail");
     }
 
     #[test]
