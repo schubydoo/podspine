@@ -155,6 +155,55 @@ fn state_construction_fails_when_a_root_is_missing() {
     }
 }
 
+/// Final defense-in-depth on the audio route: every resolver check passes (a
+/// chaptered episode, a real file under `data/books/<id>`), but the chapter file
+/// itself is a symlink pointing outside BOTH trusted roots. The last
+/// canonicalize-and-check must catch it and 404 — this is the deliberately
+/// hand-rolled two-root check, and this is its only test.
+#[cfg(unix)]
+#[tokio::test]
+async fn audio_file_symlinked_outside_both_roots_is_a_404() {
+    let base = scratch("http-two-root-escape");
+    let data = base.join("data");
+    let library = base.join("library");
+    std::fs::create_dir_all(&library).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    let outside = base.join("outside.m4a");
+    std::fs::write(&outside, b"not really audio").unwrap();
+
+    let index = Index::open_in_memory().unwrap();
+    index.upsert_book(&book_row("b1", "CapId1")).unwrap();
+    let book_dir = data.join("books").join("b1");
+    std::fs::create_dir_all(&book_dir).unwrap();
+    let target = book_dir.join("001.m4a");
+    std::os::unix::fs::symlink(&outside, &target).unwrap();
+    let mut ep = episode_row("b1", 0, 16);
+    ep.file_path = target.to_string_lossy().into_owned();
+    index.upsert_episode(&ep).unwrap();
+
+    let resp = router(test_state(index, &data, &library))
+        .oneshot(Request::get("/audio/CapId1/1").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert!(outside.exists(), "the outside file is never touched");
+}
+
+/// Invalid feed-id characters 404 at the allow-list, before any DB or
+/// filesystem work — on the thumb route too (the cover route's sibling).
+#[tokio::test]
+async fn cover_thumb_rejects_an_invalid_feed_id() {
+    let resp = router(empty_state())
+        .oneshot(
+            Request::get("/cover/bad!id/thumb")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
 /// Synthesize a two-chapter FLAC (chapters via a `.cue` sidecar — embedded FLAC
 /// chapters carry no titles). `None` when this ffmpeg has no FLAC encoder.
 fn synth_flac_with_cue(dir: &Path) -> Option<PathBuf> {
@@ -1435,6 +1484,7 @@ async fn scanning_state_holds_the_browse_ui_and_503s_the_capability_routes() {
         "/feed/Xk9mQ2vP7nR4tB1cY6wZ8a.xml",
         "/audio/Xk9mQ2vP7nR4tB1cY6wZ8a/1",
         "/cover/Xk9mQ2vP7nR4tB1cY6wZ8a",
+        "/cover/Xk9mQ2vP7nR4tB1cY6wZ8a/thumb",
     ] {
         let resp = router(state.clone())
             .oneshot(Request::get(path).body(Body::empty()).unwrap())

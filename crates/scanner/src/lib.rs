@@ -4059,11 +4059,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A database failure mid-scan is survived and logged, never a panic —
+    /// A database failure mid-reconcile is survived and logged, never a panic —
     /// fault-inject by dropping the `book` table out from under a live [`Index`]
-    /// via a second connection. One scan then exercises every skipped-with-a-warn
-    /// arm: the duplicate-row collapse, the id-reuse map, and the disabled-book
-    /// prune (the disabled path never probes, so no ffmpeg is needed).
+    /// via a second connection. One reconcile then exercises every
+    /// skipped-with-a-warn arm: the duplicate-row collapse, the id-reuse map, the
+    /// disabled-book prune (the disabled path never probes, so no ffmpeg is
+    /// needed), the orphan prune, and the metrics book count.
     #[test]
     fn scan_survives_a_broken_index() {
         let root = scratch("scan-broken-index");
@@ -4078,11 +4079,110 @@ mod tests {
             .execute("DROP TABLE book", [])
             .unwrap();
 
-        let summary = scan_library(&root, &data, &index, ScanOptions::default());
+        let summary = reconcile(&root, &data, &index, ScanOptions::default());
         assert_eq!(
             summary.skipped, 1,
             "disabled book is still skipped when every index call fails"
         );
+        assert_eq!(summary.pruned, 0, "failed orphan prune degrades to zero");
+    }
+
+    /// The duplicate-row collapse must survive a DELETE that fails while reads
+    /// still work — fault-inject with a second connection holding a write lock
+    /// (WAL keeps reads serving; the delete gets SQLITE_BUSY immediately).
+    #[test]
+    fn collapse_survives_a_failing_delete() {
+        let root = scratch("collapse-delete-fail");
+        let src = root.join("book.m4b");
+        std::fs::write(&src, b"").unwrap();
+        let canonical = src.canonicalize().unwrap().to_string_lossy().into_owned();
+
+        let db = root.join("test.db");
+        let index = Index::open(&db).unwrap();
+        for id in ["dup", "dup-2"] {
+            index
+                .upsert_book(&BookRow {
+                    id: id.into(),
+                    slug: id.into(),
+                    feed_id: podspine_index::capability::generate(),
+                    title: "Dup".into(),
+                    author: None,
+                    cover_path: None,
+                    source_path: canonical.clone(),
+                    source_mtime: 0,
+                    storage_mode: None,
+                    default_cover_url: None,
+                    force_embedded: false,
+                    transcode: None,
+                })
+                .unwrap();
+        }
+
+        let blocker = rusqlite::Connection::open(&db).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        collapse_duplicate_source_rows(&index, &root.join("data"));
+        drop(blocker);
+        assert_eq!(
+            index.list_books().unwrap().len(),
+            2,
+            "a failed delete leaves both rows (logged, not fatal)"
+        );
+    }
+
+    /// Symlinks that leave the library root, and dangling symlinks, are skipped
+    /// with a warning — never followed, never fatal.
+    #[cfg(unix)]
+    #[test]
+    fn walk_skips_escaping_and_dangling_symlinks() {
+        let base = scratch("walk-symlinks");
+        let library = base.join("library");
+        std::fs::create_dir_all(&library).unwrap();
+        let outside = base.join("outside.m4b");
+        std::fs::write(&outside, b"").unwrap();
+        std::os::unix::fs::symlink(&outside, library.join("escape.m4b")).unwrap();
+        std::os::unix::fs::symlink(base.join("nope.m4b"), library.join("dangling.m4b")).unwrap();
+
+        let index = Index::open_in_memory().unwrap();
+        let summary = scan_library(&library, &base.join("data"), &index, ScanOptions::default());
+        assert_eq!(summary.indexed, 0, "neither symlink is ingested");
+        assert!(index.list_books().unwrap().is_empty());
+    }
+
+    /// A DB that can't open must still fire the ready callback — otherwise the
+    /// server wedges on the "Scanning…" page forever (issue 159's failure mode).
+    #[test]
+    fn watch_loop_fires_ready_even_when_the_db_cannot_open() {
+        let root = scratch("watch-bad-db");
+        let db_as_dir = root.join("db-as-dir");
+        std::fs::create_dir_all(&db_as_dir).unwrap(); // a directory can't open as SQLite
+        let fired = std::cell::Cell::new(false);
+        let res = watch_loop(
+            &root,
+            &root.join("data"),
+            &db_as_dir,
+            ScanOptions::default(),
+            || fired.set(true),
+        );
+        assert!(res.is_err(), "the DB failure is surfaced");
+        assert!(fired.get(), "readiness flips even on DB failure");
+    }
+
+    /// An unwatchable library degrades to no-auto-refresh: the initial scan
+    /// still runs, ready still fires, and the loop exits cleanly.
+    #[test]
+    fn watch_loop_degrades_when_the_library_cannot_be_watched() {
+        let root = scratch("watch-no-library");
+        let missing = root.join("no-such-library");
+        let fired = std::cell::Cell::new(false);
+        let res = watch_loop(
+            &missing,
+            &root.join("data"),
+            &root.join("test.db"),
+            ScanOptions::default(),
+            || fired.set(true),
+        );
+        assert!(res.is_ok(), "watch failure is degradation, not an error");
+        assert!(fired.get(), "readiness flips without a watch");
     }
 
     #[test]

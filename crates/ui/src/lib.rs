@@ -669,6 +669,14 @@ mod tests {
             !dark.contains("aria-pressed=\"true\">Auto</button>"),
             "Auto not active in dark"
         );
+
+        // Light: an explicit data-theme="light" (the third attr arm).
+        let light = index_page(&[], Theme::Light).into_string();
+        assert!(light.contains("<html lang=\"en\" data-theme=\"light\">"));
+        assert!(
+            light.contains("aria-pressed=\"true\">Light</button>"),
+            "Light active"
+        );
     }
 
     #[test]

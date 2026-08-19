@@ -1236,6 +1236,59 @@ mod tests {
         assert_eq!(mime_for("/x/blob"), "audio/mp4");
     }
 
+    /// `evict` deletes files — pin its guard branches directly: a regenerable
+    /// book dir that vanished, a directory entry with a numeric stem, a
+    /// non-regenerable sibling, the under-cap early return, and the
+    /// stop-once-under-cap break.
+    #[test]
+    fn evict_edge_branches() {
+        let dir = scratch("http-evict-edges");
+        let books = dir.path().join("books");
+        let b1 = books.join("b1");
+        std::fs::create_dir_all(&b1).unwrap();
+        // Chapters: 001 backdated (the LRU victim), 002 fresh. A cover (skipped
+        // by stem) and a directory with a chapter-shaped name (skipped by kind).
+        let old = b1.join("001.m4a");
+        let newer = b1.join("002.m4a");
+        std::fs::write(&old, [0u8; 10]).unwrap();
+        std::fs::write(&newer, [0u8; 10]).unwrap();
+        std::fs::write(b1.join("cover.jpg"), [0u8; 64]).unwrap();
+        std::fs::create_dir(b1.join("003.m4a")).unwrap();
+        let past = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+
+        // Non-regenerable sibling: never a candidate.
+        let b2 = books.join("b2");
+        std::fs::create_dir_all(&b2).unwrap();
+        std::fs::write(b2.join("001.m4a"), [0u8; 10]).unwrap();
+
+        // Regenerable set: b1, plus a dir that no longer exists on disk.
+        let regenerable: HashSet<PathBuf> = [b1.clone(), books.join("gone")].into();
+
+        // Under cap: nothing deleted.
+        evict(&books, Some(1024), None, FsPath::new("/keep"), &regenerable);
+        assert!(old.exists() && newer.exists(), "under cap deletes nothing");
+
+        // Cap of one file: delete oldest-first, then stop once under cap.
+        evict(&books, Some(10), None, FsPath::new("/keep"), &regenerable);
+        assert!(!old.exists(), "oldest chapter evicted first");
+        assert!(newer.exists(), "eviction stops once under cap");
+        assert!(b1.join("cover.jpg").exists(), "covers are never candidates");
+        assert!(
+            b1.join("003.m4a").is_dir(),
+            "directories are never candidates"
+        );
+        assert!(
+            b2.join("001.m4a").exists(),
+            "non-regenerable book untouched"
+        );
+    }
+
     /// Eviction is best-effort and must never panic or fail a request — fault-
     /// inject both abandon paths: a database failure (the `book` table dropped
     /// out from under a live [`Index`] by a second connection) and a poisoned
