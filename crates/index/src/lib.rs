@@ -482,6 +482,7 @@ fn episode_from_row(row: &Row) -> rusqlite::Result<EpisodeRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use podspine_test_support::scratch;
 
     fn book(id: &str, slug: &str, title: &str) -> BookRow {
         BookRow {
@@ -592,9 +593,7 @@ mod tests {
 
     #[test]
     fn open_persists_to_a_file_across_reopen() {
-        let dir = std::env::temp_dir().join("podspine-index-file");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("index-file");
         let db = dir.join("podspine.db");
 
         let idx = Index::open(&db).unwrap();
@@ -604,15 +603,12 @@ mod tests {
         // Reopen the same file: the row (and schema) survived.
         let reopened = Index::open(&db).unwrap();
         assert_eq!(reopened.get_book("b1").unwrap().unwrap().title, "A Book");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn open_migrates_a_pre_start_sec_database() {
         // Simulate a database created before `episode.start_sec` existed.
-        let dir = std::env::temp_dir().join("podspine-index-migrate");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("index-migrate");
         let db = dir.join("old.db");
         {
             let conn = Connection::open(&db).unwrap();
@@ -681,8 +677,6 @@ mod tests {
         // Idempotent: reopening an already-migrated DB is a no-op.
         drop(idx);
         assert!(Index::open(&db).is_ok());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -694,9 +688,7 @@ mod tests {
         // established feed. rowid preserves insertion order, so `book-2` keeps the
         // earlier `created_at` and `book_source_identities` returns it first — which
         // is the row the heal keeps.
-        let dir = std::env::temp_dir().join("podspine-index-createdat-order");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("index-createdat-order");
         let db = dir.join("old.db");
         {
             let conn = Connection::open(&db).unwrap();
@@ -732,7 +724,6 @@ mod tests {
             vec!["book-2", "book"],
             "the established (earlier-inserted) row must sort first, not the base id"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- capability feed ids (v1.5) ----

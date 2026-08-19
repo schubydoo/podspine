@@ -11,3 +11,6 @@ publish = false
 
 [dependencies]
 podspine-prober = { path = "../prober" }
+
+[dev-dependencies]
+podspine-test-support = { path = "../test-support" }

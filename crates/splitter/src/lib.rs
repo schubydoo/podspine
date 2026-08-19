@@ -962,34 +962,7 @@ fn fmt_secs(v: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Skip the rest of a test that this machine cannot run — no ffmpeg, or no
-    /// encoder for the format the test needs.
-    ///
-    /// The `eprintln!` and the `return` live here, once, instead of at every call
-    /// site. Wherever ffmpeg IS installed — CI, most dev machines — they cannot
-    /// execute, and 62 copies of them dominated the uncovered-line count (35 of the
-    /// 56 lines in PR 152's diff).
-    ///
-    /// Measured, not assumed: llvm-cov attributes a macro body to each **expansion**,
-    /// not to the definition, so a call site still reports one unreachable line —
-    /// one instead of two, which took 63 lines off the report (scanner 158 → 105
-    /// misses, splitter 45 → 35). One line per skip is the floor for deciding at
-    /// runtime; something has to stand for "this didn't run".
-    macro_rules! skip {
-        ($($why:tt)*) => {{
-            eprintln!("skipping: {}", format_args!($($why)*));
-            return;
-        }};
-    }
-
-    fn have_ffmpeg() -> bool {
-        Command::new("ffmpeg")
-            .arg("-version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    }
+    use podspine_test_support::{scratch, skip_unless_ffmpeg, synth_cover_png, synth_sine};
 
     fn args_as_strings(start: f64, end: f64) -> Vec<String> {
         strings(&build_encode_args(
@@ -1204,31 +1177,10 @@ mod tests {
 
     #[test]
     fn cover_thumb_downscales_a_large_cover() {
-        if !have_ffmpeg() {
-            skip!("ffmpeg not available");
-        }
-        let dir = std::env::temp_dir().join("podspine-cover-thumb");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        skip_unless_ffmpeg!();
+        let dir = scratch("cover-thumb");
         // A large cover to downscale.
-        let cover = dir.join("cover.png");
-        let ok = Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-loglevel",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                "color=c=blue:s=800x800:d=0.1",
-                "-frames:v",
-                "1",
-            ])
-            .arg(&cover)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        assert!(ok, "ffmpeg cover synth failed");
+        let cover = synth_cover_png(&dir, 800);
 
         let thumb = extract_cover_thumb(&cover, &dir).expect("thumbnail");
         assert_eq!(thumb, dir.join("cover_thumb.jpg"));
@@ -1256,44 +1208,21 @@ mod tests {
             width <= 400 && width > 0,
             "thumbnail width {width} must be <= 400"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn cover_extraction_reports_publish_when_a_directory_blocks_the_target() {
-        if !have_ffmpeg() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         // ffmpeg produces the `.part` fine, but a directory sitting at the final path
         // blocks the atomic rename → CoverError::Publish (the image is never
         // half-published; the blocker is left as-is).
-        let dir = std::env::temp_dir().join("podspine-cover-publish");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let cover = dir.join("cover.png");
-        let ok = Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-loglevel",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                "color=c=red:s=64x64:d=0.1",
-                "-frames:v",
-                "1",
-            ])
-            .arg(&cover)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        assert!(ok, "ffmpeg cover synth failed");
+        let dir = scratch("cover-publish");
+        let cover = synth_cover_png(&dir, 64);
 
         std::fs::create_dir_all(cover_thumb_path(&dir)).unwrap(); // a dir at the target
         let err = extract_cover_thumb(&cover, &dir).expect_err("blocked rename must fail");
         assert!(matches!(err, CoverError::Publish { .. }), "{err:?}");
         assert!(cover_thumb_path(&dir).is_dir(), "the blocker is left as-is");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1316,16 +1245,7 @@ mod tests {
 
     #[test]
     fn hung_ffmpeg_is_killed_by_the_timeout() {
-        fn ffmpeg_available() -> bool {
-            Command::new("ffmpeg")
-                .arg("-version")
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-        }
-        if !ffmpeg_available() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         // A real-time, unbounded encode that never terminates on its own; the
         // per-child timeout must kill it. Uses a deliberately tiny timeout via a
         // direct argv, bypassing the 5-min production constant.
@@ -1383,14 +1303,10 @@ mod tests {
 
     #[test]
     fn split_maps_a_nonzero_ffmpeg_exit_to_a_split_error() {
-        if !have_ffmpeg() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         // A positive-duration cut on a non-audio input: ffmpeg fails to read it
         // and exits non-zero, exercising run_ffmpeg's failure path + the mapping.
-        let dir = std::env::temp_dir().join("podspine-split-fail");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("split-fail");
         let bad = dir.join("notaudio.m4a");
         std::fs::write(&bad, b"definitely not an audio stream").unwrap();
         let ch = ChapterCut {
@@ -1401,38 +1317,16 @@ mod tests {
         let err = split_book(&bad, &dir.join("out"), std::slice::from_ref(&ch), "m4a")
             .expect_err("bad input must fail");
         assert!(matches!(err, SplitError::Ffmpeg { idx: 0, .. }), "{err:?}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn parallel_split_returns_every_chapter_in_index_order() {
-        if !have_ffmpeg() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         // Many chapters (> the worker pool on most CPUs) so the parallel path runs
         // and we can prove the results come back in chapter order regardless of
         // which worker finished first.
-        let dir = std::env::temp_dir().join("podspine-parallel-split");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let input = dir.join("book.m4a");
-        let ok = Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-loglevel",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                "sine=frequency=440:duration=24",
-                "-c:a",
-                "aac",
-            ])
-            .arg(&input)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        assert!(ok, "ffmpeg synth failed");
+        let dir = scratch("parallel-split");
+        let input = synth_sine(&dir, "book.m4a", 24.0);
 
         let cuts: Vec<ChapterCut> = (0..12)
             .map(|i| ChapterCut {
@@ -1451,39 +1345,18 @@ mod tests {
             assert_eq!(ep.path, out.join(format!("{:03}.m4a", i + 1)));
             assert!(ep.path.exists() && ep.byte_length > 0);
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_failing_chapter_publishes_none_of_a_multi_chapter_split() {
-        if !have_ffmpeg() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         // All-or-nothing: if one chapter of a re-ingest fails, the chapters that DID
         // succeed must not be published over the already-served files — otherwise the
         // index's old enclosure length would point at new bytes.
-        let dir = std::env::temp_dir().join("podspine-atomic-book");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = scratch("atomic-book");
         let out = dir.join("out");
         std::fs::create_dir_all(&out).unwrap();
-        let input = dir.join("book.m4a");
-        let ok = Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-loglevel",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                "sine=frequency=440:duration=10",
-                "-c:a",
-                "aac",
-            ])
-            .arg(&input)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        assert!(ok, "ffmpeg synth failed");
+        let input = synth_sine(&dir, "book.m4a", 10.0);
 
         // Stand-ins for previously-published episodes.
         let published: Vec<PathBuf> = (1..=3).map(|n| out.join(format!("{n:03}.m4a"))).collect();
@@ -1539,39 +1412,18 @@ mod tests {
             leftovers.is_empty(),
             "produced parts must be cleaned up: {leftovers:?}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_blocked_publish_target_publishes_none_of_a_multi_chapter_split() {
-        if !have_ffmpeg() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         // Both chapters produce fine, but a directory sits where chapter 2's episode
         // must land, so its publish (rename) can't happen. The pre-check must catch
         // that before publishing chapter 1 — nothing half-published, no parts left.
-        let dir = std::env::temp_dir().join("podspine-atomic-block");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = scratch("atomic-block");
         let out = dir.join("out");
         std::fs::create_dir_all(&out).unwrap();
-        let input = dir.join("book.m4a");
-        let ok = Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-loglevel",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                "sine=frequency=440:duration=10",
-                "-c:a",
-                "aac",
-            ])
-            .arg(&input)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        assert!(ok, "ffmpeg synth failed");
+        let input = synth_sine(&dir, "book.m4a", 10.0);
 
         // A directory blocks chapter 2's target; chapter 1 has an old published file.
         std::fs::create_dir_all(out.join("002.m4a")).unwrap();
@@ -1608,7 +1460,6 @@ mod tests {
             leftovers.is_empty(),
             "parts must be cleaned up: {leftovers:?}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1636,9 +1487,7 @@ mod tests {
     fn an_unusable_output_directory_is_an_error_not_a_panic() {
         // No ffmpeg needed: `create_dir_all` fails before anything is spawned
         // (the "directory" is a regular file's child).
-        let dir = std::env::temp_dir().join("podspine-transcode-baddir");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("transcode-baddir");
         let blocker = dir.join("not-a-directory");
         std::fs::write(&blocker, b"x").unwrap();
 
@@ -1652,38 +1501,17 @@ mod tests {
         )
         .expect_err("an unusable out_dir must fail");
         assert!(matches!(err, SplitError::CreateDir { .. }), "{err:?}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_blocked_rename_is_reported_and_never_leaves_a_half_published_file() {
-        if !have_ffmpeg() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         // A directory sitting where the episode must land blocks the atomic
         // rename. The encode itself succeeds, so this exercises the publish step.
-        let dir = std::env::temp_dir().join("podspine-blocked-rename");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = scratch("blocked-rename");
         let out = dir.join("out");
         std::fs::create_dir_all(out.join("001.m4a")).unwrap();
-        let input = dir.join("in.m4a");
-        let ok = Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-loglevel",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                "sine=frequency=440:duration=3",
-                "-c:a",
-                "aac",
-            ])
-            .arg(&input)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        assert!(ok, "ffmpeg synth failed");
+        let input = synth_sine(&dir, "in.m4a", 3.0);
 
         let err = transcode_whole(&input, &out, 0, "m4a", 3.0, Encoding::Aac)
             .expect_err("the blocked rename must surface");
@@ -1692,19 +1520,15 @@ mod tests {
             out.join("001.m4a").is_dir(),
             "the blocker is left exactly as it was"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_failed_encode_leaves_the_published_episode_untouched() {
-        if !have_ffmpeg() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         // The re-ingest hazard: an episode is already published and being served
         // when a new encode of it fails. The old bytes — and the byte_length the
         // feed advertises for them — must survive, and no temporary may be left.
-        let dir = std::env::temp_dir().join("podspine-atomic-fail");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = scratch("atomic-fail");
         let out = dir.join("out");
         std::fs::create_dir_all(&out).unwrap();
         let published = out.join("001.m4a");
@@ -1726,36 +1550,15 @@ mod tests {
             !part_path(&published).exists(),
             "a failed encode must clean up its temporary"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_finished_encode_only_appears_at_the_final_path() {
-        if !have_ffmpeg() {
-            skip!("ffmpeg not available");
-        }
-        let dir = std::env::temp_dir().join("podspine-atomic-ok");
-        let _ = std::fs::remove_dir_all(&dir);
+        skip_unless_ffmpeg!();
+        let dir = scratch("atomic-ok");
         let out = dir.join("out");
         std::fs::create_dir_all(&out).unwrap();
-        let input = dir.join("in.m4a");
-        let ok = Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-loglevel",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                "sine=frequency=440:duration=4",
-                "-c:a",
-                "aac",
-            ])
-            .arg(&input)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        assert!(ok, "ffmpeg synth failed");
+        let input = synth_sine(&dir, "in.m4a", 4.0);
 
         let ep = transcode_whole(&input, &out, 0, "m4a", 4.0, Encoding::Aac).unwrap();
         assert_eq!(ep.path, out.join("001.m4a"));
@@ -1768,18 +1571,14 @@ mod tests {
             !part_path(&ep.path).exists(),
             "the temporary is renamed away, not left behind"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn split_chapter_maps_a_nonzero_ffmpeg_exit_to_an_error() {
-        if !have_ffmpeg() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         // `split_chapter` (the saver/regen entry point) on a non-audio input:
         // ffmpeg exits non-zero → the error arm, carrying the chapter index.
-        let dir = std::env::temp_dir().join("podspine-splitchap-fail");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = scratch("splitchap-fail");
         let out = dir.join("out");
         std::fs::create_dir_all(&out).unwrap();
         let bad = dir.join("notaudio.m4a");
@@ -1791,39 +1590,15 @@ mod tests {
         };
         let err = split_chapter(&bad, &out, &ch, "m4a").expect_err("bad input must fail");
         assert!(matches!(err, SplitError::Ffmpeg { idx: 2, .. }), "{err:?}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn remux_faststart_produces_a_deterministic_faststart_file() {
-        if !have_ffmpeg() {
-            skip!("ffmpeg not available");
-        }
-        let dir = std::env::temp_dir().join("podspine-remux-ft");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        skip_unless_ffmpeg!();
+        let dir = scratch("remux-ft");
         // ffmpeg's mp4 muxer writes `moov` at the END unless +faststart is asked,
         // so a plain encode gives us a non-faststart source.
-        let src = dir.join("src.m4a");
-        let ok = Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-loglevel",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                "sine=frequency=300:duration=3",
-                "-c:a",
-                "aac",
-            ])
-            .arg(&src)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !ok {
-            skip!("no aac encoder");
-        }
+        let src = synth_sine(&dir, "src.m4a", 3.0);
 
         let out = dir.join("out");
         std::fs::create_dir_all(&out).unwrap();
@@ -1853,25 +1628,19 @@ mod tests {
             std::fs::read(&ep2.path).unwrap(),
             "remux is byte-identical run-to-run"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn remux_maps_a_nonzero_ffmpeg_exit_to_a_split_error() {
-        if !have_ffmpeg() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         // A non-audio input makes ffmpeg exit non-zero → the remux error arm.
-        let dir = std::env::temp_dir().join("podspine-remux-fail");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = scratch("remux-fail");
         let out = dir.join("out");
         std::fs::create_dir_all(&out).unwrap();
         let bad = dir.join("notaudio.m4a");
         std::fs::write(&bad, b"definitely not an audio stream").unwrap();
         let err = remux_faststart(&bad, &out, 0, "m4a", 3.0).expect_err("bad input must fail");
         assert!(matches!(err, SplitError::Ffmpeg { idx: 0, .. }), "{err:?}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1904,31 +1673,22 @@ mod tests {
 
     #[test]
     fn extract_cover_maps_a_nonzero_ffmpeg_exit_to_a_cover_error() {
-        if !have_ffmpeg() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         // No video stream to map -> ffmpeg exits non-zero -> CoverError::Ffmpeg.
-        let dir = std::env::temp_dir().join("podspine-cover-fail");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("cover-fail");
         let bad = dir.join("notaudio.m4a");
         std::fs::write(&bad, b"no video here").unwrap();
         let err =
             extract_cover(&bad, &dir.join("out"), "jpg").expect_err("no cover stream must fail");
         assert!(matches!(err, CoverError::Ffmpeg { .. }), "{err:?}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn extract_cover_thumb_maps_a_bad_input_to_a_cover_error() {
-        if !have_ffmpeg() {
-            skip!("ffmpeg not available");
-        }
+        skip_unless_ffmpeg!();
         // A non-image input -> ffmpeg can't decode it -> CoverError (Ffmpeg or the
         // empty-output guard), never a panic.
-        let dir = std::env::temp_dir().join("podspine-thumb-fail");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("thumb-fail");
         let bad = dir.join("notanimage.png");
         std::fs::write(&bad, b"definitely not an image").unwrap();
         let err = extract_cover_thumb(&bad, &dir.join("out")).expect_err("bad input must fail");
@@ -1939,31 +1699,25 @@ mod tests {
             ),
             "{err:?}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn extract_cover_reports_create_dir_when_out_dir_is_a_file() {
         // out_dir is an existing regular file -> create_dir_all fails BEFORE any
         // ffmpeg spawn -> CoverError::CreateDir. ffmpeg-free, so it runs everywhere.
-        let dir = std::env::temp_dir().join("podspine-cover-createdir");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("cover-createdir");
         let file_as_dir = dir.join("iam-a-file");
         std::fs::write(&file_as_dir, b"x").unwrap();
         let err = extract_cover(Path::new("irrelevant.m4b"), &file_as_dir, "jpg")
             .expect_err("out_dir being a file must fail");
         assert!(matches!(err, CoverError::CreateDir { .. }), "{err:?}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn split_book_reports_create_dir_when_out_dir_is_a_file() {
         // Same guard on the chaptered path: out_dir is a file -> SplitError::CreateDir
         // before any chapter is cut (ffmpeg-free).
-        let dir = std::env::temp_dir().join("podspine-split-createdir");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("split-createdir");
         let file_as_dir = dir.join("iam-a-file");
         std::fs::write(&file_as_dir, b"x").unwrap();
         let ch = ChapterCut {
@@ -1974,6 +1728,5 @@ mod tests {
         let err = split_book(Path::new("irrelevant.m4b"), &file_as_dir, &[ch], "m4a")
             .expect_err("out_dir being a file must fail");
         assert!(matches!(err, SplitError::CreateDir { .. }), "{err:?}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

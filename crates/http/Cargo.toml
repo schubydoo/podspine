@@ -26,6 +26,7 @@ blake3 = { workspace = true }
 
 [dev-dependencies]
 podspine-scanner = { path = "../scanner" }
+podspine-test-support = { path = "../test-support" }
 axum = { workspace = true }
 tokio = { workspace = true }
 tower = { version = "=0.5.3", features = ["util"] }

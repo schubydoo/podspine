@@ -154,30 +154,12 @@ fn parse_rfc2822(s: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FeedBook, FeedEpisode, build_channel};
+    use crate::{FeedBook, build_channel};
     use rss::Channel;
 
+    /// [`crate::sample_book`] with the fixed mtime these tests share.
     fn sample(n: usize) -> FeedBook {
-        let episodes = (0..n)
-            .map(|idx| FeedEpisode {
-                idx,
-                title: format!("Chapter {}", idx + 1),
-                audio_url: format!("http://host/audio/book/{:03}.m4a", idx + 1),
-                byte_length: 1000 + idx as u64,
-                duration_sec: 61.0 * (idx as f64 + 1.0),
-                mime_type: "audio/mp4".to_string(),
-            })
-            .collect();
-        FeedBook {
-            id: "book-1".to_string(),
-            title: "A Test Book".to_string(),
-            author: Some("An Author".to_string()),
-            description: Some("A description".to_string()),
-            cover_url: Some("http://host/cover.jpg".to_string()),
-            source_mtime: 1_700_000_000,
-            self_url: "http://host/feed/book.xml".to_string(),
-            episodes,
-        }
+        crate::sample_book(n, 1_700_000_000)
     }
 
     fn has(errors: &[SelfCheckError], want: impl Fn(&SelfCheckError) -> bool) -> bool {

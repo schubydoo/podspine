@@ -1222,6 +1222,7 @@ name = "podspine-chapters"
 version = "1.7.0"
 dependencies = [
  "podspine-prober",
+ "podspine-test-support",
 ]
 
 [[package]]
@@ -1229,6 +1230,7 @@ name = "podspine-config"
 version = "1.7.0"
 dependencies = [
  "clap",
+ "podspine-test-support",
  "serde",
  "thiserror",
  "toml",
@@ -1258,6 +1260,7 @@ dependencies = [
  "podspine-metrics",
  "podspine-scanner",
  "podspine-splitter",
+ "podspine-test-support",
  "podspine-ui",
  "tokio",
  "tower",
@@ -1271,6 +1274,7 @@ version = "1.7.0"
 dependencies = [
  "base64 0.23.1",
  "getrandom 0.4.3",
+ "podspine-test-support",
  "rusqlite",
  "thiserror",
 ]
@@ -1308,6 +1312,7 @@ dependencies = [
  "podspine-metrics",
  "podspine-prober",
  "podspine-splitter",
+ "podspine-test-support",
  "thiserror",
  "tracing",
 ]
@@ -1318,9 +1323,14 @@ version = "1.7.0"
 dependencies = [
  "podspine-metrics",
  "podspine-prober",
+ "podspine-test-support",
  "thiserror",
  "wait-timeout",
 ]
+
+[[package]]
+name = "podspine-test-support"
+version = "1.7.0"
 
 [[package]]
 name = "podspine-ui"

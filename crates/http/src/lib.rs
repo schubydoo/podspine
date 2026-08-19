@@ -1203,6 +1203,7 @@ impl IntoResponse for AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use podspine_test_support::scratch;
 
     #[test]
     fn mime_by_extension() {
@@ -1398,8 +1399,7 @@ mod tests {
 
     #[test]
     fn evict_enforces_size_cap_and_skips_non_chapter_files() {
-        let dir = std::env::temp_dir().join("podspine-evict-size");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = scratch("evict-size");
         let books = dir.join("books");
         let bk = books.join("b1");
         for n in 1..=3 {
@@ -1417,13 +1417,11 @@ mod tests {
             "non-chapter files are untouched"
         );
         assert!(numeric_files(&bk) <= 1, "size cap evicted older chapters");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn evict_drops_ttl_expired_chapters_except_keep() {
-        let dir = std::env::temp_dir().join("podspine-evict-ttl");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = scratch("evict-ttl");
         let books = dir.join("books");
         let bk = books.join("b1");
         touch(&bk.join("001.m4a"), 100);
@@ -1442,13 +1440,11 @@ mod tests {
 
         assert!(!bk.join("001.m4a").exists(), "TTL-expired chapter evicted");
         assert!(keep.exists(), "keep is never evicted, even past TTL");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn evict_is_a_noop_without_a_cap_or_ttl() {
-        let dir = std::env::temp_dir().join("podspine-evict-noop");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = scratch("evict-noop");
         let books = dir.join("books");
         let bk = books.join("b1");
         touch(&bk.join("001.m4a"), 100);
@@ -1458,7 +1454,6 @@ mod tests {
 
         assert!(keep.exists());
         assert_eq!(numeric_files(&bk), 1, "nothing evicted when unbounded");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1479,8 +1474,7 @@ mod tests {
         // (a directory source — e.g. an MP3 folder, or a legacy pre-6.2 copy).
         // Only the regenerable one may be evicted; the non-regenerable files must
         // survive even a tiny cap (Greptile P1) — nothing would rebuild them.
-        let dir = std::env::temp_dir().join("podspine-evict-mp3safe");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = scratch("evict-mp3safe");
         let books = dir.join("books");
         let split = books.join("splitbook"); // regenerable
         touch(&split.join("001.m4a"), 100);
@@ -1502,7 +1496,6 @@ mod tests {
             !split.join("001.m4a").exists(),
             "regenerable chapters are still evicted under the cap"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

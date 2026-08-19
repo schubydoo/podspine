@@ -187,32 +187,35 @@ pub fn render_checked(book: &FeedBook) -> Result<String, Vec<selfcheck::SelfChec
     Ok(channel.to_string())
 }
 
+/// An n-episode `FeedBook` fixture, shared by this file's tests and
+/// `selfcheck`'s (the one duplicate-prone literal in the crate).
+#[cfg(test)]
+pub(crate) fn sample_book(n: usize, mtime: i64) -> FeedBook {
+    let episodes = (0..n)
+        .map(|idx| FeedEpisode {
+            idx,
+            title: format!("Chapter {}", idx + 1),
+            audio_url: format!("http://host/audio/book/{:03}.m4a", idx + 1),
+            byte_length: 1000 + idx as u64,
+            duration_sec: 61.0 * (idx as f64 + 1.0),
+            mime_type: "audio/mp4".to_string(),
+        })
+        .collect();
+    FeedBook {
+        id: "book-1".to_string(),
+        title: "A Test Book".to_string(),
+        author: Some("An Author".to_string()),
+        description: Some("A description".to_string()),
+        cover_url: Some("http://host/cover.jpg".to_string()),
+        source_mtime: mtime,
+        self_url: "http://host/feed/book.xml".to_string(),
+        episodes,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn sample(n: usize, mtime: i64) -> FeedBook {
-        let episodes = (0..n)
-            .map(|idx| FeedEpisode {
-                idx,
-                title: format!("Chapter {}", idx + 1),
-                audio_url: format!("http://host/audio/book/{:03}.m4a", idx + 1),
-                byte_length: 1000 + idx as u64,
-                duration_sec: 61.0 * (idx as f64 + 1.0),
-                mime_type: "audio/mp4".to_string(),
-            })
-            .collect();
-        FeedBook {
-            id: "book-1".to_string(),
-            title: "A Test Book".to_string(),
-            author: Some("An Author".to_string()),
-            description: Some("A description".to_string()),
-            cover_url: Some("http://host/cover.jpg".to_string()),
-            source_mtime: mtime,
-            self_url: "http://host/feed/book.xml".to_string(),
-            episodes,
-        }
-    }
 
     #[test]
     fn guid_is_stable_and_mtime_sensitive() {
@@ -254,7 +257,7 @@ mod tests {
 
     #[test]
     fn channel_items_carry_required_tags() {
-        let book = sample(3, 1_700_000_000);
+        let book = sample_book(3, 1_700_000_000);
         let channel = build_channel(&book);
         assert_eq!(channel.items().len(), 3);
 
@@ -276,7 +279,7 @@ mod tests {
 
     #[test]
     fn rendered_xml_has_namespaces_and_required_elements() {
-        let xml = render(&sample(2, 1_700_000_000));
+        let xml = render(&sample_book(2, 1_700_000_000));
         assert_eq!(
             xml.matches("xmlns:itunes").count(),
             1,
@@ -293,7 +296,7 @@ mod tests {
 
     #[test]
     fn rendered_pubdates_are_present_for_every_item() {
-        let xml = render(&sample(4, 1_700_000_000));
+        let xml = render(&sample_book(4, 1_700_000_000));
         assert_eq!(
             xml.matches("<pubDate>").count(),
             4 + 1,

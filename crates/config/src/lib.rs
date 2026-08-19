@@ -549,6 +549,7 @@ fn parse_duration(s: &str) -> Result<Option<Duration>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use podspine_test_support::scratch;
 
     fn cli(library: Option<&str>) -> Cli {
         Cli {
@@ -692,25 +693,18 @@ mod tests {
 
     /// `validate` needs a real library dir; give each case its own.
     fn validate_binds(dir: &str, bind: &str, metrics: &str) -> Result<(), ConfigError> {
-        let tmp = std::env::temp_dir().join(dir);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = scratch(dir);
         let mut c = cli(Some(tmp.to_str().unwrap()));
         c.bind = Some(bind.to_string());
         c.metrics_bind = Some(metrics.to_string());
         let resolved = Config::resolve(&c, &FileConfig::default()).unwrap();
-        let result = resolved.validate();
-        let _ = std::fs::remove_dir_all(&tmp);
-        result
+        resolved.validate()
     }
 
     #[test]
     fn metrics_bind_may_not_reuse_the_feed_servers_address() {
         assert!(matches!(
-            validate_binds(
-                "podspine-cfg-collide-exact",
-                "127.0.0.1:8080",
-                "127.0.0.1:8080"
-            ),
+            validate_binds("cfg-collide-exact", "127.0.0.1:8080", "127.0.0.1:8080"),
             Err(ConfigError::MetricsBindConflict { .. })
         ));
     }
@@ -720,11 +714,7 @@ mod tests {
         // 0.0.0.0:8080 already claims 127.0.0.1:8080 — without this the second
         // listener dies with a bare "address already in use" at startup.
         assert!(matches!(
-            validate_binds(
-                "podspine-cfg-collide-wild",
-                "0.0.0.0:8080",
-                "127.0.0.1:8080"
-            ),
+            validate_binds("cfg-collide-wild", "0.0.0.0:8080", "127.0.0.1:8080"),
             Err(ConfigError::MetricsBindConflict { .. })
         ));
     }
@@ -732,11 +722,7 @@ mod tests {
     #[test]
     fn a_wildcard_metrics_bind_collides_with_a_specific_feed_bind() {
         assert!(matches!(
-            validate_binds(
-                "podspine-cfg-collide-wild-rev",
-                "127.0.0.1:8080",
-                "0.0.0.0:8080"
-            ),
+            validate_binds("cfg-collide-wild-rev", "127.0.0.1:8080", "0.0.0.0:8080"),
             Err(ConfigError::MetricsBindConflict { .. })
         ));
     }
@@ -744,7 +730,7 @@ mod tests {
     #[test]
     fn different_ports_never_collide() {
         assert!(
-            validate_binds("podspine-cfg-collide-ok", "0.0.0.0:8080", "0.0.0.0:9090").is_ok(),
+            validate_binds("cfg-collide-ok", "0.0.0.0:8080", "0.0.0.0:9090").is_ok(),
             "distinct ports must be allowed, wildcard or not"
         );
     }
@@ -752,14 +738,7 @@ mod tests {
     #[test]
     fn distinct_interfaces_on_one_port_are_allowed() {
         // Legal and occasionally deliberate: two specific, different interfaces.
-        assert!(
-            validate_binds(
-                "podspine-cfg-collide-ifaces",
-                "127.0.0.1:8080",
-                "192.0.2.1:8080"
-            )
-            .is_ok()
-        );
+        assert!(validate_binds("cfg-collide-ifaces", "127.0.0.1:8080", "192.0.2.1:8080").is_ok());
     }
 
     #[test]
@@ -811,7 +790,7 @@ mod tests {
     fn mapped_metrics_bind_is_rejected_end_to_end() {
         assert!(matches!(
             validate_binds(
-                "podspine-cfg-collide-mapped",
+                "cfg-collide-mapped",
                 "127.0.0.1:8080",
                 "[::ffff:127.0.0.1]:8080"
             ),
@@ -847,12 +826,10 @@ mod tests {
 
     #[test]
     fn validate_accepts_a_real_dir_and_creates_data_dir() {
-        let tmp = std::env::temp_dir().join("podspine-cfg-validate");
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = scratch("cfg-validate");
         let data = tmp.join("data");
         let c = Config {
-            library: tmp.clone(),
+            library: tmp.to_path_buf(),
             data_dir: data.clone(),
             bind: "0.0.0.0:8080".parse().unwrap(),
             base_url: "http://localhost:8080".to_string(),
@@ -867,7 +844,6 @@ mod tests {
         };
         c.validate().unwrap();
         assert!(data.is_dir(), "data dir created");
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -979,11 +955,9 @@ mod tests {
     #[test]
     fn validate_rejects_a_missing_or_non_dir_library() {
         // Own subdir — must NOT share a fixed path with any sibling test, or the
-        // parallel runner races the remove_dir_all/create_dir_all below against
+        // parallel runner races `scratch()`'s wipe-and-recreate against
         // `validate_accepts_a_real_dir_and_creates_data_dir` (uses `-validate`).
-        let tmp = std::env::temp_dir().join("podspine-cfg-validate-reject");
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = scratch("cfg-validate-reject");
 
         // --library points at a real FILE (not a directory) → LibraryNotDir.
         let as_file = tmp.join("not-a-dir");
@@ -1014,17 +988,13 @@ mod tests {
         let ok = Config::resolve(&cl, &FileConfig::default()).unwrap();
         assert!(ok.validate().is_ok());
         assert!(ok.data_dir.is_dir(), "data dir created by validate");
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn validate_reports_data_dir_when_the_path_is_unwritable() {
         // library is a real dir (passes exists/is_dir), but data_dir sits UNDER a
         // regular file, so create_dir_all fails -> ConfigError::DataDir.
-        let tmp = std::env::temp_dir().join("podspine-cfg-datadir");
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = scratch("cfg-datadir");
         let blocker = tmp.join("iam-a-file");
         std::fs::write(&blocker, b"x").unwrap();
         let mut cl = cli(Some(tmp.to_str().unwrap()));
@@ -1035,7 +1005,6 @@ mod tests {
             "{:?}",
             c.validate()
         );
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -1135,14 +1104,12 @@ mod tests {
 
     #[test]
     fn load_file_reads_a_toml_file() {
-        let dir = std::env::temp_dir().join("podspine-cfg-load");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("cfg-load");
         let path = dir.join("podspine.toml");
         std::fs::write(&path, "library = \"/books\"\nbind = \"0.0.0.0:3000\"\n").unwrap();
         let f = load_file(Some(&path)).unwrap();
         assert_eq!(f.library, Some(PathBuf::from("/books")));
         assert_eq!(f.bind.as_deref(), Some("0.0.0.0:3000"));
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -1153,12 +1120,10 @@ mod tests {
 
     #[test]
     fn load_file_malformed_is_a_parse_error() {
-        let dir = std::env::temp_dir().join("podspine-cfg-bad");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("cfg-bad");
         let path = dir.join("bad.toml");
         std::fs::write(&path, "this is = not valid = toml").unwrap();
         let err = load_file(Some(&path)).unwrap_err();
         assert!(matches!(err, ConfigError::ParseConfig { .. }));
-        let _ = std::fs::remove_file(&path);
     }
 }
