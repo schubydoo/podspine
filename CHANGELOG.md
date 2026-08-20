@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.7.1 (2026-08-20)
+
+### Fixes
+
+- Remux-to-faststart now publishes atomically like every other producer, so a failed remux can no longer clobber a cached copy that is being served ([#183](https://github.com/schubydoo/podspine/pull/183))
+- The stale-copy sweep now recognizes episode files beyond chapter 999, so books with 1000+ chapters no longer leave orphaned copies on disk after a container change ([#183](https://github.com/schubydoo/podspine/pull/183))
+- Log every previously swallowed error — internal 500s, skipped cache evictions, failed disabled-book prunes, and skipped id-reuse scans now leave a diagnosable trail in the server log instead of failing silently ([#183](https://github.com/schubydoo/podspine/pull/183))
+- Startup now fails loudly when the data dir or library root cannot be resolved, instead of coming up as a server that silently 404s every request ([#183](https://github.com/schubydoo/podspine/pull/183))
+
+### Performance
+
+- Serve a small cover thumbnail to the browse-UI grid instead of full-resolution artwork: the scanner generates a `cover_thumb.jpg` (long edge ≤400px) alongside each cover, and `/cover/{id}/thumb` serves it (falling back to the full cover when it's missing). Existing libraries are backfilled by the reconcile on the next scan — no re-ingest needed. The RSS feed and `/cover` keep the full-size image for podcatchers ([#180](https://github.com/schubydoo/podspine/pull/180))
+- Split a book's chapters in parallel instead of one at a time, bounded by the existing CPU-sized ffmpeg gate, so a first scan of a chaptered library is much faster (measured ~9× on a 20-core host for a 40-chapter book) — episode order and per-chapter enclosure sizes are unchanged ([#178](https://github.com/schubydoo/podspine/pull/178))
+
 ## 1.7.0 (2026-08-18)
 
 ### Features
