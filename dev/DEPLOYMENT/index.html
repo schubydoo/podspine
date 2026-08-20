@@ -1341,7 +1341,7 @@ env → global config file → default.</strong></p>
 <p>Server-wide keys (<code>bind</code>, <code>base_url</code>, <code>library</code>, <code>data_dir</code>, <code>cache_size</code>,
 <code>cache_ttl</code>, <code>transcode</code>, …) are <strong>ignored with a log warning</strong> if they appear in a
 per-book file — they only make sense server-wide. (<code>transcode</code> is server-wide for
-now: it is decided from the source codec, so a per-book key would buy little.) An unparseable sidecar is logged and
+now: it is decided from the source codec, so a per-book key would buy little.) An unparsable sidecar is logged and
 skipped for that book; it never aborts the scan.</p>
 <h2 id="exposing-podspine-safely">Exposing Podspine safely<a class="headerlink" href="#exposing-podspine-safely" title="Permanent link">&para;</a></h2>
 <p>Podspine has two kinds of routes, and they want different exposure:</p>
