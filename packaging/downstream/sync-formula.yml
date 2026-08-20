@@ -1,12 +1,13 @@
 # INSTALL THIS INTO the schubydoo/homebrew-podspine repo at
 # .github/workflows/sync-formula.yml  (it does NOT run from the main podspine repo).
 #
-# The canonical podspine formula lives in the main repo (schubydoo/podspine), where its
-# version/url/hash are regenerated on every release by packaging-bump.yml. This tap just
-# mirrors that file: on a schedule (and on demand, dispatched by the main repo's
-# tap-sync-trigger.yml) it fetches Formula/podspine.rb from the public main repo and
-# commits it here if it changed. Auth-free: reads a public raw file over TLS, pushes with
-# this repo's own GITHUB_TOKEN.
+# The canonical podspine formula lives in the main repo (schubydoo/podspine),
+# where packaging-bump.yml regenerates its version/url/hash on every release.
+# This tap only mirrors that file: on a schedule (and on demand, dispatched by
+# the main repo's tap-sync-trigger.yml), it fetches Formula/podspine.rb from
+# the public main repo and commits it here when it changed. Auth-free: it
+# reads a public raw file over TLS and pushes with this repo's own
+# GITHUB_TOKEN.
 name: Sync formula from podspine
 
 on:
@@ -36,13 +37,15 @@ jobs:
         run: |
           set -euo pipefail
           tmp="$(mktemp)"
-          # Soft no-op if the source isn't fetchable yet (not on main, transient blip):
-          # keep the current valid formula and retry next run.
+          # A soft no-op when the source is not fetchable yet (not on main,
+          # or a transient blip): keep the current valid formula and retry on
+          # the next run.
           if ! curl -fsSL "$SRC" -o "$tmp"; then
             echo "::notice::could not fetch $SRC (not on main yet?) — skipping this run"
             exit 0
           fi
-          # Fail closed if the fetch returned a non-formula (e.g. a 200 error page).
+          # Fail closed when the fetch returned a non-formula (e.g. a 200
+          # error page).
           if ! grep -q '^class Podspine < Formula' "$tmp"; then
             echo "::error::fetched content is not the podspine formula"
             exit 1

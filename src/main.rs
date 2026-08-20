@@ -22,10 +22,10 @@ async fn main() -> Result<()> {
 
     let config = Config::load().context("resolving configuration")?;
 
-    // Install the recorder (and bind its listener) before the first reconcile,
-    // so startup ingest is measured rather than silently dropped. Both failures
-    // are fatal: metrics were explicitly asked for, so a missing endpoint should
-    // surface here, not as a gap in a dashboard.
+    // Install the recorder (and bind its listener) before the first
+    // reconcile, so that the startup ingest is measured, not silently
+    // dropped. Both failures are fatal: metrics were explicitly asked for, so
+    // a missing endpoint must surface here, not as a gap in a dashboard.
     let metrics = match config.metrics_bind {
         Some(bind) => {
             let handle = podspine_metrics::install()
@@ -61,20 +61,21 @@ async fn main() -> Result<()> {
     )
     .context("canonicalizing the data dir / library root")?;
 
-    // First-run UX (issue 159): don't hold the HTTP port down behind the initial
-    // reconcile. A large first scan takes minutes to split, and anything in front
-    // of the server (a reverse proxy, a Funnel) returns 502 the whole time. Instead
-    // mark the state "scanning" and hand the initial reconcile to the watcher's
-    // background thread, which registers the filesystem watch first, runs the
-    // reconcile, then flips the state to "ready" via the callback. Until then
-    // `GET /` shows a "Scanning…" page and the capability routes answer 503 +
-    // Retry-After rather than a 502/404. A warm restart reaches ready almost
-    // immediately — the reconcile's idempotency early-returns.
+    // First-run UX (issue 159): do not hold the HTTP port down behind the
+    // initial reconcile. A large first scan takes minutes to split, and
+    // anything in front of the server (a reverse proxy, a Funnel) returns 502
+    // the whole time. Instead, mark the state "scanning" and hand the initial
+    // reconcile to the watcher's background thread. That thread registers the
+    // filesystem watch first, runs the reconcile, and then flips the state to
+    // "ready" via the callback. Until then, `GET /` shows a "Scanning…" page,
+    // and the capability routes answer 503 + Retry-After, not a 502/404. A
+    // warm restart reaches ready almost immediately: the reconcile's
+    // idempotency early-returns.
     //
-    // Watch-before-scan (not scan-before-watch): a library change that lands during
-    // the initial scan is buffered and reconciled by the watcher rather than lost
-    // until the next event or a restart. The watcher owns the only index writer, so
-    // exactly one reconciler ever runs.
+    // Watch-before-scan (not scan-before-watch): the watcher buffers and
+    // reconciles a library change that lands during the initial scan; the
+    // change is not lost until the next event or a restart. The watcher owns
+    // the only index writer, so exactly one reconciler ever runs.
     state.set_ready(false);
     {
         let state = state.clone();

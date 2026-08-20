@@ -1,13 +1,14 @@
 name: CodeQL
 
-# Static analysis (SAST) for Rust via CodeQL — results land in the Security tab
-# (Code scanning). The `main` ruleset makes CodeQL a REQUIRED code-scanning tool,
-# so coverage must survive the "stuck PR" class: the `push` trigger binds a result
-# to each branch's STABLE head SHA (GitHub maps it onto open PRs and honours it
-# across base moves that recompute the merge ref), while `pull_request` adds the
-# merge-ref, PR-diff-aware analysis. Analysing every branch head — not just main —
-# is what keeps a PR off mergeStateStatus=BLOCKED after an unrelated merge moves
-# main. CodeQL uploads via the built-in GITHUB_TOKEN (App tokens are rejected by
+# Static analysis (SAST) for Rust via CodeQL; results land in the Security
+# tab (Code scanning). The `main` ruleset makes CodeQL a REQUIRED
+# code-scanning tool, so coverage must survive the "stuck PR" class. The
+# `push` trigger binds a result to each branch's STABLE head SHA (GitHub maps
+# it onto open PRs and honours it across base moves that recompute the merge
+# ref), while `pull_request` adds the merge-ref, PR-diff-aware analysis. The
+# analysis of every branch head (not just main) is what keeps a PR off
+# mergeStateStatus=BLOCKED after an unrelated merge moves main. CodeQL
+# uploads via the built-in GITHUB_TOKEN (App tokens are rejected by
 # upload-sarif, github/codeql-action#2719).
 #
 # NOTE: action refs are pinned to full commit SHAs (the repo's Actions policy
@@ -45,13 +46,15 @@ jobs:
         uses: github/codeql-action/init@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
         with:
           languages: rust
-          # Rust ONLY supports `build-mode: none` (CodeQL 2.25.x). `manual`/`autobuild`
-          # fail at `database init` with "Rust does not support the manual build mode",
-          # so there's no cargo-build-under-tracer option. Extraction is therefore
+          # Rust ONLY supports `build-mode: none` (CodeQL 2.25.x).
+          # `manual`/`autobuild` fail at `database init` with "Rust does not
+          # support the manual build mode", so there is no
+          # cargo-build-under-tracer option. Extraction is therefore
           # source-only: some files report "extracted with errors" (unresolved
-          # dependency/macro types) — a known limitation of the experimental Rust
-          # extractor, NOT fixable via build mode. Deeper Rust coverage comes from
-          # clippy (-D warnings), cargo audit/deny, and security.yml.
+          # dependency/macro types), a known limitation of the experimental
+          # Rust extractor, and NOT fixable via build mode. Deeper Rust
+          # coverage comes from clippy (-D warnings), cargo audit/deny, and
+          # security.yml.
           build-mode: none
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7

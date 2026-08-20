@@ -1,10 +1,10 @@
-//! Real ffmpeg split of a real audiobook — the POC's core proof.
+//! Real ffmpeg split of a real audiobook: the POC's core proof.
 //!
 //! Existence-gated on the local golden-path fixture (or `$PODSPINE_TEST_M4B`);
-//! quietly skips in CI where the large file is absent. Splits the first few
-//! chapters and asserts each output's *actual* duration matches the requested
-//! duration within ±1 s — which is exactly what a `-to`/`-t` mistake (the 2×
-//! bug) would violate.
+//! it quietly skips in CI, where the large file is absent. It splits the
+//! first few chapters and asserts that each output's *actual* duration
+//! matches the requested duration within ±1 s. That is exactly what a
+//! `-to`/`-t` mistake (the 2× bug) would violate.
 
 use std::path::{Path, PathBuf};
 
@@ -35,8 +35,8 @@ fn splits_real_chapters_without_2x_bug_and_leaves_source_untouched() {
     let book = probe(&input).expect("probe fixture");
     assert!(book.chapters.len() >= 3, "need at least 3 chapters to test");
 
-    // First 3 chapters (a real fixture typically includes a short one — a
-    // useful tiny-segment case).
+    // The first 3 chapters (a real fixture typically includes a short one:
+    // a useful tiny-segment case).
     let cuts: Vec<ChapterCut> = book.chapters[..3]
         .iter()
         .map(|c| ChapterCut {
@@ -74,7 +74,7 @@ fn splits_real_chapters_without_2x_bug_and_leaves_source_untouched() {
         assert!(ep.byte_length > 0, "output not empty");
 
         // The anti-2x proof: probe the produced file and compare its actual
-        // duration to what we asked for (±1 s, per NFR-P1).
+        // duration to the requested one (±1 s, per NFR-P1).
         let requested = cut.end_sec - cut.start_sec;
         let actual = probe(&ep.path).expect("probe output").duration_sec;
         assert!(

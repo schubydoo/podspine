@@ -1,26 +1,28 @@
-# Codecov config. Coverage is REPORTED here for visibility (PR comment + trend
-# graphs + per-crate breakdown); the REAL gate is the CI line floor in
+# Codecov config. Coverage is REPORTED here for visibility (PR comment, trend
+# graphs, per-crate breakdown). The REAL gate is the CI line floor in
 # .github/workflows/ci.yml (the `coverage (>= 90% lines)` job runs
-# `cargo llvm-cov --fail-under-lines 90`). The `project` status is informational
-# (a nudge, never a block); `patch` is a real pass/fail traffic light on new-code
-# coverage — but neither is a *required* check unless it's added to branch
-# protection. Coverage uploads from ONE Linux cell, so flags / carryforward /
-# report-merging aren't needed.
+# `cargo llvm-cov --fail-under-lines 90`). The `project` status is
+# informational (a nudge, never a block). `patch` is a real pass/fail traffic
+# light on new-code coverage. Neither is a *required* check unless it is added
+# to branch protection. Coverage uploads from ONE Linux cell, so flags,
+# carryforward, and report-merging are not needed.
 #
-# Rust note: Codecov ingests the lcov that `cargo llvm-cov --lcov` emits directly
-# — no cobertura conversion step.
+# Rust note: Codecov ingests the lcov that `cargo llvm-cov --lcov` emits
+# directly; no cobertura conversion step is needed.
 #
-# Baseline: ~94% lines excluding src/main.rs (feed/selfcheck/ui/prober/chapters/
-# index all ≥98%; splitter/cli the lowest; src/main.rs is 0% — the live server
-# wiring, not unit-testable — and is excluded from the report via `ignore` below).
+# Baseline: ~94% lines excluding src/main.rs (feed/selfcheck/ui/prober/
+# chapters/index are all ≥98%; splitter is the lowest). src/main.rs is 0% (the
+# live server wiring, not unit-testable) and is excluded from the report via
+# `ignore` below.
 #
 # Validate before deploying changes:
 #   curl -X POST --data-binary @codecov.yml https://api.codecov.io/validate
 
 codecov:
-  # ci.yml uploads coverage even when the floor step FAILS (the `!cancelled()`
-  # guard), on purpose: a coverage drop should surface exactly when a change
-  # breaks the floor. So don't gate the Codecov status on CI passing.
+  # ci.yml uploads coverage even when the floor step FAILS (the
+  # `!cancelled()` guard), on purpose: a coverage drop must surface exactly
+  # when a change breaks the floor. So do not gate the Codecov status on CI
+  # passing.
   require_ci_to_pass: false
   notify:
     wait_for_ci: false
@@ -29,32 +31,34 @@ codecov:
 coverage:
   precision: 2
   round: down # a strict floor rounds down, matching the CI --fail-under-lines gate
-  range: "88...96" # red->green band around the ~94% baseline
+  range: "88...96" # the red-to-green band around the ~94% baseline
   status:
     project:
       default:
         target: 90% # mirror the ci.yml line floor
         threshold: 1% # tolerate sub-1% drift before flagging
-        informational: true # nudge, never block — ci.yml is the source of truth
+        informational: true # a nudge, never a block; ci.yml is the source of truth
     patch:
       default:
-        # New-code (diff) coverage gate. 80% sits below the repo's ~91% overall
-        # so it flags under-tested new code without chronic red; raise it if new
-        # PRs comfortably clear a higher bar.
+        # New-code (diff) coverage gate. 80% sits below the repo's ~91%
+        # overall, so it flags under-tested new code without chronic red.
+        # Raise it when new PRs comfortably clear a higher bar.
         target: 80%
-        threshold: 0% # no slack — new code meets the target or the status goes red
+        threshold: 0% # no slack: new code meets the target, or the status goes red
         informational: false # a real pass/fail traffic light (still a non-required check)
-        if_not_found: success # docs-only PRs upload no diff → don't block them
+        if_not_found: success # docs-only PRs upload no diff; do not block them
 
-# src/main.rs is the server's live wiring (resolve config, open the index, scan,
-# bind the socket, serve) — exercised by running the app, not by unit tests. It
-# can't be meaningfully unit-tested, so exclude it from the REPORTED coverage so
-# the dashboard reflects testable code. (The CI line floor still measures the full
-# tree; it carries enough headroom to absorb this ~0.8% of lines.)
+# src/main.rs is the server's live wiring (resolve config, open the index,
+# scan, bind the socket, serve). A run of the app exercises it, not unit
+# tests. It cannot be meaningfully unit-tested, so it is excluded from the
+# REPORTED coverage, and the dashboard then reflects testable code. (The CI
+# line floor still measures the full tree; it carries enough headroom to
+# absorb this ~0.8% of lines.)
 ignore:
   - "src/main.rs"
-  # Dev-only test scaffolding (skip!/scratch/ffmpeg synths) — it only ever runs
-  # inside tests, so "coverage" of it is noise, same reasoning as src/main.rs.
+  # Dev-only test scaffolding (skip!/scratch/ffmpeg synths): it only ever
+  # runs inside tests, so "coverage" of it is noise, for the same reason as
+  # src/main.rs.
   - "crates/test-support/src/lib.rs"
 
 # The per-line PR annotations are mostly visual clutter; the comment + dashboard
@@ -76,8 +80,8 @@ comment:
 # component matcher silently does NOT pick up a `**` glob here (the component
 # renders empty even at 100% coverage), whereas explicit file paths DO match.
 # (Same quirk clauster's codecov.yml hit with its `db/**` / `hooks/**` components.)
-# So when a crate gains a module, add its `.rs` file here — a glob will look fine
-# and quietly track nothing.
+# So when a crate gains a module, add its `.rs` file here; a glob would look
+# fine and quietly track nothing.
 component_management:
   individual_components:
     - component_id: scanner

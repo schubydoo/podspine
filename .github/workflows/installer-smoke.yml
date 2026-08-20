@@ -1,13 +1,13 @@
 name: Installer smoke
 
-# Smoke-test every install method on real runners (the cross-OS / package-manager
-# coverage the dev host can't provide): the one-line installers install.sh (Linux +
-# macOS) and install.ps1 (Windows), their uninstall counterparts, the Homebrew
-# formula (macOS), the Nix flake (Linux), and `cargo install` (Linux + macOS). The
-# script/brew jobs install the
-# published RELEASE binary and verify it runs via `--help` (the `--version` flag
-# ships in this PR, so the current release doesn't have it yet); the Nix job builds
-# THIS PR's source and so checks `--version`. Non-required signal job.
+# Smoke-test every install method on real runners (the cross-OS /
+# package-manager coverage the dev host cannot provide): the one-line
+# installers install.sh (Linux + macOS) and install.ps1 (Windows), their
+# uninstall counterparts, the Homebrew formula (macOS), the Nix flake (Linux),
+# and `cargo install` (Linux + macOS). The script/brew jobs install the
+# published RELEASE binary and verify that it runs via `--help`. The Nix and
+# cargo jobs build THIS checkout's source, so they check `--version`. This is
+# a non-required signal job.
 on:
   workflow_dispatch:
   pull_request:
@@ -65,9 +65,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # install.ps1 runs under a function + try/catch (no `exit`, for iex safety); it
-      # signals failure via $global:LASTEXITCODE, so verify the OUTCOME (binary present
-      # + runnable) rather than trusting the script's exit status.
+      # install.ps1 runs under a function + try/catch (no `exit`, for iex
+      # safety); it signals failure via $global:LASTEXITCODE. So verify the
+      # OUTCOME (the binary is present and runnable); do not trust the
+      # script's exit status.
       - name: install.ps1 + verify + uninstall.ps1
         shell: pwsh
         run: |
@@ -95,9 +96,10 @@ jobs:
       - name: brew install via a local tap + verify
         run: |
           set -euo pipefail
-          # Modern Homebrew refuses a bare local formula path — it must live in a tap.
-          # Stage our formula into an ephemeral local tap (mirrors real consumption via
-          # the homebrew-podspine repo) and install from there.
+          # Modern Homebrew refuses a bare local formula path: the formula
+          # must live in a tap. Stage the formula into an ephemeral local tap
+          # (this mirrors real consumption via the homebrew-podspine repo) and
+          # install from there.
           brew tap-new schubydoo/local --no-git
           tap_dir="$(brew --repository schubydoo/local)"
           mkdir -p "$tap_dir/Formula"
@@ -123,7 +125,7 @@ jobs:
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
-      # Builds THIS PR's source, so the freshly-added --version flag is present.
+      # This builds THIS checkout's source, so the --version flag is present.
       - name: Build + run the flake
         run: |
           set -euo pipefail
@@ -143,10 +145,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # `cargo install --path` from THIS PR's checkout exercises the cargo route
-      # (and the source carries the new --version). The Rust toolchain is preinstalled
-      # on GitHub runners. The [package.metadata.binstall] block is separately
-      # validated end-to-end by `cargo binstall --git` once it lands on main.
+      # `cargo install --path` from THIS checkout exercises the cargo route
+      # (the source carries --version). The Rust toolchain is preinstalled on
+      # GitHub runners. The [package.metadata.binstall] block is separately
+      # validated end-to-end by `cargo binstall --git` from main.
       - name: cargo install + verify
         run: |
           set -euo pipefail

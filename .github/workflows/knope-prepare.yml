@@ -1,14 +1,15 @@
 name: Prepare Release
 
-# knope's "release PR" half. On push to main, if the Conventional-Commit history
-# since the last tag warrants a release, knope bumps the version + CHANGELOG,
-# resyncs Cargo.lock, force-pushes the `release` branch, and opens/refreshes a
-# `chore: prepare release X.Y.Z` PR. Merging that PR is the approval gate; the
-# merge triggers knope-release.yml.
+# knope's "release PR" half. On push to main, if pending changeset fragments
+# warrant a release, knope bumps the version + CHANGELOG, resyncs Cargo.lock,
+# force-pushes the `release` branch, and opens/refreshes a
+# `chore: prepare release X.Y.Z` PR. The merge of that PR is the approval
+# gate; the merge triggers knope-release.yml.
 #
-# Gated on the `KNOPE_ENABLED` repo variable (now 'true'). Needs the `podspine-ci`
-# GitHub App INSTALLED on the repo (PODSPINE_CI_APP_ID / PODSPINE_CI_APP_PRIVATE_KEY
-# secrets) — only for release-driving pushes; see the changeset-first ordering below.
+# Gated on the `KNOPE_ENABLED` repo variable (now 'true'). This needs the
+# `podspine-ci` GitHub App INSTALLED on the repo (PODSPINE_CI_APP_ID /
+# PODSPINE_CI_APP_PRIVATE_KEY secrets). The App is needed only for
+# release-driving pushes; see the changeset-first ordering below.
 
 on:
   push:
@@ -29,10 +30,11 @@ jobs:
     permissions:
       contents: read
     steps:
-      # Detect a pending changeset FIRST, with a credential-less checkout, so a
-      # routine push with no fragment is a clean no-op that never touches the
-      # podspine-ci App. Only a release-driving push mints the token below — this
-      # decouples ordinary merges (docs/CI/no-changelog) from the App entirely.
+      # Detect a pending changeset FIRST, with a credential-less checkout, so
+      # that a routine push with no fragment is a clean no-op that never
+      # touches the podspine-ci App. Only a release-driving push mints the
+      # token below. This decouples ordinary merges (docs/CI/no-changelog)
+      # from the App entirely.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -48,9 +50,10 @@ jobs:
           echo "has=$([ "$count" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
           echo "pending changeset fragments: $count"
       # Everything below runs ONLY when a fragment is pending. Short-lived
-      # podspine-ci App token: its identity is what lets the release PR's eventual
-      # merge tag trigger release.yml (a GITHUB_TOKEN-pushed tag would not, by
-      # GitHub's recursion suppression) and lets CI run on the release PR.
+      # podspine-ci App token: its identity is what lets the release PR's
+      # eventual merge tag trigger release.yml (a GITHUB_TOKEN-pushed tag
+      # would not, because of GitHub's recursion suppression), and it lets CI
+      # run on the release PR.
       - name: Mint podspine-ci App token
         id: app-token
         if: ${{ steps.changesets.outputs.has == 'true' }}
@@ -65,9 +68,9 @@ jobs:
         run: |
           echo "::error::podspine-ci App token mint produced an empty token; check the PODSPINE_CI_APP_ID / PODSPINE_CI_APP_PRIVATE_KEY secrets and the App installation."
           exit 1
-      # Re-checkout with the App token persisted so knope's `git push` of the
-      # release branch + the PR it opens run as the App identity. Full history +
-      # tags so knope can find the last release tag.
+      # Re-checkout with the App token persisted, so that knope's `git push`
+      # of the release branch, and the PR it opens, run as the App identity.
+      # Full history and tags, so that knope can find the last release tag.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: ${{ steps.changesets.outputs.has == 'true' }}
         with:

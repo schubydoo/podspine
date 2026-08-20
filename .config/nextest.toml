@@ -1,6 +1,6 @@
 # cargo-nextest configuration. Only the `ci` profile is customized: it emits
-# JUnit XML (the only format Codecov's Test Analytics ingests — same reason
-# claustrum runs gotestsum) at target/nextest/ci/junit.xml. Local
+# JUnit XML (the only format Codecov's Test Analytics ingests; claustrum runs
+# gotestsum for the same reason) at target/nextest/ci/junit.xml. Local
 # `cargo nextest run` uses the default profile and is unaffected.
 [profile.ci.junit]
 path = "junit.xml"

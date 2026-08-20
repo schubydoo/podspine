@@ -1,30 +1,36 @@
 //! `http` — the Axum HTTP surface.
 //!
 //! Routes split into two surfaces (v1.5):
-//! - **Browse UI (keyed by human `slug`)** — meant for the LAN / behind
-//!   proxy-auth; it enumerates the library, so it must not be publicly exposed:
+//! - **Browse UI (keyed by human `slug`)**: meant for the LAN or behind
+//!   proxy-auth. It enumerates the library, so it must not be publicly
+//!   exposed:
 //!   - `GET /` — the browsable book grid.
 //!   - `GET /book/{slug}` — a book's page: copy-feed-URL, QR, how-to panel.
-//! - **Public capability surface (keyed by unguessable `feed_id`)** — safe to
-//!   expose externally; a guessed id reveals nothing (404):
-//!   - `GET /feed/{feed_id}.xml` — the podcast feed (built from the index and
-//!     passed through the feed self-check before serving).
-//!   - `GET /audio/{feed_id}/{number}` — an episode file with HTTP Range support
-//!     (206 / `Content-Range` / 416) via `axum-range`.
+//! - **Public capability surface (keyed by unguessable `feed_id`)**: safe to
+//!   expose externally. A guessed id reveals nothing (404):
+//!   - `GET /feed/{feed_id}.xml` — the podcast feed. The handler builds it
+//!     from the index and passes it through the feed self-check before it
+//!     serves it.
+//!   - `GET /audio/{feed_id}/{number}` — an episode file with HTTP Range
+//!     support (206 / `Content-Range` / 416) via `axum-range`.
 //!   - `GET /cover/{feed_id}` — the book's cover image.
 //! - `GET /healthz` — liveness.
 //!
-//! Book/episode keys are resolved server-side through the index; the file path
-//! served comes from the database (written at scan time), never built from user
-//! input. Hardening (Task 3.5, TAD §7): the human slug is validated against an
-//! allow-list charset ([`valid_slug`]) and the capability id against
-//! [`valid_feed_id`], so `..`/separators/absolute markers 404 before touching
-//! the DB or filesystem; as defense-in-depth the resolved audio path is still
-//! canonicalized and asserted to live under a trusted root — the data dir, or the
-//! library root for whole-file episodes served in place (Sprint 6.2); a
-//! `ConcurrencyLimitLayer` bounds in-flight requests alongside the timeout and
-//! body-limit layers. Errors never leak filesystem paths or ffmpeg stderr (that
-//! detail is logged, collapsed to a bare status for the client). See TAD §4/§7.
+//! The handlers resolve book/episode keys server-side through the index. The
+//! served file path comes from the database (written at scan time); it is
+//! never built from user input. Hardening (Task 3.5, TAD §7):
+//! - The slug must match an allow-list charset ([`valid_slug`]), and the
+//!   capability id must match [`valid_feed_id`]. So `..`, separators, and
+//!   absolute markers 404 before they touch the DB or the filesystem.
+//! - As defense in depth, the resolved audio path is still canonicalized and
+//!   asserted to live under a trusted root: the data dir, or the library
+//!   root for whole-file episodes served in place (Sprint 6.2).
+//! - A `ConcurrencyLimitLayer` bounds in-flight requests, alongside the
+//!   timeout and body-limit layers.
+//! - Errors never leak filesystem paths or ffmpeg stderr. That detail is
+//!   logged; the client gets a bare status.
+//!
+//! See TAD §4/§7.
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -62,11 +68,12 @@ use podspine_ui::{
 const MAX_INFLIGHT_REQUESTS: usize = 512;
 
 /// Whether a URL slug is safe to use as an opaque index key. Allow-list only:
-/// non-empty and `[a-z0-9-]` — exactly what the scanner's `slugify` produces.
+/// non-empty and `[a-z0-9-]`, exactly what the scanner's `slugify` produces.
 /// This rejects `..`, `/`, `\`, absolute markers, dots, and any other
 /// separator-bearing or traversal input *before* it reaches the DB or the
-/// filesystem. Callers 404 on rejection (no 403 oracle). Belt to the path
-/// canonicalization suspenders in [`resolve_audio_path`]. See TAD §7 (A01).
+/// filesystem. Callers 404 on rejection (no 403 oracle). This check is the
+/// belt; the path canonicalization in [`resolve_audio_target`] is the
+/// suspenders. See TAD §7 (A01).
 fn valid_slug(slug: &str) -> bool {
     !slug.is_empty()
         && slug
@@ -76,10 +83,11 @@ fn valid_slug(slug: &str) -> bool {
 
 /// Whether a string is a syntactically valid capability `feed_id`: non-empty,
 /// bounded length, and the URL-safe base64 alphabet (`[A-Za-z0-9_-]`) that
-/// [`podspine_index::capability::generate`] produces. Same purpose as
-/// [`valid_slug`] — reject traversal/separator input before the DB/filesystem —
-/// but a wider charset because the id is random, not a lowercase slug. A bad id
-/// 404s (no oracle); a well-formed but unknown id also 404s.
+/// [`podspine_index::capability::generate`] produces. The purpose is the same
+/// as [`valid_slug`]: reject traversal/separator input before the
+/// DB/filesystem. The charset is wider because the id is random, not a
+/// lowercase slug. A bad id 404s (no oracle); a well-formed but unknown id
+/// also 404s.
 fn valid_feed_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
@@ -88,14 +96,16 @@ fn valid_feed_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// Same-origin guard for the state-changing `POST` routes (CSRF defense). The only
-/// cookie the app sets is the non-auth `theme` preference (no session/auth cookie),
-/// so `SameSite` carries no ambient authority to protect; instead we check the
-/// browser-set fetch-metadata / `Origin` headers. Modern browsers always send
-/// `Sec-Fetch-Site`, so cross-site form posts are caught even in the proxy-auth
-/// deployment (where a forged request would otherwise ride the owner's proxy
-/// session). Non-browser clients (curl) send neither header and carry no ambient
-/// auth to abuse, so they're allowed. Fails closed on a mismatched `Origin`.
+/// Same-origin guard for the state-changing `POST` routes (CSRF defense). The
+/// only cookie the app sets is the non-auth `theme` preference (there is no
+/// session/auth cookie), so `SameSite` carries no ambient authority to
+/// protect. Instead the guard checks the browser-set fetch-metadata and
+/// `Origin` headers. Modern browsers always send `Sec-Fetch-Site`, so the
+/// guard catches cross-site form posts even in the proxy-auth deployment
+/// (there, a forged request would otherwise ride the owner's proxy session).
+/// Non-browser clients (curl) send neither header and carry no ambient auth
+/// to abuse, so they are allowed. The guard fails closed on a mismatched
+/// `Origin`.
 fn same_origin(headers: &HeaderMap, base_url: &str) -> bool {
     if let Some(sfs) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
         return sfs == "same-origin" || sfs == "none";
@@ -107,9 +117,10 @@ fn same_origin(headers: &HeaderMap, base_url: &str) -> bool {
     }
 }
 
-/// The visitor's colour [`Theme`] from the `theme` cookie (absent/garbage →
-/// [`Theme::System`], i.e. follow the OS). Parsed by hand — the app pulls in no
-/// cookie crate for one first-party, non-auth preference cookie.
+/// The visitor's colour [`Theme`] from the `theme` cookie. Absent or garbage
+/// input gives [`Theme::System`], i.e. follow the OS. The value is parsed by
+/// hand: the app pulls in no cookie crate for one first-party, non-auth
+/// preference cookie.
 fn theme_from_cookie(headers: &HeaderMap) -> Theme {
     headers
         .get(header::COOKIE)
@@ -123,14 +134,16 @@ fn theme_from_cookie(headers: &HeaderMap) -> Theme {
         .unwrap_or_default()
 }
 
-/// The same-origin path to redirect back to after a `POST /theme` (PRG), taken from
-/// the `Referer`. Returns the path+query of an absolute `scheme://host/path` URL, or
-/// a value that is already a plain absolute path. Rejects protocol-relative
-/// (`//host`) and anything not starting with a single `/`, so it can never become an
-/// open redirect. `None` (→ caller falls back to `/`) when there's no usable path.
+/// The same-origin path to redirect back to after a `POST /theme` (PRG),
+/// taken from the `Referer`. Return the path+query of an absolute
+/// `scheme://host/path` URL, or a value that is already a plain absolute
+/// path. Reject protocol-relative input (`//host`) and anything that does not
+/// start with a single `/`, so the result can never become an open redirect.
+/// Return `None` when there is no usable path (the caller falls back to `/`).
 fn referer_path(referer: &str) -> Option<String> {
-    // Strip `scheme://authority`, leaving `/path?query`; if there's no `://`, the
-    // header was already a bare path (defensive — Referer is normally absolute).
+    // Strip `scheme://authority`, which leaves `/path?query`. If there is no
+    // `://`, the header was already a bare path (defensive; a Referer is
+    // normally absolute).
     let candidate = match referer.split_once("://") {
         Some((_, after_authority)) => match after_authority.find('/') {
             Some(slash) => &after_authority[slash..],
@@ -144,22 +157,23 @@ fn referer_path(referer: &str) -> Option<String> {
 /// Shared server state.
 #[derive(Clone)]
 pub struct AppState {
-    /// The index (SQLite `Connection` is not `Sync`, so it lives behind a mutex;
-    /// handlers never hold the lock across an `.await`).
+    /// The index. The SQLite `Connection` is not `Sync`, so it lives behind a
+    /// mutex. Handlers never hold the lock across an `.await`.
     pub index: Arc<Mutex<Index>>,
     /// External base URL for feed/enclosure links (no trailing slash).
     pub base_url: String,
     /// Canonical data dir — extracted (chaptered) audio must stay under it.
     pub data_dir: PathBuf,
-    /// Canonical library root — whole-file episodes are streamed in place from
-    /// here (Sprint 6.2), so a resolved in-place path must stay under it. This is
-    /// the read-only source tree; the audio handler never writes to it.
+    /// Canonical library root. Whole-file episodes are streamed in place from
+    /// here (Sprint 6.2), so a resolved in-place path must stay under it. This
+    /// is the read-only source tree; the audio handler never writes to it.
     pub library_dir: PathBuf,
     /// Feed-level fallback cover URL for books with no embedded art.
     pub default_cover_url: Option<String>,
-    /// Server-default storage mode. Under [`StorageMode::Saver`], episode files
-    /// aren't pre-split — the audio handler regenerates a chapter on demand and
-    /// caches it; `Full` = pre-split. A book carrying its own mode overrides it.
+    /// Server-default storage mode. Under [`StorageMode::Saver`], episode
+    /// files are not pre-split: the audio handler regenerates a chapter on
+    /// demand and caches it. `Full` means pre-split. A book that carries its
+    /// own mode overrides this.
     pub storage: StorageMode,
     /// `saver`-mode cache cap in bytes (`None` = unbounded).
     pub cache_size_bytes: Option<u64>,
@@ -168,28 +182,29 @@ pub struct AppState {
     /// Per-chapter regeneration locks (single-flight): concurrent requests for
     /// the same uncached chapter run ffmpeg once, not N times.
     inflight: Arc<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>>,
-    /// `true` once the initial library scan has finished. Defaults to `true`, so a
-    /// state built for a test or an already-populated library serves normally; the
-    /// server binary flips it to `false` before it kicks off the background first
-    /// scan and back to `true` when that scan completes (issue 159). While it is
-    /// `false`, `GET /` serves a "Scanning…" holding page and the capability routes
-    /// (`/feed`, `/audio`, `/cover`) return 503 + `Retry-After` instead of a 502 or
-    /// a bare 404 — so a first boot reads as "starting up", not "broken".
+    /// `true` once the initial library scan has finished. The default is
+    /// `true`, so a state built for a test or an already-populated library
+    /// serves normally. The server binary flips it to `false` before it kicks
+    /// off the background first scan, and back to `true` when that scan
+    /// completes (issue 159). While it is `false`, `GET /` serves a
+    /// "Scanning…" holding page, and the capability routes (`/feed`, `/audio`,
+    /// `/cover`) return 503 + `Retry-After` instead of a 502 or a bare 404. A
+    /// first boot then reads as "starting up", not "broken".
     ready: Arc<AtomicBool>,
 }
 
 impl AppState {
-    /// Build state, canonicalizing the data dir **and** the library root for the
-    /// path-safety checks (served files must stay under one of them). The
-    /// storage/cache args come from [`podspine_config::Config`] (pre-split
-    /// default: `StorageMode::Full`).
+    /// Build state. Canonicalize the data dir **and** the library root for
+    /// the path-safety checks (served files must stay under one of them). The
+    /// storage/cache args come from `podspine_config::Config` (the pre-split
+    /// default is `StorageMode::Full`).
     ///
-    /// Errors when either root can't be canonicalized. Both are guaranteed to
-    /// exist by `Config::validate` (library checked, data dir created), so a
-    /// failure here means the filesystem changed under us — and falling back to
-    /// the as-given path would make every containment check fail closed: a
-    /// server that silently 404s everything. Failing startup is louder and
-    /// therefore kinder.
+    /// This errors when either root cannot be canonicalized.
+    /// `Config::validate` guarantees that both exist (the library is checked,
+    /// the data dir is created), so a failure here means the filesystem
+    /// changed under the server. A fallback to the as-given path would make
+    /// every containment check fail closed: a server that silently 404s
+    /// everything. A startup failure is louder and therefore kinder.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         index: Index,
@@ -221,24 +236,27 @@ impl AppState {
         })
     }
 
-    /// Flip the "initial scan finished" flag. The server binary sets it `false`
-    /// before spawning the background first scan and `true` when that scan returns
-    /// (issue 159); it's cloned into the scan task via [`Clone`]. See [`AppState`]'s
-    /// `ready` field for what the two states change.
+    /// Flip the "initial scan finished" flag. The server binary sets it
+    /// `false` before it spawns the background first scan, and `true` when
+    /// that scan returns (issue 159); the state is cloned into the scan task
+    /// via [`Clone`]. See [`AppState`]'s `ready` field for what the two
+    /// states change.
     pub fn set_ready(&self, ready: bool) {
         self.ready.store(ready, Ordering::Release);
     }
 
-    /// Whether the initial library scan has finished (see [`set_ready`]).
+    /// Whether the initial library scan has finished (see
+    /// [`Self::set_ready`]).
     fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
     }
 }
 
-/// 503 + `Retry-After` for the capability routes while the initial scan is still
-/// running (issue 159). A podcatcher treats 503 as "retry shortly" and keeps the
-/// subscription; a 404 it can treat as "gone". Not routed through [`AppError`] so
-/// it isn't counted as a request failure — it's a readiness state, not an error.
+/// 503 + `Retry-After` for the capability routes while the initial scan is
+/// still running (issue 159). A podcatcher treats 503 as "retry shortly" and
+/// keeps the subscription; it can treat a 404 as "gone". This response is not
+/// routed through [`AppError`], so it does not count as a request failure. It
+/// is a readiness state, not an error.
 fn scanning_unavailable() -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -262,16 +280,16 @@ pub fn router(state: AppState) -> Router {
         .route("/feed/{feed_id}", get(feed))
         .route("/audio/{feed_id}/{number}", get(audio))
         .layer(TraceLayer::new_for_http())
-        // Bounds only response *production* (not the streamed body), so large
-        // audio downloads aren't truncated.
+        // This bounds only response *production* (not the streamed body), so
+        // large audio downloads are not truncated.
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(30),
         ))
-        // Bound in-flight requests (DoS guard); excess requests wait rather than
-        // exhaust resources (NFR-S3, TAD §7).
+        // Bound in-flight requests (DoS guard). Excess requests wait; they do
+        // not exhaust resources (NFR-S3, TAD §7).
         .layer(ConcurrencyLimitLayer::new(MAX_INFLIGHT_REQUESTS))
-        // We accept no request bodies; keep them tiny.
+        // The server accepts no request bodies; keep the limit tiny.
         .layer(RequestBodyLimitLayer::new(16 * 1024))
         .with_state(state)
 }
@@ -287,16 +305,18 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
-/// `GET /feed/{feed_id}.xml` — the route captures `{feed_id}` including the
-/// `.xml` suffix, which we strip before lookup. The capability URL is never
-/// crawlable: an `X-Robots-Tag: noindex` keeps it out of web search engines
-/// (the `itunes:block` in the XML separately keeps it out of podcast directories).
+/// `GET /feed/{feed_id}.xml` — the route captures `{feed_id}` together with
+/// the `.xml` suffix, and the handler strips the suffix before lookup. The
+/// capability URL is never crawlable: an `X-Robots-Tag: noindex` keeps it out
+/// of web search engines, and the `itunes:block` in the XML separately keeps
+/// it out of podcast directories.
 async fn feed(
     State(state): State<AppState>,
     Path(id_xml): Path<String>,
 ) -> Result<Response, AppError> {
-    // Before the first scan completes there is no feed to build yet: answer 503
-    // (retry shortly), never a 404 a podcatcher might treat as gone (issue 159).
+    // Before the first scan completes there is no feed to build yet: answer
+    // 503 (retry shortly), never a 404 that a podcatcher might treat as gone
+    // (issue 159).
     if !state.is_ready() {
         return Ok(scanning_unavailable());
     }
@@ -305,8 +325,8 @@ async fn feed(
         return Err(AppError::NotFound);
     }
     let xml = build_feed_xml(&state, feed_id)?;
-    // Counted after the self-check passes, so the metric means "a subscriber got
-    // a usable feed", not "a request arrived".
+    // The count happens after the self-check passes, so the metric means "a
+    // subscriber got a usable feed", not "a request arrived".
     podspine_metrics::feed_served();
     Ok((
         StatusCode::OK,
@@ -325,8 +345,8 @@ async fn index(
     headers: HeaderMap,
 ) -> Result<Html<String>, AppError> {
     let theme = theme_from_cookie(&headers);
-    // Until the initial scan finishes, hold on a "Scanning…" page rather than
-    // render an empty grid that reads as "no books / broken" (issue 159).
+    // Until the initial scan finishes, hold on a "Scanning…" page. An empty
+    // grid would read as "no books / broken" (issue 159).
     if !state.is_ready() {
         return Ok(Html(scanning_page(theme).into_string()));
     }
@@ -347,9 +367,10 @@ async fn index(
     Ok(Html(index_page(&cards, theme).into_string()))
 }
 
-/// Build the [`BookDetail`] view model the detail pages share: count the book's
-/// episodes and derive the public feed/subscribe URLs from its capability id.
-/// Each handler keeps its own lookup (slug vs `feed_id`) and page template.
+/// Build the [`BookDetail`] view model that the detail pages share: count the
+/// book's episodes and derive the public feed/subscribe URLs from its
+/// capability id. Each handler keeps its own lookup (slug vs `feed_id`) and
+/// page template.
 fn book_detail(state: &AppState, book: BookRow) -> Result<BookDetail, AppError> {
     let episode_count = {
         let index = state.index.lock().map_err(AppError::internal)?;
@@ -391,9 +412,10 @@ async fn book(
     Ok(Html(book_page(&detail, theme).into_string()))
 }
 
-/// `GET /subscribe/{feed_id}` — the "add to a podcast app" helper page (per-app
-/// deep links + QRs). Keyed by capability id: this is what the book-page QR points
-/// at, so an iOS Camera scan lands on real "Open in…" app links, not raw feed XML.
+/// `GET /subscribe/{feed_id}` — the "add to a podcast app" helper page
+/// (per-app deep links + QRs). Keyed by capability id: the book-page QR
+/// points here, so an iOS Camera scan lands on real "Open in…" app links, not
+/// on raw feed XML.
 async fn subscribe(
     State(state): State<AppState>,
     Path(feed_id): Path<String>,
@@ -414,9 +436,10 @@ async fn subscribe(
     Ok(Html(subscribe_page(&detail, theme).into_string()))
 }
 
-/// `POST /book/{slug}/regenerate` — rotate the book's capability `feed_id` (leak
-/// recovery). The old feed/audio/cover URLs 404 immediately. Redirects back to
-/// the book page (PRG) so a refresh doesn't re-submit.
+/// `POST /book/{slug}/regenerate` — rotate the book's capability `feed_id`
+/// (leak recovery). The old feed/audio/cover URLs 404 immediately. The
+/// handler redirects back to the book page (PRG), so a refresh does not
+/// re-submit.
 async fn regenerate(
     State(state): State<AppState>,
     Path(slug): Path<String>,
@@ -442,10 +465,11 @@ async fn regenerate(
 }
 
 /// `POST /theme/{mode}` — persist the visitor's colour theme. `mode` is
-/// `light`/`dark` (sets the `theme` cookie) or `system` (clears it, reverting to
-/// the OS preference). No-JS: the header picker is a form of submit buttons whose
-/// `formaction` posts here; we set the cookie and 303-redirect back (PRG) to the
-/// same-origin page they came from. Same-origin-guarded like [`regenerate`].
+/// `light`/`dark` (sets the `theme` cookie) or `system` (clears the cookie,
+/// which reverts to the OS preference). No JS: the header picker is a form of
+/// submit buttons whose `formaction` posts here. The handler sets the cookie
+/// and 303-redirects back (PRG) to the same-origin page the visitor came
+/// from. It is same-origin-guarded like [`regenerate`].
 async fn set_theme(
     State(state): State<AppState>,
     Path(mode): Path<String>,
@@ -454,20 +478,21 @@ async fn set_theme(
     if !same_origin(&headers, &state.base_url) {
         return Err(AppError::Forbidden);
     }
-    // A year-long, first-party, non-`Secure` (so it also works on a LAN over http)
-    // cosmetic cookie. `SameSite=Lax` still lets the top-level POST navigation set
-    // it. `system` clears the cookie via Max-Age=0.
+    // A year-long, first-party, non-`Secure` cosmetic cookie (non-`Secure` so
+    // that it also works on a LAN over http). `SameSite=Lax` still lets the
+    // top-level POST navigation set it. `system` clears the cookie via
+    // `Max-Age=0`.
     let cookie = match Theme::parse(&mode).cookie_value() {
         Some(value) => format!("theme={value}; Path=/; Max-Age=31536000; SameSite=Lax"),
         None => "theme=; Path=/; Max-Age=0; SameSite=Lax".to_string(),
     };
-    // Redirect back to the page they came from. Take the *path* of the Referer, not
-    // a match against `base_url`: the POST already passed the same-origin guard, so
-    // the Referer is this origin's page, and the browse UI is often on a different
-    // origin than `base_url` (which addresses podcatchers) — comparing against it
-    // would bounce every toggle to `/`. Only a single-slash absolute path is kept,
-    // so a protocol-relative (`//host`) or off-site value can't become an open
-    // redirect.
+    // Redirect back to the page the visitor came from. Take the *path* of the
+    // Referer, not a match against `base_url`. The POST already passed the
+    // same-origin guard, so the Referer is this origin's page. And the browse
+    // UI is often on a different origin than `base_url` (which addresses
+    // podcatchers), so a comparison against it would bounce every toggle to
+    // `/`. Only a single-slash absolute path is kept, so a protocol-relative
+    // (`//host`) or off-site value cannot become an open redirect.
     let back = headers
         .get(header::REFERER)
         .and_then(|v| v.to_str().ok())
@@ -482,21 +507,23 @@ async fn set_theme(
     Ok(resp)
 }
 
-/// `GET /cover/{feed_id}` — the book's cover image, keyed by capability id so it
-/// isn't a guessable catalog-probe surface. Covers are populated by cover
-/// extraction (Task 3.4); until then books have no cover and this 404s. The
-/// stored path is canonicalized and confirmed under the data dir before serving.
+/// `GET /cover/{feed_id}` — the book's cover image, keyed by capability id so
+/// that it is not a guessable catalog-probe surface. Cover extraction
+/// (Task 3.4) populates covers; until then books have no cover and this 404s.
+/// The handler canonicalizes the stored path and confirms it is under the
+/// data dir before it serves the file.
 ///
-/// Cached: an `ETag` (a blake3 hash of the served bytes) plus `Cache-Control` let a
-/// browser revalidate to a bodyless `304` instead of re-downloading the (often
-/// multi-MB) image on every page refresh — the grid pulls many covers at once, so
-/// over a slow link (e.g. Tailscale) that re-download was the bottleneck.
+/// Cached: an `ETag` (a blake3 hash of the served bytes) plus `Cache-Control`
+/// let a browser revalidate to a bodyless `304` instead of a re-download of
+/// the (often multi-MB) image on every page refresh. The grid pulls many
+/// covers at once, so over a slow link (e.g. Tailscale) that re-download was
+/// the bottleneck.
 async fn cover(
     State(state): State<AppState>,
     Path(feed_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    // No covers extracted until the first scan finishes — 503 (retry), not 404.
+    // No covers exist until the first scan finishes: 503 (retry), not 404.
     if !state.is_ready() {
         return Ok(scanning_unavailable());
     }
@@ -508,12 +535,12 @@ async fn cover(
     serve_image(&canonical, &headers).await
 }
 
-/// `GET /cover/{feed_id}/thumb` — a small `cover_thumb.jpg` for the browse UI grid
-/// (the RSS feed and `/cover` keep the full-res image). Serving is read-only: the
-/// scanner generates the thumbnail alongside the cover, and this handler just serves
-/// it. If it hasn't been generated yet (the reconcile backfills a missing one on the
-/// next scan) or generation failed, it falls back to the full cover rather than
-/// 404ing.
+/// `GET /cover/{feed_id}/thumb` — a small `cover_thumb.jpg` for the browse UI
+/// grid (the RSS feed and `/cover` keep the full-res image). Serving is
+/// read-only: the scanner generates the thumbnail alongside the cover, and
+/// this handler only serves it. When the thumbnail is not generated yet (the
+/// reconcile backfills a missing one on the next scan), or generation failed,
+/// the handler falls back to the full cover; it does not 404.
 async fn cover_thumb(
     State(state): State<AppState>,
     Path(feed_id): Path<String>,
@@ -529,16 +556,18 @@ async fn cover_thumb(
     // The full cover is the source of truth (must exist, under the data dir).
     let cover = resolve_under_data_dir(&cover_path, &state.data_dir, &feed_id)?;
 
-    // Prefer the scanner-generated thumbnail sitting next to the cover; fall back to
-    // the full cover if it hasn't been generated yet (the reconcile backfills a
-    // missing one) or generation failed — so a book with art never 404s. Serving is
-    // read-only: generation lives in the scanner (single-threaded, atomic), which is
-    // what keeps a thumbnail consistent with its cover with no cross-thread race.
+    // Prefer the scanner-generated thumbnail next to the cover. Fall back to
+    // the full cover when the thumbnail is not generated yet (the reconcile
+    // backfills a missing one) or generation failed, so a book with art never
+    // 404s. Serving is read-only: generation lives in the scanner
+    // (single-threaded, atomic), and that split keeps a thumbnail consistent
+    // with its cover with no cross-thread race.
     //
-    // Fall back to the cover when the thumbnail *serve* fails too, not just when it
-    // can't be resolved: a re-ingest deletes the old thumb before regenerating it, so
-    // it can vanish between canonicalize and read — the cover is only ever atomically
-    // replaced (never absent), so serving it is always safe.
+    // Fall back to the cover when the thumbnail *serve* fails too, not only
+    // when it cannot be resolved. A re-ingest deletes the old thumb before it
+    // regenerates it, so the thumb can vanish between canonicalize and read.
+    // The cover is only ever atomically replaced (never absent), so serving
+    // it is always safe.
     if let Some(dir) = cover.parent() {
         let thumb = cover_thumb_path(dir);
         if let Ok(canonical) =
@@ -562,13 +591,14 @@ fn book_cover_path(state: &AppState, feed_id: &str) -> Result<String, AppError> 
         .ok_or(AppError::NotFound)
 }
 
-/// The A01 containment check every serve path funnels through (TAD §7):
-/// canonicalize `path` (resolving `..` and symlinks) and confirm the result stays
-/// under the trusted `root`. A path that can't be canonicalized (missing file) or
-/// that resolves outside `root` is rejected as `NotFound` — never a distinct
-/// status, so the rejection is not an existence oracle. `what` names the site in
-/// the operator's log; the client never sees it. `number` is the episode number
-/// when the site has one — it identifies the poisoned row in the warn.
+/// The A01 containment check that every serve path funnels through (TAD §7):
+/// canonicalize `path` (this resolves `..` and symlinks) and confirm that the
+/// result stays under the trusted `root`. A path that cannot be canonicalized
+/// (a missing file), or that resolves outside `root`, is rejected as
+/// `NotFound`. The rejection is never a distinct status, so it is not an
+/// existence oracle. `what` names the site in the operator's log; the client
+/// never sees it. `number` is the episode number when the site has one; it
+/// identifies the poisoned row in the warn.
 fn canonical_under(
     path: &FsPath,
     root: &FsPath,
@@ -587,10 +617,11 @@ fn canonical_under(
     Ok(canonical)
 }
 
-/// Canonicalize a stored image path and confirm it stays under the data dir (a
-/// resolved path that escapes it is rejected as `NotFound`, never served). Fails
-/// with `NotFound` when the file doesn't exist — which the thumbnail handler relies
-/// on to fall back to the full cover.
+/// Canonicalize a stored image path and confirm that it stays under the data
+/// dir. A resolved path that escapes the data dir is rejected as `NotFound`,
+/// never served. This also fails with `NotFound` when the file does not
+/// exist; the thumbnail handler relies on that to fall back to the full
+/// cover.
 fn resolve_under_data_dir(
     path: &str,
     data_dir: &FsPath,
@@ -605,13 +636,13 @@ fn resolve_under_data_dir(
     )
 }
 
-/// Serve an on-disk image with content-addressed caching: an `ETag` (a blake3 hash
-/// of the served bytes) + `Cache-Control`, and a bodyless `304` on a matching
-/// `If-None-Match`, so a browser revalidates cheaply instead of re-downloading the
-/// image on every page refresh. `canonical` is already resolved and confirmed under
-/// the data dir. The ETag is over the exact bytes (not stat metadata), so it can't
-/// advertise a stale validator against a cover that was re-extracted between a stat
-/// and the read.
+/// Serve an on-disk image with content-addressed caching: an `ETag` (a blake3
+/// hash of the served bytes) plus `Cache-Control`, and a bodyless `304` on a
+/// matching `If-None-Match`. A browser then revalidates cheaply instead of a
+/// re-download of the image on every page refresh. `canonical` is already
+/// resolved and confirmed under the data dir. The `ETag` is over the exact
+/// bytes (not stat metadata), so it cannot advertise a stale validator
+/// against a cover that was re-extracted between a stat and the read.
 async fn serve_image(canonical: &FsPath, headers: &HeaderMap) -> Result<Response, AppError> {
     let bytes = tokio::fs::read(canonical)
         .await
@@ -646,43 +677,47 @@ async fn serve_image(canonical: &FsPath, headers: &HeaderMap) -> Result<Response
 
 /// `GET /audio/{feed_id}/{number}` — stream an episode with Range support.
 ///
-/// The `Content-Type` is set explicitly: `axum-range`'s `Ranged` emits
-/// Content-Range/Accept-Ranges/Content-Length but NO Content-Type, and a missing
-/// type makes strict clients (Apple Podcasts / iOS AVPlayer) refuse to play with
-/// "can't be played on this device" — even though the enclosure carries `type=`.
+/// The handler sets the `Content-Type` explicitly. `axum-range`'s `Ranged`
+/// emits Content-Range/Accept-Ranges/Content-Length but NO Content-Type, and
+/// a missing type makes strict clients (Apple Podcasts / iOS `AVPlayer`) refuse
+/// to play with "can't be played on this device", even though the enclosure
+/// carries `type=`.
 async fn audio(
     State(state): State<AppState>,
     Path((feed_id, number)): Path<(String, u32)>,
     range: Option<TypedHeader<Range>>,
 ) -> Result<Response, AppError> {
-    // Episodes aren't materialized until the first scan finishes — 503 (retry),
-    // not 404, so a podcatcher polling an enclosure keeps trying (issue 159).
+    // Episodes are not materialized until the first scan finishes: 503
+    // (retry), not 404, so a podcatcher that polls an enclosure keeps trying
+    // (issue 159).
     if !state.is_ready() {
         return Ok(scanning_unavailable());
     }
-    // The row is snapshotted under the index lock inside the resolver and the lock
-    // is released before any file I/O. A re-ingest that moves this book into
-    // another container (a transcode flag or target flip) can therefore replace the
-    // rows and sweep the old file between that snapshot and the `File::open` below.
-    // Every step from here fails closed, so the request 404s and the client
-    // retries — it can never be served partial or stale-length bytes. See the note
-    // at the sweep in `podspine_scanner::scan_book_as` for why that microsecond
-    // window is left unguarded.
+    // The resolver snapshots the row under the index lock and releases the
+    // lock before any file I/O. A re-ingest that moves this book into another
+    // container (a transcode flag or target flip) can therefore replace the
+    // rows and sweep the old file between that snapshot and the `File::open`
+    // below. Every step from here fails closed, so the request 404s and the
+    // client retries; it can never receive partial or stale-length bytes. See
+    // the note at the sweep in `podspine_scanner::scan_book_as` for why that
+    // microsecond window is left unguarded.
     let target = resolve_audio_target(&state, &feed_id, number)?;
-    // A missing file is regenerated on demand when the resolver supplied a `Regen`
-    // (a `saver` chapter split, or a faststart remux of a whole-file episode);
-    // otherwise (e.g. `full`-mode chapter, in-place whole file) it's a genuine 404.
+    // When the resolver supplied a `Regen` (a `saver` chapter split, or a
+    // faststart remux of a whole-file episode), a missing file is regenerated
+    // on demand. Otherwise (e.g. a `full`-mode chapter, an in-place whole
+    // file) it is a genuine 404.
     if !target.path.exists() {
         match &target.regen {
             Some(regen) => ensure_cached(&state, &target.path, regen).await?,
             None => return Err(AppError::NotFound),
         }
     }
-    // Final defense-in-depth: the file now exists, so canonicalize it (resolving
-    // any symlink) and confirm it still lives under a trusted root before opening
-    // — the data dir (extracted chapters) OR the library root (whole-file
-    // episodes served in place). The resolver already checked the relevant root;
-    // this additionally catches a file that is itself a symlink pointing outside.
+    // Final defense in depth: the file now exists, so canonicalize it (this
+    // resolves any symlink) and confirm that it still lives under a trusted
+    // root before the open. The trusted roots are the data dir (extracted
+    // chapters) OR the library root (whole-file episodes served in place).
+    // The resolver already checked the relevant root; this check additionally
+    // catches a file that is itself a symlink that points outside.
     let path = target.path.canonicalize().map_err(|_| AppError::NotFound)?;
     if !path.starts_with(&state.data_dir) && !path.starts_with(&state.library_dir) {
         tracing::warn!(
@@ -701,9 +736,10 @@ async fn audio(
     Ok(([(header::CONTENT_TYPE, mime)], Ranged::new(range, body)).into_response())
 }
 
-/// Build and self-check the feed XML for a capability `feed_id`. All public URLs
-/// in the feed (self link, enclosures, cover) are built from `feed_id` so the
-/// whole book is reachable from the one capability, and nothing guessable.
+/// Build and self-check the feed XML for a capability `feed_id`. All public
+/// URLs in the feed (self link, enclosures, cover) are built from `feed_id`,
+/// so the whole book is reachable from the one capability, and nothing is
+/// guessable.
 fn build_feed_xml(state: &AppState, feed_id: &str) -> Result<String, AppError> {
     let (book, episodes) = {
         let index = state.index.lock().map_err(AppError::internal)?;
@@ -718,9 +754,9 @@ fn build_feed_xml(state: &AppState, feed_id: &str) -> Result<String, AppError> {
     };
 
     let base = &state.base_url;
-    // Per-book cover served at /cover/{feed_id} when extracted; otherwise a
-    // per-book `.podspine.toml` fallback (Sprint 6.4), then the server-wide one,
-    // then no image at all. See Task 3.4.
+    // The per-book cover is served at `/cover/{feed_id}` when extracted. The
+    // fallbacks, in order: a per-book `.podspine.toml` URL (Sprint 6.4), then
+    // the server-wide one, then no image at all. See Task 3.4.
     let cover_url = book
         .cover_path
         .as_ref()
@@ -754,39 +790,40 @@ fn build_feed_xml(state: &AppState, feed_id: &str) -> Result<String, AppError> {
     })
 }
 
-/// Resolve `(feed_id, episode number)` to a validated on-disk path.
-/// What `/audio` needs: the canonical target file (which may not exist yet in
-/// `saver` mode) and, in `saver` mode, everything to regenerate it on demand.
-/// Whether a book's effective storage mode is `saver`: its per-book
-/// `.podspine.toml` override (Sprint 6.4) if set, else the server default. A
-/// `None` is a pre-6.4 row that follows the server config until re-scanned.
 /// Whether this book's episodes were **re-encoded** at ingest (Task 5.2).
 ///
-/// A re-encode is not byte-reproducible across ffmpeg builds, so such an episode
-/// must never be regenerated on demand (the rebuilt file's length could no longer
-/// match the `enclosure length` already published in the feed) and must never be
-/// evicted (nothing could rebuild it). Both callers below therefore treat a
-/// transcoded book as `full`, whatever its `storage_mode` says. `None` is a
-/// pre-5.2 row, which was necessarily stream-copied.
+/// A re-encode is not byte-reproducible across ffmpeg builds. So such an
+/// episode must never be regenerated on demand (the rebuilt file's length
+/// could no longer match the `enclosure length` already published in the
+/// feed), and it must never be evicted (nothing could rebuild it). Both
+/// callers below therefore treat a transcoded book as `full`, independent of
+/// its `storage_mode`. `None` is a pre-5.2 row, which was necessarily
+/// stream-copied.
 fn book_is_transcoded(book: &BookRow) -> bool {
     book.transcode.is_some_and(TranscodeMode::is_on)
 }
 
+/// Whether a book's effective storage mode is `saver`: its per-book
+/// `.podspine.toml` override (Sprint 6.4) if set, else the server default.
+/// `None` is a pre-6.4 row that follows the server config until it is
+/// re-scanned.
 fn book_is_saver(book: &BookRow, global: StorageMode) -> bool {
     book.storage_mode.unwrap_or(global) == StorageMode::Saver
 }
 
+/// What `/audio` needs: the canonical target file (which may not exist yet in
+/// `saver` mode) and, in `saver` mode, everything to regenerate it on demand.
 struct AudioTarget {
     path: PathBuf,
     regen: Option<Regen>,
 }
 
-/// Inputs to regenerate one cache file on demand — a `saver` chapter split, or a
-/// faststart remux of a whole-file episode (Sprint 6.3). The source is always a
-/// canonicalized file asserted to live under the library root — both arms of
-/// [`resolve_audio_target`] validate before constructing this, so nothing that
-/// reaches ffmpeg can have escaped. The op decides which ffmpeg call rebuilds the
-/// deterministic output.
+/// Inputs to regenerate one cache file on demand: a `saver` chapter split, or
+/// a faststart remux of a whole-file episode (Sprint 6.3). The source is
+/// always a canonicalized file asserted to live under the library root. Both
+/// arms of [`resolve_audio_target`] validate before they construct this, so
+/// nothing that reaches ffmpeg can have escaped. The op decides which ffmpeg
+/// call rebuilds the deterministic output.
 struct Regen {
     source: PathBuf,
     out_dir: PathBuf,
@@ -797,28 +834,30 @@ struct Regen {
 /// Which ffmpeg operation regenerates the cache file.
 #[derive(Clone)]
 enum RegenOp {
-    /// Re-split one chapter (`saver` mode) — a sub-range of the container.
+    /// Re-split one chapter (`saver` mode): a sub-range of the container.
     Chapter(ChapterCut),
     /// Remux a whole file to faststart (`PODSPINE_REMUX_NON_FASTSTART`).
     Faststart { idx: usize, duration_sec: f64 },
 }
 
-/// Resolve `/audio/{feed_id}/{number}` to its on-disk target. Three path-safe
-/// shapes, by whether the episode is a whole file (and how it's stored):
+/// Resolve `/audio/{feed_id}/{number}` to its on-disk target. There are three
+/// path-safe shapes, by whether the episode is a whole file (and how it is
+/// stored):
 ///
-/// - **In place (whole-file episode, `file_path == source_path`):** a whole file
-///   streamed from the library — canonicalized, asserted under the library root,
-///   and size-checked against the recorded length (Sprint 6.2).
-/// - **Faststart remux (whole-file episode, `file_path != source_path`):** the
-///   served file is a cache copy under the data dir; it's regenerated on demand by
-///   remuxing the library source to faststart (Sprint 6.3), so the resolver returns
-///   a [`Regen`] carrying [`RegenOp::Faststart`].
+/// - **In place (whole-file episode, `file_path == source_path`):** a whole
+///   file streamed from the library. It is canonicalized, asserted under the
+///   library root, and size-checked against the recorded length (Sprint 6.2).
+/// - **Faststart remux (whole-file episode, `file_path != source_path`):**
+///   the served file is a cache copy under the data dir. A remux of the
+///   library source to faststart regenerates it on demand (Sprint 6.3), so
+///   the resolver returns a [`Regen`] that carries [`RegenOp::Faststart`].
 /// - **Extracted (chaptered episode):** the path is reconstructed from the
-///   canonical `data_dir` plus **opaque DB keys** (`book.id`, chapter index) and a
-///   validated audio extension — never built from request input — so it stays
-///   under the data dir by construction (no traversal). In `saver` mode it's
-///   regenerated on demand ([`RegenOp::Chapter`]); existence is not required —
-///   unless the book was transcoded (Task 5.2), which is never regenerated.
+///   canonical `data_dir` plus **opaque DB keys** (`book.id`, chapter index)
+///   and a validated audio extension. It is never built from request input,
+///   so it stays under the data dir by construction (no traversal). In
+///   `saver` mode a chapter split regenerates it on demand
+///   ([`RegenOp::Chapter`]), and existence is not required — unless the book
+///   was transcoded (Task 5.2); a transcoded book is never regenerated.
 fn resolve_audio_target(
     state: &AppState,
     feed_id: &str,
@@ -844,21 +883,24 @@ fn resolve_audio_target(
         (book, ep)
     };
 
-    // Serve-in-place (Sprint 6.2): a whole-file episode streamed directly from the
-    // read-only library — never copied under the data dir. Recognized by a
-    // non-empty `source_path` whose value equals `file_path` (a whole-file episode
-    // whose `file_path != source_path` was remuxed to a faststart cache copy and
-    // is handled by the data-dir path below). Three guards, all 404 on failure:
-    //   1. canonicalize + assert under the library root (reject `..`/symlink
-    //      escape) — the A01 "assert under the library root" rule (TAD §7);
-    //   2. the recorded enclosure length must equal the on-disk source size —
+    // Serve-in-place (Sprint 6.2): a whole-file episode streamed directly
+    // from the read-only library, never copied under the data dir. It is
+    // recognized by a non-empty `source_path` whose value equals `file_path`.
+    // (A whole-file episode whose `file_path != source_path` was remuxed to a
+    // faststart cache copy; the data-dir path below handles it.) Two guards,
+    // both 404 on failure:
+    //   1. Canonicalize and assert under the library root (reject a `..` or
+    //      symlink escape): the A01 "assert under the library root" rule
+    //      (TAD §7).
+    //   2. The recorded enclosure length must equal the on-disk source size:
     //      the WHOLE-FILE invariant. A chaptered episode (a sub-range) that
-    //      wrongly carries a `source_path` from a bad migration / partial rescan
-    //      / manual edit has a chapter-sized `byte_length` ≠ the container size,
-    //      so it's rejected here instead of serving the full container's bytes
-    //      under the chapter's enclosure length.
-    // Returns before the data-dir/regeneration logic below, so a poisoned row can
-    // never fall through into it.
+    //      wrongly carries a `source_path` (from a bad migration, a partial
+    //      rescan, or a manual edit) has a chapter-sized `byte_length` that
+    //      differs from the container size. It is rejected here; the full
+    //      container's bytes are never served under the chapter's enclosure
+    //      length.
+    // This branch returns before the data-dir/regeneration logic below, so a
+    // poisoned row can never fall through into it.
     if !ep.source_path.is_empty() && ep.file_path == ep.source_path {
         let src = canonical_under(
             FsPath::new(&ep.source_path),
@@ -884,20 +926,22 @@ fn resolve_audio_target(
         });
     }
 
-    // The container extension is the audio ext the scanner recorded; reject
-    // anything non-alphanumeric so it can never introduce a path separator.
+    // The container extension is the audio extension the scanner recorded.
+    // Reject anything non-alphanumeric, so that it can never introduce a path
+    // separator.
     let out_ext = FsPath::new(&ep.file_path)
         .extension()
         .and_then(|e| e.to_str())
         .map(str::to_ascii_lowercase)
         .filter(|e| !e.is_empty() && e.chars().all(|c| c.is_ascii_alphanumeric()))
         .ok_or(AppError::NotFound)?;
-    // Defense-in-depth, at runtime (not a debug_assert that vanishes in release):
-    // resolve the book dir and confirm it stays under the canonical data dir
-    // before anything is opened or written. The components are opaque DB keys,
-    // but a poisoned row must never let a path escape. The chapter file itself
-    // may not exist yet (saver), so canonicalize the parent dir; a book dir that
-    // doesn't exist (never ingested) is a clean 404.
+    // Defense in depth, at runtime (not a debug_assert that vanishes in
+    // release): resolve the book dir and confirm that it stays under the
+    // canonical data dir before anything is opened or written. The components
+    // are opaque DB keys, but a poisoned row must never let a path escape.
+    // The chapter file itself may not exist yet (saver), so canonicalize the
+    // parent dir. A book dir that does not exist (never ingested) is a clean
+    // 404.
     let out_dir = state
         .data_dir
         .join("books")
@@ -912,13 +956,14 @@ fn resolve_audio_target(
 
     // Two kinds of episode materialize under the data dir here:
     let regen = if !ep.source_path.is_empty() && ep.needs_faststart {
-        // A non-faststart whole-file episode remuxed to a faststart cache copy
-        // (Sprint 6.3, `file_path != source_path`). Regenerate it on demand from
-        // the library source — always, independent of storage_mode. The
-        // `needs_faststart` gate means a chaptered row that merely carries a stray
-        // `source_path` is NOT remuxed into its container here; it drops to the
-        // chaptered arm and serves its actual split (or 404s). Validate the source
-        // stays under the library root first (the A01 rule), 404 on escape.
+        // A non-faststart whole-file episode remuxed to a faststart cache
+        // copy (Sprint 6.3, `file_path != source_path`). Regenerate it on
+        // demand from the library source: always, independent of
+        // `storage_mode`. The `needs_faststart` gate means a chaptered row
+        // that merely carries a stray `source_path` is NOT remuxed into its
+        // container here; it drops to the chaptered arm and serves its actual
+        // split (or 404s). Validate first that the source stays under the
+        // library root (the A01 rule); 404 on escape.
         let src = canonical_under(
             FsPath::new(&ep.source_path),
             &state.library_dir,
@@ -939,16 +984,18 @@ fn resolve_audio_target(
         && !book_is_transcoded(&book)
         && FsPath::new(&book.source_path).is_file()
     {
-        // A chaptered episode. Regen is possible only in `saver` mode (per-book,
-        // Sprint 6.4) when the book's source is a single file to re-split; the
-        // `is_file` guard is belt-and-suspenders (a directory source would make
-        // `ffmpeg <directory>` fail), so a missing file is a clean 404, not a 500.
+        // A chaptered episode. Regen is possible only in `saver` mode
+        // (per-book, Sprint 6.4) when the book's source is a single file to
+        // re-split. The `is_file` guard is belt-and-suspenders (a directory
+        // source would make `ffmpeg <directory>` fail), and a missing file is
+        // a clean 404, not a 500.
         //
-        // Same A01 containment rule as the remux arm above: `book.source_path` is
-        // an opaque DB value, so canonicalize it and assert it stays under the
-        // library root before it can reach ffmpeg. Checked here rather than at
-        // regen time so a poisoned row is rejected before anything is opened or
-        // written — including when the cached chapter happens to already exist.
+        // The same A01 containment rule as the remux arm above applies:
+        // `book.source_path` is an opaque DB value, so canonicalize it and
+        // assert that it stays under the library root before it can reach
+        // ffmpeg. The check runs here, not at regen time, so that a poisoned
+        // row is rejected before anything is opened or written — including
+        // when the cached chapter happens to already exist.
         let src = canonical_under(
             FsPath::new(&book.source_path),
             &state.library_dir,
@@ -960,12 +1007,14 @@ fn resolve_audio_target(
             source: src,
             out_dir,
             out_ext,
-            // `end_sec` is reconstructed as start + duration. This is EXACT, not an
-            // approximation: the scanner stores `duration_sec = cut.end - cut.start`
-            // (the requested cut length, not a measured output duration), so this
-            // yields the same `[start, end)` the ingest split used — and ffmpeg's
-            // 6-decimal arg formatting absorbs any float round-trip. The stream
-            // copy is therefore byte-identical (asserted in the serve test).
+            // `end_sec` is reconstructed as start + duration. This is EXACT,
+            // not an approximation: the scanner stores
+            // `duration_sec = cut.end - cut.start` (the requested cut length,
+            // not a measured output duration), so this yields the same
+            // `[start, end)` that the ingest split used. And ffmpeg's
+            // 6-decimal arg formatting absorbs any float round-trip. The
+            // stream copy is therefore byte-identical (asserted in the serve
+            // test).
             op: RegenOp::Chapter(ChapterCut {
                 idx: idx as usize,
                 start_sec: ep.start_sec,
@@ -978,10 +1027,10 @@ fn resolve_audio_target(
     Ok(AudioTarget { path, regen })
 }
 
-/// Ensure `target` exists, regenerating it on demand: a `saver` chapter split, or
-/// a whole-file faststart remux (Sprint 6.3). A per-path single-flight lock means
-/// concurrent requests for the same uncached file run ffmpeg once; the blocking
-/// ffmpeg work runs off the async runtime.
+/// Ensure that `target` exists; regenerate it on demand (a `saver` chapter
+/// split, or a whole-file faststart remux, Sprint 6.3). A per-path
+/// single-flight lock means concurrent requests for the same uncached file
+/// run ffmpeg once. The blocking ffmpeg work runs off the async runtime.
 async fn ensure_cached(state: &AppState, target: &FsPath, regen: &Regen) -> Result<(), AppError> {
     let lock = {
         let mut map = state.inflight.lock().map_err(AppError::internal)?;
@@ -992,7 +1041,8 @@ async fn ensure_cached(state: &AppState, target: &FsPath, regen: &Regen) -> Resu
     let _guard = lock.lock().await;
 
     let outcome = async {
-        // A concurrent request may have produced it while we waited on the lock.
+        // A concurrent request may have produced the file during the wait on
+        // the lock.
         if target.exists() {
             return Ok(());
         }
@@ -1018,40 +1068,45 @@ async fn ensure_cached(state: &AppState, target: &FsPath, regen: &Regen) -> Resu
         .map_err(AppError::internal)?
         .map_err(AppError::internal)?;
 
-        // Keep the cache under its cap/TTL, never evicting what we just produced.
+        // Keep the cache under its cap/TTL; never evict the file just
+        // produced.
         enforce_cache(state, target).await;
         Ok(())
     }
     .await;
 
-    // Drop the single-flight entry so the map stays bounded to *in-flight*
-    // regenerations, not every chapter ever served. Any waiter still blocked on
-    // `.lock()` holds its own `Arc` clone of this same mutex, and every path
-    // re-checks `target.exists()` after acquiring it, so removing the map entry
-    // here can never cause a duplicate ffmpeg run.
+    // Drop the single-flight entry, so that the map stays bounded to
+    // *in-flight* regenerations, not every chapter ever served. Any waiter
+    // still blocked on `.lock()` holds its own `Arc` clone of this same
+    // mutex, and every path re-checks `target.exists()` after it acquires the
+    // lock. So the removal of the map entry here can never cause a duplicate
+    // ffmpeg run.
     if let Ok(mut map) = state.inflight.lock() {
         map.remove(target);
     }
     outcome
 }
 
-/// Evict cached chapter files to keep the `saver` cache under its size cap and
-/// TTL; `keep` (the file we just served) is never evicted. No-op when both
-/// limits are unset. Best-effort — eviction never fails a request.
+/// Evict cached chapter files to keep the `saver` cache under its size cap
+/// and TTL. `keep` (the file just served) is never evicted. This is a no-op
+/// when both limits are unset. It is best-effort: eviction never fails a
+/// request.
 async fn enforce_cache(state: &AppState, keep: &FsPath) {
     let (cap, ttl) = (state.cache_size_bytes, state.cache_ttl);
     if cap.is_none() && ttl.is_none() {
         return; // unbounded + no TTL: nothing to evict
     }
     let books = state.data_dir.join("books");
-    // Evict only from **effective-`saver`, single-file-source, stream-copied**
-    // books (per-book storage_mode, Sprint 6.4): their cached chapters re-split on
-    // demand, so deleting one is safe. A transcoded book (Task 5.2) is excluded —
-    // nothing regenerates a re-encode, so evicting it would 404 until a rescan. A `full` book's chapters are kept — evicting them
-    // would 404 (no regen) — and a non-single-file book (MP3 folder) is served in
-    // place, so those dirs are left alone. (A `full` book's remux cache, if any,
-    // therefore persists — a minor, safe over-conservatism.) Snapshot the sources
-    // without holding the lock across the `is_file` stats.
+    // Evict only from **effective-`saver`, single-file-source,
+    // stream-copied** books (per-book `storage_mode`, Sprint 6.4): their
+    // cached chapters re-split on demand, so a delete is safe. A transcoded
+    // book (Task 5.2) is excluded: nothing regenerates a re-encode, so an
+    // eviction would 404 until a rescan. A `full` book's chapters are kept:
+    // an eviction would 404 (no regen). A non-single-file book (MP3 folder)
+    // is served in place, so those dirs are left alone. (A `full` book's
+    // remux cache, if any, therefore persists: a minor, safe
+    // over-conservatism.) Snapshot the sources without the lock held across
+    // the `is_file` stats.
     let sources: Vec<(String, bool)> = {
         let Ok(index) = state.index.lock() else {
             tracing::warn!("cache eviction skipped: index lock poisoned");
@@ -1087,11 +1142,12 @@ async fn enforce_cache(state: &AppState, keep: &FsPath) {
 }
 
 /// Collect cached chapter files (numeric stems under `books/*/`) from
-/// **regenerable** books only, drop TTL-expired ones, then delete oldest-first
-/// until under `cap`. mtime is the LRU key: regenerating a chapter refreshes it.
-/// Non-regenerable book dirs (a directory-source book, or a legacy pre-6.2 copy)
-/// are skipped entirely so nothing that can't be rebuilt is destroyed. Best-effort;
-/// per-file I/O errors are ignored.
+/// **regenerable** books only. Drop TTL-expired ones. Then delete
+/// oldest-first until the total is under `cap`. The mtime is the LRU key: a
+/// chapter regeneration refreshes it. Non-regenerable book dirs (a
+/// directory-source book, or a legacy pre-6.2 copy) are skipped entirely, so
+/// nothing that cannot be rebuilt is destroyed. Best-effort; per-file I/O
+/// errors are ignored.
 fn evict(
     books_dir: &FsPath,
     cap: Option<u64>,
@@ -1116,7 +1172,8 @@ fn evict(
         };
         for e in entries.flatten() {
             let p = e.path();
-            // Only chapter files (`001.m4a`-style, numeric stem): skips covers.
+            // Only chapter files (`001.m4a`-style, numeric stem); this skips
+            // covers.
             let numeric = p
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -1187,7 +1244,7 @@ fn image_mime(path: &str) -> &'static str {
     }
 }
 
-/// Handler error — maps to a status code and never leaks internals.
+/// Handler error. It maps to a status code and never leaks internals.
 #[derive(Debug)]
 enum AppError {
     NotFound,
@@ -1196,8 +1253,8 @@ enum AppError {
 }
 
 impl AppError {
-    /// Collapse any error into `Internal`, logging the detail — the client sees
-    /// only a 500, but the operator gets the cause.
+    /// Collapse any error into `Internal` and log the detail. The client sees
+    /// only a 500; the operator gets the cause.
     fn internal<E: std::fmt::Display>(e: E) -> Self {
         tracing::error!(error = %e, "internal error");
         AppError::Internal
@@ -1236,9 +1293,9 @@ mod tests {
         assert_eq!(mime_for("/x/blob"), "audio/mp4");
     }
 
-    /// `evict` deletes files — pin its guard branches directly: a regenerable
-    /// book dir that vanished, a directory entry with a numeric stem, a
-    /// non-regenerable sibling, the under-cap early return, and the
+    /// `evict` deletes files, so pin its guard branches directly: a
+    /// regenerable book dir that vanished, a directory entry with a numeric
+    /// stem, a non-regenerable sibling, the under-cap early return, and the
     /// stop-once-under-cap break.
     #[test]
     fn evict_edge_branches() {
@@ -1289,10 +1346,10 @@ mod tests {
         );
     }
 
-    /// Eviction is best-effort and must never panic or fail a request — fault-
-    /// inject both abandon paths: a database failure (the `book` table dropped
-    /// out from under a live [`Index`] by a second connection) and a poisoned
-    /// index lock. Each returns quietly after logging a warn.
+    /// Eviction is best-effort and must never panic or fail a request. The
+    /// test fault-injects both abandon paths: a database failure (a second
+    /// connection drops the `book` table out from under a live [`Index`]) and
+    /// a poisoned index lock. Each returns quietly after it logs a warn.
     #[tokio::test]
     async fn enforce_cache_survives_a_broken_index_and_a_poisoned_lock() {
         let dir = scratch("http-enforce-cache-faults");
@@ -1372,7 +1429,8 @@ mod tests {
             transcode,
         };
         let saver = Some(StorageMode::Saver);
-        // A re-encode can't be rebuilt byte-for-byte, so `saver` must not apply.
+        // A re-encode cannot be rebuilt byte-for-byte, so `saver` must not
+        // apply.
         assert!(book_is_transcoded(&mk(saver, Some(TranscodeMode::Aac))));
         assert!(book_is_transcoded(&mk(saver, Some(TranscodeMode::Mp3))));
         // Stream-copied books (and pre-5.2 rows) stay regenerable.
@@ -1434,8 +1492,9 @@ mod tests {
 
     #[test]
     fn referer_path_extracts_path_and_blocks_open_redirect() {
-        // Absolute URLs → their path+query, regardless of host/port (so a UI origin
-        // that differs from base_url still returns home to the right page).
+        // An absolute URL gives its path+query, independent of host/port (so
+        // a UI origin that differs from `base_url` still returns to the right
+        // page).
         assert_eq!(
             referer_path("http://192.168.1.5:8080/book/dracula").as_deref(),
             Some("/book/dracula")
@@ -1444,9 +1503,9 @@ mod tests {
             referer_path("https://podspine.example/subscribe/x?y=1").as_deref(),
             Some("/subscribe/x?y=1")
         );
-        // An absolute URL with no path → root.
+        // An absolute URL with no path gives the root.
         assert_eq!(referer_path("http://host").as_deref(), Some("/"));
-        // Already a bare path is accepted.
+        // A bare path is accepted as-is.
         assert_eq!(referer_path("/book/x").as_deref(), Some("/book/x"));
         // Open-redirect vectors are rejected (caller falls back to `/`).
         assert_eq!(referer_path("http://evil.com//evil.com/x"), None);
@@ -1478,7 +1537,8 @@ mod tests {
             &with("origin", "http://host:8087"),
             "http://host:8087/sub"
         ));
-        // Non-browser client (no headers) is allowed — no ambient auth to abuse.
+        // A non-browser client (no headers) is allowed; it has no ambient auth
+        // to abuse.
         assert!(same_origin(&HeaderMap::new(), base));
     }
 
@@ -1526,7 +1586,7 @@ mod tests {
         touch(&bk.join("cover.jpg"), 500); // non-numeric stem: never a cache file
         let keep = bk.join("003.m4a");
 
-        // Cap 150B: with `keep` (100B) protected, older chapters are evicted.
+        // Cap 150B: `keep` (100B) is protected, so older chapters are evicted.
         evict(&books, Some(150), None, &keep, &regen_set(&[&bk]));
 
         assert!(keep.exists(), "the just-served file is kept");
@@ -1576,7 +1636,7 @@ mod tests {
 
     #[test]
     fn evict_tolerates_a_missing_books_dir() {
-        // Top-level read_dir fails -> clean no-op, no panic.
+        // A failed top-level read_dir is a clean no-op, not a panic.
         evict(
             FsPath::new("/no/such/podspine/books"),
             Some(1),
@@ -1588,10 +1648,11 @@ mod tests {
 
     #[test]
     fn evict_never_touches_non_regenerable_books() {
-        // A regenerable (single-file-source) book and a non-regenerable book dir
-        // (a directory source — e.g. an MP3 folder, or a legacy pre-6.2 copy).
-        // Only the regenerable one may be evicted; the non-regenerable files must
-        // survive even a tiny cap (Greptile P1) — nothing would rebuild them.
+        // A regenerable (single-file-source) book and a non-regenerable book
+        // dir (a directory source, e.g. an MP3 folder, or a legacy pre-6.2
+        // copy). Only the regenerable one may be evicted. The non-regenerable
+        // files must survive even a tiny cap (Greptile P1): nothing would
+        // rebuild them.
         let dir = scratch("evict-mp3safe");
         let books = dir.join("books");
         let split = books.join("splitbook"); // regenerable
@@ -1632,10 +1693,10 @@ mod tests {
 
     #[test]
     fn internal_swallows_the_source_error() {
-        // `AppError::internal` is what every `.map_err(..)` on the request path
-        // funnels through: whatever the underlying error was — a poisoned mutex,
-        // a rusqlite failure — it must collapse to a bare Internal, so no
-        // filesystem path or SQL text can reach the client.
+        // `AppError::internal` is what every `.map_err(..)` on the request
+        // path funnels through. Whatever the underlying error was (a poisoned
+        // mutex, a rusqlite failure), it must collapse to a bare `Internal`,
+        // so that no filesystem path or SQL text can reach the client.
         let from_io = AppError::internal(std::io::Error::other("secret /srv/path detail"));
         assert!(matches!(from_io, AppError::Internal));
         assert_eq!(

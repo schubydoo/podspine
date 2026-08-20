@@ -1,11 +1,12 @@
 name: Scorecard
 
-# OpenSSF Scorecard — repository-level security best-practices audit. Runs on
-# branch_protection_rule (so ruleset changes trigger a re-evaluation), a weekly
-# schedule, and pushes to main. Intentionally NOT a required check: it never runs
-# on pull_request, so requiring it would leave every PR perpetually pending. The
-# signal lives in the Security tab (Code scanning → Scorecard) and at
-# scorecard.dev once publish_results is enabled.
+# OpenSSF Scorecard: a repository-level security best-practices audit. It
+# runs on branch_protection_rule (ruleset changes then trigger a
+# re-evaluation), on a weekly schedule, and on pushes to main. It is
+# intentionally NOT a required check: it never runs on pull_request, so a
+# requirement on it would leave every PR perpetually pending. The signal
+# lives in the Security tab (Code scanning → Scorecard) and at scorecard.dev
+# once publish_results is enabled.
 #
 # NOTE: action refs are pinned to full commit SHAs (the repo's Actions policy
 # requires it; also satisfies Scorecard Pinned-Dependencies); Renovate keeps them current.
@@ -38,13 +39,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # podspine-ci App token as Scorecard's repo_token: the Branch-Protection check
-      # needs administration:read (the default GITHUB_TOKEN can't read branch rules,
-      # so that check scores 0 / inconclusive). Sourcing it from the App also lifts
-      # the API budget to >=5,000/hr. Requires the App to be granted
-      # `administration: read`. Soft-fail: until the App secrets exist the mint
-      # yields an empty token and Scorecard falls back to GITHUB_TOKEN (Branch-
-      # Protection stays inconclusive, as it is today) rather than failing the run.
+      # podspine-ci App token as Scorecard's repo_token: the Branch-Protection
+      # check needs administration:read (the default GITHUB_TOKEN cannot read
+      # branch rules, so that check scores 0 / inconclusive). The App source
+      # also lifts the API budget to >=5,000/hr. This requires the App to be
+      # granted `administration: read`. Soft-fail: until the App secrets
+      # exist, the mint yields an empty token, and Scorecard falls back to
+      # GITHUB_TOKEN (Branch-Protection stays inconclusive, as it is today);
+      # the run does not fail.
       - name: Mint podspine-ci App token
         id: app-token
         continue-on-error: true

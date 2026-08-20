@@ -6,9 +6,9 @@ set -euo pipefail
 #
 #   curl -fsSL https://raw.githubusercontent.com/schubydoo/podspine/main/uninstall.sh | bash
 #
-# Removes the `podspine` binary installed by install.sh. It does NOT touch your
-# audiobook library or any data directory you passed to `--data-dir` — delete
-# those yourself if you want them gone.
+# This removes the `podspine` binary that install.sh installed. It does NOT
+# touch your audiobook library or any data directory you passed to
+# `--data-dir`. Delete those yourself if you want them gone.
 #
 # Environment overrides:
 #   PODSPINE_INSTALL_DIR   directory to remove from; default: ~/.local/bin
@@ -30,8 +30,9 @@ have() { command -v "$1" >/dev/null 2>&1; }
 dir="${PODSPINE_INSTALL_DIR:-${HOME}/.local/bin}"
 dest="${dir}/${TOOL_NAME}"
 
-# If it isn't where we'd install it, try to find it on PATH so we can point the
-# user at whatever they actually have (e.g. a brew/cargo copy we shouldn't touch).
+# If the binary is not at the default install path, try to find it on PATH,
+# so that the message can point the user at whatever they actually have
+# (e.g. a brew/cargo copy this script must not touch).
 if [ ! -e "$dest" ]; then
     warn "No ${TOOL_NAME} binary at ${dest}."
     if found="$(command -v "$TOOL_NAME" 2>/dev/null)"; then

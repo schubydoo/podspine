@@ -6,8 +6,9 @@
 //! - **Sequential `<pubDate>`, oldest = chapter 1.** Dates are anchored to the
 //!   source mtime and stepped so every episode lands in the past and pubDates are
 //!   strictly increasing with chapter order.
-//! - **Stable `<guid>`** = `blake3(book.id : idx : source_mtime)` — stable across
-//!   re-runs of an unchanged source; changes only when the source mtime changes.
+//! - **Stable `<guid>`** = `blake3(book.id : idx : source_mtime)`. It is
+//!   stable across re-runs of an unchanged source; it changes only when the
+//!   source mtime changes.
 //! - Every item carries `<itunes:episode>`, `<itunes:duration>` (`HH:MM:SS`) and
 //!   an `<enclosure>` whose `length` is the **real** output byte size.
 //!
@@ -24,8 +25,8 @@ pub mod selfcheck;
 
 const PODCAST_NS: &str = "https://podcastindex.org/namespace/1.0";
 
-/// Seconds between successive episode pubDates. Only the *ordering* matters to
-/// podcast apps; the spacing just keeps the dates visibly distinct.
+/// Seconds between successive episode pubDates. Only the *ordering* matters
+/// to podcast apps; the spacing only keeps the dates visibly distinct.
 const PUBDATE_STEP_SECS: i64 = 60;
 
 /// One episode's inputs to the feed.
@@ -37,7 +38,7 @@ pub struct FeedEpisode {
     pub title: String,
     /// Absolute URL to the audio file (the `<enclosure>` url).
     pub audio_url: String,
-    /// Real output size in bytes — the `<enclosure>` `length`.
+    /// Real output size in bytes: the `<enclosure>` `length`.
     pub byte_length: u64,
     /// Episode duration in seconds.
     pub duration_sec: f64,
@@ -48,7 +49,7 @@ pub struct FeedEpisode {
 /// One book's inputs to the feed.
 #[derive(Debug, Clone)]
 pub struct FeedBook {
-    /// Opaque, stable book id — part of each episode guid.
+    /// Opaque, stable book id: part of each episode guid.
     pub id: String,
     /// Feed/channel title.
     pub title: String,
@@ -58,7 +59,8 @@ pub struct FeedBook {
     pub description: Option<String>,
     /// Cover image URL (`itunes:image`, per-item and channel-level).
     pub cover_url: Option<String>,
-    /// Source file mtime (epoch seconds) — pubDate anchor + guid material.
+    /// Source file mtime (epoch seconds): the pubDate anchor and guid
+    /// material.
     pub source_mtime: i64,
     /// The feed's own URL (channel `<link>`).
     pub self_url: String,
@@ -83,9 +85,10 @@ pub fn format_itunes_duration(secs: f64) -> String {
     format!("{h:02}:{m:02}:{s:02}")
 }
 
-/// pubDate epoch for episode `idx` of `n`, anchored so the last episode sits at
-/// `anchor` and earlier ones step backwards — i.e. every date is `<= anchor`
-/// (in the past) and strictly increasing with `idx` (chapter 1 oldest).
+/// pubDate epoch for episode `idx` of `n`, anchored so that the last episode
+/// sits at `anchor` and earlier ones step backwards. So every date is
+/// `<= anchor` (in the past) and strictly increases with `idx` (chapter 1 is
+/// the oldest).
 ///
 /// Public so the scanner can persist the same value it would render, keeping the
 /// index and the feed in agreement.
@@ -109,7 +112,8 @@ fn format_rfc2822(epoch: i64) -> String {
 }
 
 /// Build the RSS [`Channel`] for a book. Items are emitted in chapter order
-/// (oldest first); ordering guarantees come from pubDate + `itunes:episode`.
+/// (oldest first); the ordering guarantees come from pubDate and
+/// `itunes:episode`.
 pub fn build_channel(book: &FeedBook) -> Channel {
     let n = book.episodes.len();
 
@@ -159,12 +163,13 @@ pub fn build_channel(book: &FeedBook) -> Channel {
     ch_it.set_author(book.author.clone());
     ch_it.set_image(book.cover_url.clone());
     ch_it.set_summary(book.description.clone());
-    // Feeds are private capability URLs — always ask directories not to list them.
+    // Feeds are private capability URLs. Always ask directories not to list
+    // them.
     ch_it.set_block(Some("Yes".to_string()));
     channel.set_itunes_ext(Some(ch_it));
 
-    // The rss crate emits xmlns:itunes automatically when itunes_ext is set; we
-    // only need to declare the podcast namespace here.
+    // The rss crate emits xmlns:itunes automatically when itunes_ext is set;
+    // only the podcast namespace needs a declaration here.
     let mut ns = BTreeMap::new();
     ns.insert("podcast".to_string(), PODCAST_NS.to_string());
     channel.set_namespaces(ns);
@@ -178,9 +183,9 @@ pub fn render(book: &FeedBook) -> String {
     build_channel(book).to_string()
 }
 
-/// Build, self-check, and render a book's feed — returning the XML only if the
-/// feed passes [`selfcheck::check`]. This is the entry point the server should
-/// use so a broken feed is never served.
+/// Build, self-check, and render a book's feed. Return the XML only when the
+/// feed passes [`selfcheck::check`]. This is the entry point for the server,
+/// so that a broken feed is never served.
 pub fn render_checked(book: &FeedBook) -> Result<String, Vec<selfcheck::SelfCheckError>> {
     let channel = build_channel(book);
     selfcheck::check(&channel)?;

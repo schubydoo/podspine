@@ -1,9 +1,10 @@
-# ClusterFuzzLite — weekly corpus PRUNE + COVERAGE report (maintenance for the
-# daily cflite_batch). Prune minimizes the persisted corpus (drops inputs adding
-# no coverage); coverage replays the whole corpus and pushes an HTML line-coverage
-# report to the corpus repo's gh-pages branch — showing exactly which parser code
-# the fuzzers reach (0% = a harness is owed). Both reuse the storage-repo +
-# FUZZ_STORAGE_TOKEN. NOT required checks. Docs: https://google.github.io/clusterfuzzlite/
+# ClusterFuzzLite: the weekly corpus PRUNE + COVERAGE report (maintenance
+# for the daily cflite_batch). Prune minimizes the persisted corpus (it drops
+# inputs that add no coverage). Coverage replays the whole corpus and pushes
+# an HTML line-coverage report to the corpus repo's gh-pages branch, which
+# shows exactly which parser code the fuzzers reach (0% means a harness is
+# owed). Both reuse the storage-repo + FUZZ_STORAGE_TOKEN. NOT required
+# checks. Docs: https://google.github.io/clusterfuzzlite/
 name: ClusterFuzzLite cron (prune + coverage)
 
 on:

@@ -1,8 +1,9 @@
-//! `splitter` — `ffmpeg` wrapper that cuts one audiobook file into per-chapter
-//! episode files by **stream copy** (no re-encode), or — opt-in, for sources no
-//! podcatcher can play — by **re-encoding** to AAC/MP3 (Task 5.2).
+//! `splitter` — `ffmpeg` wrapper that cuts one audiobook file into
+//! per-chapter episode files by **stream copy** (no re-encode). Opt-in, for
+//! sources that no podcatcher can play, it cuts by a **re-encode** to AAC/MP3
+//! (Task 5.2).
 //!
-//! Per chapter it runs, as an **argv vector** (never a shell string — chapter
+//! Per chapter it runs, as an **argv vector** (never a shell string: chapter
 //! metadata is untrusted):
 //!
 //! ```text
@@ -12,21 +13,23 @@
 //! ```
 //!
 //! ## Invariants (the reason this crate exists)
-//! - `-ss` goes **before** `-i` (fast index seek) and duration is `-t <end-start>`.
-//!   Using `-to` after `-i` together with `-ss` before `-i` does **not** subtract
-//!   the offset and yields a ~2× file — so we never emit `-to`. `build_encode_args`
-//!   encodes this and is unit-tested without invoking ffmpeg.
-//! - `byte_length` is read from the **actual output file** (`fs::metadata().len()`),
-//!   never prorated from a bitrate.
+//! - `-ss` goes **before** `-i` (fast index seek), and the duration is
+//!   `-t <end-start>`. `-to` after `-i`, together with `-ss` before `-i`,
+//!   does **not** subtract the offset and yields a ~2× file. So the splitter
+//!   never emits `-to`. `build_encode_args` encodes this rule, and a unit
+//!   test checks it without an ffmpeg invocation.
+//! - `byte_length` comes from the **actual output file**
+//!   (`fs::metadata().len()`); it is never prorated from a bitrate.
 //! - The source file is only ever read; every output lands in `out_dir`.
 //!
 //! ## Hardening (Task 3.5)
-//! Every ffmpeg spawn goes through [`run_ffmpeg`], which (a) acquires a permit
-//! from a process-wide counting semaphore sized to the CPU count, so concurrent
-//! ffmpeg jobs are bounded, and (b) enforces a per-child wall-clock timeout,
-//! killing a hung child. The splitter is **synchronous** (`std::process`), so
-//! this uses a `std`-built semaphore + the `wait-timeout` crate rather than the
-//! `tokio` primitives the TAD sketched — same guarantees, no async ripple.
+//! Every ffmpeg spawn goes through [`run_ffmpeg`], which does two things:
+//! (a) it acquires a permit from a process-wide counting semaphore sized to
+//! the CPU count, so the number of concurrent ffmpeg jobs is bounded; and
+//! (b) it enforces a per-child wall-clock timeout and kills a hung child. The
+//! splitter is **synchronous** (`std::process`), so this uses a `std`-built
+//! semaphore plus the `wait-timeout` crate, not the `tokio` primitives the
+//! TAD sketched. The guarantees are the same, with no async ripple.
 
 use std::ffi::OsString;
 use std::fs;
@@ -39,37 +42,39 @@ use std::time::Duration;
 
 use wait_timeout::ChildExt;
 
-/// Per-child ffmpeg wall-clock timeout. A stream-copy of one chapter is seconds;
-/// splitting a whole 10h book is ≤2min (NFR-P1), so any single child running
-/// past this is hung, not slow.
+/// Per-child ffmpeg wall-clock timeout. A stream copy of one chapter takes
+/// seconds, and a split of a whole 10h book takes ≤2min (NFR-P1). So any
+/// single child that runs past this limit is hung, not slow.
 const FFMPEG_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Per-child ffmpeg wall-clock timeout for a **re-encode** ([`Encoding::Aac`] /
-/// [`Encoding::Mp3`], Task 5.2). A re-encode is bounded by CPU, not by the index:
-/// a whole chapterless 10h FLAC is a single child that runs for tens of minutes
-/// on a Raspberry Pi, so [`FFMPEG_TIMEOUT`] would kill honest work. Still a hard
-/// bound — a child past this is hung, not slow.
+/// Per-child ffmpeg wall-clock timeout for a **re-encode** ([`Encoding::Aac`]
+/// / [`Encoding::Mp3`], Task 5.2). CPU bounds a re-encode, not the index: a
+/// whole chapterless 10h FLAC is a single child that runs for tens of minutes
+/// on a Raspberry Pi, so [`FFMPEG_TIMEOUT`] would kill honest work. This is
+/// still a hard bound: a child past it is hung, not slow.
 const TRANSCODE_TIMEOUT: Duration = Duration::from_secs(7200);
 
 /// How an episode's audio is produced from the source.
 ///
 /// [`Encoding::Copy`] is the default and the only mode used for podcast-safe
-/// sources (MP3/AAC): the bytes are copied out of the container untouched. The
-/// re-encode modes exist for Tier-2 sources (FLAC/Vorbis/Opus/ALAC) that most
-/// podcatchers refuse to play, and are opt-in per server (`PODSPINE_TRANSCODE`).
+/// sources (MP3/AAC): the bytes are copied out of the container untouched.
+/// The re-encode modes exist for Tier-2 sources (FLAC/Vorbis/Opus/ALAC) that
+/// most podcatchers refuse to play; they are opt-in per server
+/// (`PODSPINE_TRANSCODE`).
 ///
-/// A re-encode is **not** byte-reproducible across ffmpeg builds, so a transcoded
-/// book is always materialized once at ingest and never regenerated on demand —
-/// that is what keeps `enclosure length` equal to the file actually served.
+/// A re-encode is **not** byte-reproducible across ffmpeg builds. So a
+/// transcoded book is always materialized once at ingest and never
+/// regenerated on demand. That rule keeps `enclosure length` equal to the
+/// file actually served.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Encoding {
-    /// Stream copy (`-c copy`) — no re-encode, the default everywhere.
+    /// Stream copy (`-c copy`): no re-encode, the default everywhere.
     #[default]
     Copy,
     /// Re-encode to AAC 128 kbps (ffmpeg's built-in `aac` encoder, `.m4a`).
     Aac,
-    /// Re-encode to MP3 128 kbps (`libmp3lame`, `.mp3`) — the fallback target for
-    /// clients that still choke on AAC.
+    /// Re-encode to MP3 128 kbps (`libmp3lame`, `.mp3`): the fallback target
+    /// for clients that still do not play AAC.
     Mp3,
 }
 
@@ -105,7 +110,8 @@ impl Encoding {
 /// A chapter to cut: its position and its `[start, end)` in seconds.
 ///
 /// Deliberately independent of where the chapters came from (embedded ffprobe
-/// markers, a `.cue` sidecar, …) so the splitter doesn't depend on the prober.
+/// markers, a `.cue` sidecar, …), so that the splitter does not depend on the
+/// prober.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChapterCut {
     /// Zero-based chapter position (episode N in the feed is `idx + 1`).
@@ -123,7 +129,8 @@ pub struct SplitEpisode {
     pub idx: usize,
     /// Path to the written episode file (container matches `out_ext`).
     pub path: PathBuf,
-    /// Real output size in bytes (`fs::metadata().len()`) — for `enclosure length`.
+    /// Real output size in bytes (`fs::metadata().len()`), used for
+    /// `enclosure length`.
     pub byte_length: u64,
     /// Requested chapter duration in seconds (`end - start`).
     pub duration_sec: f64,
@@ -142,7 +149,7 @@ pub enum SplitError {
         idx: usize,
     },
     /// `ffmpeg` ran but exited non-zero. `stderr` is captured for logs (never
-    /// surface it to HTTP clients — that leak is the http layer's guard).
+    /// surface it to HTTP clients; the http layer guards that leak).
     #[error("ffmpeg failed on chapter {idx} (exit {code:?}): {stderr}")]
     Ffmpeg {
         /// Zero-based chapter position.
@@ -197,8 +204,9 @@ pub enum SplitError {
     },
 }
 
-/// Failure modes of a cover extraction. A book with no cover is *not* an error —
-/// the caller checks `has_cover` first; these only cover a genuine ffmpeg failure.
+/// Failure modes of a cover extraction. A book with no cover is *not* an
+/// error (the caller checks `has_cover` first); these only cover a genuine
+/// ffmpeg failure.
 #[derive(Debug, thiserror::Error)]
 pub enum CoverError {
     /// `ffmpeg` could not be launched.
@@ -269,9 +277,10 @@ impl Drop for Permit<'_> {
     }
 }
 
-/// How many ffmpeg jobs may run at once: the CPU count (fallback 4 when the OS
-/// won't say). The single source of truth for both the process-wide [`ffmpeg_gate`]
-/// and the per-book split worker pool ([`split_book_encoded`]), so they agree.
+/// How many ffmpeg jobs may run at once: the CPU count (fallback 4 when the
+/// OS will not say). This is the single source of truth for both the
+/// process-wide [`ffmpeg_gate`] and the per-book split worker pool
+/// ([`split_book_encoded`]), so they agree.
 fn ffmpeg_parallelism() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
@@ -304,12 +313,13 @@ enum RunError {
 
 /// Run one ffmpeg invocation under the concurrency gate with a per-child
 /// timeout+kill. stdout is discarded; stderr is captured (small under
-/// `-loglevel error`) so a failure can be logged without leaking it to clients.
+/// `-loglevel error`), so that a failure can be logged without a leak to
+/// clients.
 fn run_ffmpeg(args: &[OsString]) -> Result<(), RunError> {
     run_ffmpeg_within(args, FFMPEG_TIMEOUT)
 }
 
-/// As [`run_ffmpeg`], with an explicit per-child timeout — a re-encode needs a
+/// As [`run_ffmpeg`], with an explicit per-child timeout: a re-encode needs a
 /// far longer bound than a stream copy ([`Encoding::timeout`]).
 fn run_ffmpeg_within(args: &[OsString], timeout: Duration) -> Result<(), RunError> {
     let _permit = ffmpeg_gate().acquire();
@@ -322,8 +332,9 @@ fn run_ffmpeg_within(args: &[OsString], timeout: Duration) -> Result<(), RunErro
         .spawn()
         .map_err(RunError::Spawn)?;
 
-    // Drain stderr on a side thread so a chatty child can't fill the pipe buffer
-    // and stall before exit (which would masquerade as a timeout).
+    // Drain stderr on a side thread, so that a chatty child cannot fill the
+    // pipe buffer and stall before exit (that stall would masquerade as a
+    // timeout).
     let stderr_drain = child.stderr.take().map(|mut pipe| {
         std::thread::spawn(move || {
             let mut s = String::new();
@@ -346,8 +357,8 @@ fn run_ffmpeg_within(args: &[OsString], timeout: Duration) -> Result<(), RunErro
             stderr: stderr(),
         }),
         None => {
-            // Hung child: kill and reap so we don't leak a zombie; the drain
-            // thread then hits EOF and its handle is dropped.
+            // Hung child: kill and reap it, so that no zombie leaks. The drain
+            // thread then hits EOF, and its handle is dropped.
             let _ = child.kill();
             let _ = child.wait();
             Err(RunError::TimedOut)
@@ -356,42 +367,47 @@ fn run_ffmpeg_within(args: &[OsString], timeout: Duration) -> Result<(), RunErro
 }
 
 /// Extract the embedded cover image of `input` into `out_dir/cover.<ext>` by
-/// **stream copy** (no re-encode), returning the written path. `ext` should match
-/// the cover codec (`"jpg"` for mjpeg, `"png"` for png). The source is only read.
+/// **stream copy** (no re-encode). Return the written path. `ext` should
+/// match the cover codec (`"jpg"` for mjpeg, `"png"` for png). The source is
+/// only read.
 ///
-/// Maps only the first video (attached-picture) stream, so no audio is written. The
-/// write is atomic ([`extract_image`]), so a `/cover` or `/thumb` reader never sees
-/// a half-written cover while a rescan re-extracts it.
+/// This maps only the first video (attached-picture) stream, so no audio is
+/// written. The write is atomic ([`extract_image`]), so a `/cover` or
+/// `/thumb` reader never sees a half-written cover while a rescan re-extracts
+/// it.
 pub fn extract_cover(input: &Path, out_dir: &Path, ext: &str) -> Result<PathBuf, CoverError> {
     let out_path = out_dir.join(format!("cover.{ext}"));
     extract_image(out_path, |part| build_cover_args(input, part))
 }
 
-/// Long-edge cap (px) for the cover thumbnail. 400 covers every browse-UI use —
-/// the grid (~150px), the detail cover (~200px) and the subscribe subcover (~96px)
-/// — at 2× density, while the full-res `/cover` is what the RSS feed advertises for
-/// podcatcher artwork.
+/// Long-edge cap (px) for the cover thumbnail. 400 covers every browse-UI use
+/// at 2× density: the grid (~150px), the detail cover (~200px), and the
+/// subscribe subcover (~96px). The full-res `/cover` is what the RSS feed
+/// advertises for podcatcher artwork.
 const COVER_THUMB_PX: u32 = 400;
 
-/// The path of a book's browse-UI cover thumbnail under `out_dir`. Centralized so
-/// the generator, the serve layer, and the scanner's invalidation all agree on it.
+/// The path of a book's browse-UI cover thumbnail under `out_dir`.
+/// Centralized, so that the generator, the serve layer, and the scanner's
+/// invalidation all agree on it.
 pub fn cover_thumb_path(out_dir: &Path) -> PathBuf {
     out_dir.join("cover_thumb.jpg")
 }
 
-/// Downscale an already-extracted cover into a small [`cover_thumb_path`] JPEG for
-/// the browse UI (the RSS feed keeps the full-res `/cover`). Bounded to
-/// [`COVER_THUMB_PX`] on the long edge and never upscaled; the source cover file is
-/// only read, and the write is atomic ([`extract_image`]).
+/// Downscale an already-extracted cover into a small [`cover_thumb_path`]
+/// JPEG for the browse UI (the RSS feed keeps the full-res `/cover`). The
+/// output is bounded to [`COVER_THUMB_PX`] on the long edge and never
+/// upscaled. The source cover file is only read, and the write is atomic
+/// ([`extract_image`]).
 pub fn extract_cover_thumb(cover: &Path, out_dir: &Path) -> Result<PathBuf, CoverError> {
     let out_path = cover_thumb_path(out_dir);
     extract_image(out_path, |part| build_cover_thumb_args(cover, part))
 }
 
-/// Run ffmpeg to produce an image at `out_path` **atomically**: create the parent
-/// dir, write to a `.part` sibling, validate it's non-empty, then rename into place.
-/// A concurrent reader sees the old file or the new one, never a half-written one —
-/// which is what lets a rescan re-extract a cover while `/cover` and `/thumb` serve.
+/// Run ffmpeg to produce an image at `out_path` **atomically**: create the
+/// parent dir, write to a `.part` sibling, validate that it is non-empty,
+/// then rename it into place. A concurrent reader sees the old file or the
+/// new one, never a half-written one. That rule lets a rescan re-extract a
+/// cover while `/cover` and `/thumb` serve.
 fn extract_image(
     out_path: PathBuf,
     args_for: impl FnOnce(&Path) -> Vec<OsString>,
@@ -440,7 +456,8 @@ fn build_cover_args(input: &Path, output: &Path) -> Vec<OsString> {
         "error".into(),
         "-i".into(),
         input.as_os_str().to_os_string(),
-        // First (attached-picture) video stream only — drops audio, one frame.
+        // First (attached-picture) video stream only: this drops audio and
+        // writes one frame.
         "-map".into(),
         "0:v:0".into(),
         "-frames:v".into(),
@@ -451,10 +468,11 @@ fn build_cover_args(input: &Path, output: &Path) -> Vec<OsString> {
     ]
 }
 
-/// Build the ffmpeg argv for the cover thumbnail: read the cover image, one frame,
-/// scale so the long edge is at most [`COVER_THUMB_PX`] (aspect preserved, never
-/// upscaled — `min(px, iw/ih)`), re-encode as JPEG. Argv vector, never a shell
-/// string. Factored out for a hermetic unit test.
+/// Build the ffmpeg argv for the cover thumbnail: read the cover image, take
+/// one frame, scale so that the long edge is at most [`COVER_THUMB_PX`]
+/// (aspect preserved, never upscaled: `min(px, iw/ih)`), and re-encode as
+/// JPEG. Argv vector, never a shell string. Factored out for a hermetic unit
+/// test.
 fn build_cover_thumb_args(input: &Path, output: &Path) -> Vec<OsString> {
     vec![
         "-nostdin".into(),
@@ -489,18 +507,19 @@ pub fn episode_file_name(idx: usize, ext: &str) -> String {
     format!("{:03}.{ext}", idx + 1)
 }
 
-/// Whether a file stem marks a produced episode file — the stem side of the
-/// [`episode_file_name`] contract: all digits and nothing else. A `.part`
-/// temporary keeps `.part` in its stem ([`part_path`]) so it never matches,
-/// which is what lets the cache eviction and the scanner's sweeps skip it.
+/// Whether a file stem marks a produced episode file: the stem side of the
+/// [`episode_file_name`] contract, all digits and nothing else. A `.part`
+/// temporary keeps `.part` in its stem ([`part_path`]), so it never matches.
+/// That rule lets the cache eviction and the scanner's sweeps skip it.
 pub fn is_episode_stem(stem: &str) -> bool {
     !stem.is_empty() && stem.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// Split every chapter of `input` into `out_dir`, returning one [`SplitEpisode`]
-/// per chapter (fails fast on the first error). Creates `out_dir` if needed and
-/// never modifies `input`. `out_ext` selects the stream-copy output container to
-/// match the source codec (e.g. `"m4a"`, `"mp3"`, `"flac"`, `"ogg"`, `"opus"`).
+/// Split every chapter of `input` into `out_dir`. Return one [`SplitEpisode`]
+/// per chapter (this fails fast on the first error). It creates `out_dir` if
+/// needed and never modifies `input`. `out_ext` selects the stream-copy
+/// output container to match the source codec (e.g. `"m4a"`, `"mp3"`,
+/// `"flac"`, `"ogg"`, `"opus"`).
 pub fn split_book(
     input: &Path,
     out_dir: &Path,
@@ -510,9 +529,9 @@ pub fn split_book(
     split_book_encoded(input, out_dir, chapters, out_ext, Encoding::Copy)
 }
 
-/// As [`split_book`], with an explicit [`Encoding`] — [`Encoding::Copy`] is the
-/// stream-copy default; the re-encode modes serve Task 5.2's opt-in transcoding
-/// of sources podcatchers can't play.
+/// As [`split_book`], with an explicit [`Encoding`]. [`Encoding::Copy`] is
+/// the stream-copy default; the re-encode modes serve Task 5.2's opt-in
+/// transcoding of sources that podcatchers do not play.
 pub fn split_book_encoded(
     input: &Path,
     out_dir: &Path,
@@ -534,16 +553,17 @@ pub fn split_book_encoded(
             .collect();
     }
 
-    // Two phases so a multi-chapter split is all-or-nothing.
+    // Two phases, so that a multi-chapter split is all-or-nothing.
     //
-    // Phase 1 — produce every chapter's `.part` in PARALLEL. Each is an independent
-    // ffmpeg stream-copy (or re-encode) to its own `{idx+1:03}.part.<ext>`, so the
-    // only shared state is the per-index result slot each worker writes exactly
-    // once. Actual ffmpeg concurrency is bounded by the process-wide `ffmpeg_gate`;
-    // the pool is capped at the same CPU count so extra workers wouldn't just park.
-    // (This is the first-scan speed-up: splitting was serial while the gate sat
-    // unused.) Nothing is published yet, so the previously-served episodes are
-    // untouched no matter what happens here.
+    // Phase 1: produce every chapter's `.part` in PARALLEL. Each is an
+    // independent ffmpeg stream copy (or re-encode) to its own
+    // `{idx+1:03}.part.<ext>`, so the only shared state is the per-index
+    // result slot that each worker writes exactly once. The process-wide
+    // `ffmpeg_gate` bounds the actual ffmpeg concurrency; the pool is capped
+    // at the same CPU count, because extra workers would only park. (This is
+    // the first-scan speed-up: the split was serial while the gate sat
+    // unused.) Nothing is published yet, so the previously served episodes
+    // stay untouched no matter what happens here.
     let out_path_for = |ch: &ChapterCut| out_dir.join(episode_file_name(ch.idx, out_ext));
     let slots: Vec<Mutex<Option<Result<ProducedPart, SplitError>>>> =
         (0..n).map(|_| Mutex::new(None)).collect();
@@ -579,10 +599,11 @@ pub fn split_book_encoded(
         })
         .collect();
 
-    // If ANY chapter failed, publish NONE: delete every produced part (so the old
-    // episode files stay in place) and return the lowest-index error, matching the
-    // old serial `?`. This is what keeps a failed re-ingest from leaving a chapter's
-    // new bytes over the index's old enclosure length.
+    // If ANY chapter failed, publish NONE: delete every produced part (the
+    // old episode files then stay in place) and return the lowest-index
+    // error, which matches the old serial `?`. This rule keeps a failed
+    // re-ingest from leaving a chapter's new bytes over the index's old
+    // enclosure length.
     if produced.iter().any(Result::is_err) {
         for p in produced.iter().flatten() {
             let _ = fs::remove_file(&p.part);
@@ -595,18 +616,19 @@ pub fn split_book_encoded(
             .expect("a failed result exists in this branch"));
     }
 
-    // Phase 2 — every chapter produced: publish each `.part` into place.
+    // Phase 2: every chapter produced, so publish each `.part` into place.
     let parts: Vec<ProducedPart> = produced
         .into_iter()
         .map(|r| r.expect("all parts are Ok in this branch"))
         .collect();
     let part_paths: Vec<PathBuf> = parts.iter().map(|p| p.part.clone()).collect();
 
-    // A same-dir rename is atomic and, in practice, only fails when a directory sits
-    // at the target (the "blocked rename" case). Check EVERY target before renaming
-    // any, so a late block can't leave earlier chapters published over the index's
-    // now-stale enclosure lengths. If any is blocked, publish nothing and delete all
-    // the produced parts — the previously-served episodes stay intact.
+    // A same-dir rename is atomic and, in practice, only fails when a
+    // directory sits at the target (the "blocked rename" case). Check EVERY
+    // target before any rename, so that a late block cannot leave earlier
+    // chapters published over the index's now-stale enclosure lengths. If any
+    // target is blocked, publish nothing and delete all the produced parts;
+    // the previously served episodes stay intact.
     for ch in chapters {
         let out_path = out_path_for(ch);
         if out_path.is_dir() {
@@ -625,10 +647,11 @@ pub fn split_book_encoded(
     }
 
     // Targets are clear: publish each part in chapter order. A rename that still
-    // fails here is a catastrophic I/O error (e.g. the disk filled between producing
-    // the parts and this rename); delete the parts not yet published so nothing is
-    // left half-done, then error. Renames that already succeeded can't be rolled
-    // back — POSIX has no cross-file rename transaction — but the next scan re-splits.
+    // fails here is a catastrophic I/O error (e.g. the disk filled between the part
+    // production and this rename). Delete the parts not yet published, so
+    // that nothing is left half-done, then error. Renames that already
+    // succeeded cannot be rolled back (POSIX has no cross-file rename
+    // transaction), but the next scan re-splits.
     let mut episodes = Vec::with_capacity(n);
     for (i, (ch, part)) in chapters.iter().zip(parts).enumerate() {
         match publish_part(part, out_path_for(ch), ch.idx, ch.end_sec - ch.start_sec) {
@@ -678,11 +701,12 @@ pub fn split_chapter_encoded(
 /// Produce one episode file, atomically: run ffmpeg into the [`part_path`]
 /// sibling of `out_path`, validate what it wrote, then rename it into place.
 ///
-/// `args_for` builds the argv against the temporary — callers never name the
-/// final path themselves, so nothing can write directly over a published episode.
-/// Every failure removes the temporary and returns without touching `out_path`,
-/// so a re-ingest that dies mid-encode leaves the previously served file, and its
-/// recorded `byte_length`, exactly as they were.
+/// `args_for` builds the argv against the temporary; callers never name the
+/// final path themselves, so nothing can write directly over a published
+/// episode. Every failure removes the temporary and returns without a touch
+/// of `out_path`. A re-ingest that dies mid-encode therefore leaves the
+/// previously served file, and its recorded `byte_length`, exactly as they
+/// were.
 fn produce_episode(
     out_path: PathBuf,
     idx: usize,
@@ -694,23 +718,25 @@ fn produce_episode(
     publish_part(produced, out_path, idx, duration_sec)
 }
 
-/// One episode's audio, produced into its `.part` file and validated but **not yet
-/// published** (renamed into place). Splitting produce from publish lets
-/// [`split_book_encoded`] make a multi-chapter split all-or-nothing: it produces
-/// every chapter's part first, and only publishes them if all succeeded — so a
-/// failing chapter never leaves a sibling's new bytes over the old index length.
+/// One episode's audio, produced into its `.part` file and validated but
+/// **not yet published** (renamed into place). The produce/publish split lets
+/// [`split_book_encoded`] make a multi-chapter split all-or-nothing: it
+/// produces every chapter's part first, and it publishes them only when all
+/// succeeded. So a failed chapter never leaves a sibling's new bytes over the
+/// old index length.
 struct ProducedPart {
     /// The validated `.part` file (awaiting a rename to its final path).
     part: PathBuf,
-    /// Real output size in bytes (`fs::metadata().len()`) — the enclosure length.
+    /// Real output size in bytes (`fs::metadata().len()`), used as the
+    /// enclosure length.
     byte_length: u64,
     /// ffmpeg wall-clock, recorded into the split histogram only on publish.
     elapsed: Duration,
 }
 
-/// Run ffmpeg for one episode into its `.part` file and validate the output, but do
-/// **not** rename it into place. On any failure the `.part` is removed and the
-/// already-published episode (if any) is left untouched.
+/// Run ffmpeg for one episode into its `.part` file and validate the output,
+/// but do **not** rename it into place. On any failure, the `.part` is
+/// removed, and the already-published episode (if any) is left untouched.
 fn produce_part(
     out_path: &Path,
     idx: usize,
@@ -720,10 +746,10 @@ fn produce_part(
     let part = part_path(out_path);
     let args = args_for(&part);
 
-    // Timed around the ffmpeg call only. The observation is recorded on publish,
-    // once the output has been validated: a failed or timed-out split would
-    // otherwise pollute the latency distribution with a duration that reflects
-    // the failure rather than the work.
+    // The timer wraps the ffmpeg call only. The observation is recorded on
+    // publish, once the output has been validated. A failed or timed-out
+    // split would otherwise pollute the latency distribution with a duration
+    // that reflects the failure, not the work.
     let started = std::time::Instant::now();
     let run = run_ffmpeg_within(&args, enc.timeout());
     let elapsed = started.elapsed();
@@ -761,12 +787,13 @@ fn produce_part(
     })
 }
 
-/// Publish a produced `.part` into its final path — a same-directory atomic replace
-/// (readers see the old file or the new one, never a mix) — and record the split
-/// metric. An ffmpeg that "succeeds" into a missing or zero-byte file was already
-/// rejected by [`produce_part`], so reaching here means real, published work: a
-/// re-encode is observed here too (the same unit of work, and the slowest ingest an
-/// operator can have — hiding it would make the histogram lie about the tail).
+/// Publish a produced `.part` into its final path (a same-directory atomic
+/// replace: readers see the old file or the new one, never a mix) and record
+/// the split metric. [`produce_part`] already rejected an ffmpeg that
+/// "succeeds" into a missing or zero-byte file, so this point means real,
+/// published work. A re-encode is observed here too: it is the same unit of
+/// work, and the slowest ingest an operator can have. A hidden re-encode
+/// would make the histogram lie about the tail.
 fn publish_part(
     produced: ProducedPart,
     out_path: PathBuf,
@@ -787,16 +814,17 @@ fn publish_part(
     })
 }
 
-/// Remux a whole (chapterless) MP4 to **faststart** — stream-copied, `moov`
-/// relocated to the front — so podcast clients seek immediately. Serves a
-/// non-faststart whole-file episode from the cache when `PODSPINE_REMUX_NON_FASTSTART`
-/// is on (Sprint 6.3); the source is never touched. Like [`split_chapter`] it is a
-/// deterministic `-c copy`, so the output size is a stable `enclosure length`, and
-/// it publishes through the same atomic [`produce_episode`] path (`.part` then
-/// rename, observed in the split histogram) — a failed remux never touches a
-/// previously cached copy. `idx`/`out_ext` name the cache file (`NNN.<ext>`);
-/// `duration_sec` is the whole file's duration (the enclosure duration, carried
-/// through unchanged).
+/// Remux a whole (chapterless) MP4 to **faststart**: stream-copied, with
+/// `moov` relocated to the front, so that podcast clients seek immediately.
+/// This serves a non-faststart whole-file episode from the cache when
+/// `PODSPINE_REMUX_NON_FASTSTART` is on (Sprint 6.3); the source is never
+/// touched. Like [`split_chapter`], it is a deterministic `-c copy`, so the
+/// output size is a stable `enclosure length`. It publishes through the same
+/// atomic [`produce_episode`] path (`.part`, then rename, observed in the
+/// split histogram), so a failed remux never touches a previously cached
+/// copy. `idx`/`out_ext` name the cache file (`NNN.<ext>`). `duration_sec` is
+/// the whole file's duration (the enclosure duration, carried through
+/// unchanged).
 pub fn remux_faststart(
     input: &Path,
     out_dir: &Path,
@@ -810,12 +838,13 @@ pub fn remux_faststart(
     })
 }
 
-/// Re-encode a whole (chapterless) file into one episode under `out_dir` —
-/// Task 5.2's transcode path for a source no podcatcher will play (a FLAC with no
-/// `.cue`, say). Unlike [`split_chapter_encoded`] this emits **no `-ss`/`-t`**: the
-/// episode is the entire file, so a probed duration that is a hair short must not
-/// clip the ending. `duration_sec` is carried through to the enclosure unchanged
-/// (the ffprobe duration), while `byte_length` is read from the real output.
+/// Re-encode a whole (chapterless) file into one episode under `out_dir`:
+/// Task 5.2's transcode path for a source that no podcatcher will play (a
+/// FLAC with no `.cue`, say). Unlike [`split_chapter_encoded`], this emits
+/// **no `-ss`/`-t`**: the episode is the entire file, so a probed duration
+/// that is a hair short must not clip the ending. `duration_sec` is carried
+/// through to the enclosure unchanged (the ffprobe duration), while
+/// `byte_length` comes from the real output.
 ///
 /// `enc` must be a re-encode mode; [`Encoding::Copy`] here would just be a
 /// container rewrite, which is [`remux_faststart`]'s job.
@@ -838,9 +867,10 @@ pub fn transcode_whole(
     })
 }
 
-/// argv for a whole-file faststart remux: keep audio only, drop chapters, copy
-/// codecs (no re-encode), relocate `moov`. No `-ss`/`-t` — the whole file. An
-/// argument vector, never a shell string (untrusted paths).
+/// argv for a whole-file faststart remux: keep audio only, drop chapters,
+/// copy codecs (no re-encode), relocate `moov`. No `-ss`/`-t`: the remux
+/// covers the whole file. An argument vector, never a shell string (paths are
+/// untrusted).
 fn build_remux_args(input: &Path, output: &Path) -> Vec<OsString> {
     vec![
         "-nostdin".into(),
@@ -891,7 +921,8 @@ fn build_encode_args(
     args.push("-i".into());
     args.push(input.as_os_str().to_os_string());
     if let Some((start_sec, end_sec)) = range {
-        // -t <duration>, NEVER -to (which with a pre-input -ss makes a 2x file).
+        // -t <duration>, NEVER -to (with a pre-input -ss, -to makes a 2x
+        // file).
         args.push("-t".into());
         args.push(fmt_secs((end_sec - start_sec).max(0.0)).into());
     }
@@ -911,17 +942,18 @@ fn build_encode_args(
 /// The temporary path an episode is encoded into before it is renamed over
 /// `out_path`.
 ///
-/// Every episode is written **out of place and then renamed**, because a rename
-/// within one directory is atomic: a request that arrives mid-encode is served the
-/// previous complete file (or 404s), never a half-written one, and an ffmpeg that
-/// fails or is killed leaves the already-published episode untouched. That matters
-/// most for a re-encode, which holds the output open for minutes rather than
-/// milliseconds — but it costs nothing to do for a stream copy too.
+/// Every episode is written **out of place and then renamed**, because a
+/// rename within one directory is atomic. A request that arrives mid-encode
+/// is served the previous complete file (or 404s), never a half-written one.
+/// And an ffmpeg that fails or is killed leaves the already-published episode
+/// untouched. That matters most for a re-encode, which holds the output open
+/// for minutes, not milliseconds; but it costs nothing for a stream copy too.
 ///
-/// The extension is **preserved** (`001.m4a` → `001.part.m4a`): ffmpeg picks its
-/// muxer from it, and [`is_mp4_family`] reads it to decide `+faststart`. The stem
-/// is no longer a bare `NNN`, so the cache-eviction and stale-copy sweeps — which
-/// both match an all-digit stem ([`is_episode_stem`]) — skip a temporary.
+/// The extension is **preserved** (`001.m4a` → `001.part.m4a`): ffmpeg picks
+/// its muxer from it, and [`is_mp4_family`] reads it to decide `+faststart`.
+/// The stem is no longer a bare `NNN`, so the cache-eviction and stale-copy
+/// sweeps (both match an all-digit stem, [`is_episode_stem`]) skip a
+/// temporary.
 fn part_path(out_path: &Path) -> PathBuf {
     let stem = out_path
         .file_stem()
@@ -1051,7 +1083,8 @@ mod tests {
         let pair = |a: &str, b: &str| args.windows(2).any(|w| w[0] == a && w[1] == b);
         assert!(pair("-c:a", "libmp3lame"));
         assert!(pair("-b:a", "128k"));
-        // Without a Xing/LAME header a client can't read the duration (TAD §5.4).
+        // Without a Xing/LAME header a client cannot read the duration
+        // (TAD §5.4).
         assert!(pair("-write_xing", "1"));
         assert!(
             !args.iter().any(|a| a == "-movflags"),
@@ -1080,8 +1113,9 @@ mod tests {
 
     #[test]
     fn a_reencode_gets_the_longer_timeout() {
-        // A stream copy of one chapter is seconds; a whole-book re-encode is tens
-        // of minutes, so it must not run under the stream-copy bound.
+        // A stream copy of one chapter takes seconds; a whole-book re-encode
+        // takes tens of minutes, so it must not run under the stream-copy
+        // bound.
         assert_eq!(Encoding::Copy.timeout(), FFMPEG_TIMEOUT);
         assert_eq!(Encoding::Aac.timeout(), TRANSCODE_TIMEOUT);
         assert_eq!(Encoding::Mp3.timeout(), TRANSCODE_TIMEOUT);
@@ -1206,9 +1240,9 @@ mod tests {
     #[test]
     fn cover_extraction_reports_publish_when_a_directory_blocks_the_target() {
         skip_unless_ffmpeg!();
-        // ffmpeg produces the `.part` fine, but a directory sitting at the final path
-        // blocks the atomic rename → CoverError::Publish (the image is never
-        // half-published; the blocker is left as-is).
+        // ffmpeg produces the `.part` fine, but a directory at the final path
+        // blocks the atomic rename, which gives `CoverError::Publish`. The
+        // image is never half-published; the blocker is left as-is.
         let dir = scratch("cover-publish");
         let cover = synth_cover_png(&dir, 64);
 
@@ -1229,10 +1263,11 @@ mod tests {
             assert_eq!(*sem.permits.lock().unwrap(), 0, "permit taken");
         }
         assert_eq!(*sem.permits.lock().unwrap(), 1, "permit released on drop");
-        // The gate is sized to at least one CPU. Assert the sizing source, not the
-        // global gate's live free-permit count — since split_book_encoded now runs
-        // ffmpeg through that same process-wide gate in parallel, a concurrent test
-        // can legitimately hold every permit, so reading the live count here races.
+        // The gate is sized to at least one CPU. Assert the sizing source, not
+        // the global gate's live free-permit count. `split_book_encoded` now
+        // runs ffmpeg through that same process-wide gate in parallel, so a
+        // concurrent test can legitimately hold every permit, and a read of
+        // the live count here races.
         assert!(ffmpeg_parallelism() >= 1);
     }
 
@@ -1240,8 +1275,9 @@ mod tests {
     fn hung_ffmpeg_is_killed_by_the_timeout() {
         skip_unless_ffmpeg!();
         // A real-time, unbounded encode that never terminates on its own; the
-        // per-child timeout must kill it. Uses a deliberately tiny timeout via a
-        // direct argv, bypassing the 5-min production constant.
+        // per-child timeout must kill it. The test uses a deliberately tiny
+        // timeout via a direct argv, which bypasses the 5-min production
+        // constant.
         let args: Vec<OsString> = [
             "-nostdin",
             "-loglevel",
@@ -1277,8 +1313,8 @@ mod tests {
 
     #[test]
     fn zero_length_chapter_errors_without_spawning_ffmpeg() {
-        // end == start -> caught before any ffmpeg spawn, so the (missing) input
-        // path is irrelevant.
+        // end == start is caught before any ffmpeg spawn, so the (missing)
+        // input path is irrelevant.
         let ch = ChapterCut {
             idx: 3,
             start_sec: 5.0,
@@ -1297,8 +1333,9 @@ mod tests {
     #[test]
     fn split_maps_a_nonzero_ffmpeg_exit_to_a_split_error() {
         skip_unless_ffmpeg!();
-        // A positive-duration cut on a non-audio input: ffmpeg fails to read it
-        // and exits non-zero, exercising run_ffmpeg's failure path + the mapping.
+        // A positive-duration cut on a non-audio input: ffmpeg fails to read
+        // it and exits non-zero, which exercises run_ffmpeg's failure path and
+        // the mapping.
         let dir = scratch("split-fail");
         let bad = dir.join("notaudio.m4a");
         std::fs::write(&bad, b"definitely not an audio stream").unwrap();
@@ -1315,9 +1352,9 @@ mod tests {
     #[test]
     fn parallel_split_returns_every_chapter_in_index_order() {
         skip_unless_ffmpeg!();
-        // Many chapters (> the worker pool on most CPUs) so the parallel path runs
-        // and we can prove the results come back in chapter order regardless of
-        // which worker finished first.
+        // Many chapters (> the worker pool on most CPUs), so the parallel path
+        // runs and the test can prove that the results come back in chapter
+        // order, independent of which worker finished first.
         let dir = scratch("parallel-split");
         let input = synth_sine(&dir, "book.m4a", 24.0);
 
@@ -1343,9 +1380,10 @@ mod tests {
     #[test]
     fn a_failing_chapter_publishes_none_of_a_multi_chapter_split() {
         skip_unless_ffmpeg!();
-        // All-or-nothing: if one chapter of a re-ingest fails, the chapters that DID
-        // succeed must not be published over the already-served files — otherwise the
-        // index's old enclosure length would point at new bytes.
+        // All-or-nothing: if one chapter of a re-ingest fails, the chapters
+        // that DID succeed must not be published over the already-served
+        // files. Otherwise the index's old enclosure length would point at new
+        // bytes.
         let dir = scratch("atomic-book");
         let out = dir.join("out");
         std::fs::create_dir_all(&out).unwrap();
@@ -1361,8 +1399,9 @@ mod tests {
             .map(|p| std::fs::read(p).unwrap())
             .collect();
 
-        // Chapters 0 and 1 are valid; chapter 2 is empty (end == start) → fails
-        // before ffmpeg, so 0/1 produce real parts but nothing is published.
+        // Chapters 0 and 1 are valid; chapter 2 is empty (end == start) and
+        // fails before ffmpeg. So 0/1 produce real parts, but nothing is
+        // published.
         let cuts = [
             ChapterCut {
                 idx: 0,
@@ -1410,9 +1449,10 @@ mod tests {
     #[test]
     fn a_blocked_publish_target_publishes_none_of_a_multi_chapter_split() {
         skip_unless_ffmpeg!();
-        // Both chapters produce fine, but a directory sits where chapter 2's episode
-        // must land, so its publish (rename) can't happen. The pre-check must catch
-        // that before publishing chapter 1 — nothing half-published, no parts left.
+        // Both chapters produce fine, but a directory sits where chapter 2's
+        // episode must land, so its publish (rename) cannot happen. The
+        // pre-check must catch that before chapter 1 is published: nothing
+        // half-published, no parts left.
         let dir = scratch("atomic-block");
         let out = dir.join("out");
         std::fs::create_dir_all(&out).unwrap();
@@ -1471,8 +1511,8 @@ mod tests {
     #[test]
     fn a_temporary_keeps_the_extension_and_hides_from_the_sweeps() {
         let p = part_path(Path::new("/data/books/b/001.m4a"));
-        // ffmpeg picks its muxer from the extension, and `is_mp4_family` reads it
-        // to decide `+faststart` — so the extension has to survive.
+        // ffmpeg picks its muxer from the extension, and `is_mp4_family` reads
+        // it to decide `+faststart`. So the extension has to survive.
         assert_eq!(p, Path::new("/data/books/b/001.part.m4a"));
         assert!(is_mp4_family(&p), "a temporary must still look mp4-family");
         // Both the cache eviction and the stale-copy sweep match an episode stem.
@@ -1531,9 +1571,10 @@ mod tests {
     #[test]
     fn a_failed_encode_leaves_the_published_episode_untouched() {
         skip_unless_ffmpeg!();
-        // The re-ingest hazard: an episode is already published and being served
-        // when a new encode of it fails. The old bytes — and the byte_length the
-        // feed advertises for them — must survive, and no temporary may be left.
+        // The re-ingest hazard: an episode is already published and served
+        // when a new encode of it fails. The old bytes, and the byte_length
+        // the feed advertises for them, must survive, and no temporary may be
+        // left.
         let dir = scratch("atomic-fail");
         let out = dir.join("out");
         std::fs::create_dir_all(&out).unwrap();
@@ -1583,7 +1624,8 @@ mod tests {
     fn split_chapter_maps_a_nonzero_ffmpeg_exit_to_an_error() {
         skip_unless_ffmpeg!();
         // `split_chapter` (the saver/regen entry point) on a non-audio input:
-        // ffmpeg exits non-zero → the error arm, carrying the chapter index.
+        // ffmpeg exits non-zero and hits the error arm, which carries the
+        // chapter index.
         let dir = scratch("splitchap-fail");
         let out = dir.join("out");
         std::fs::create_dir_all(&out).unwrap();
@@ -1602,8 +1644,8 @@ mod tests {
     fn remux_faststart_produces_a_deterministic_faststart_file() {
         skip_unless_ffmpeg!();
         let dir = scratch("remux-ft");
-        // ffmpeg's mp4 muxer writes `moov` at the END unless +faststart is asked,
-        // so a plain encode gives us a non-faststart source.
+        // ffmpeg's mp4 muxer writes `moov` at the END unless +faststart is
+        // asked, so a plain encode gives a non-faststart source.
         let src = synth_sine(&dir, "src.m4a", 3.0);
 
         let out = dir.join("out");
@@ -1639,10 +1681,10 @@ mod tests {
     #[test]
     fn remux_maps_a_nonzero_ffmpeg_exit_to_a_split_error() {
         skip_unless_ffmpeg!();
-        // A non-audio input makes ffmpeg exit non-zero → the remux error arm.
-        // A remux publishes through the same atomic `.part` path as every other
-        // producer, so a previously cached copy being served must survive the
-        // failure byte-for-byte, and no temporary may be left.
+        // A non-audio input makes ffmpeg exit non-zero and hit the remux error
+        // arm. A remux publishes through the same atomic `.part` path as every
+        // other producer, so a previously cached copy that is served must
+        // survive the failure byte-for-byte, and no temporary may be left.
         let dir = scratch("remux-fail");
         let out = dir.join("out");
         std::fs::create_dir_all(&out).unwrap();
@@ -1689,7 +1731,7 @@ mod tests {
             !done.load(std::sync::atomic::Ordering::SeqCst),
             "second acquirer is still blocked while the permit is held"
         );
-        drop(p1); // release → wakes the waiter
+        drop(p1); // The release wakes the waiter.
         handle.join().unwrap();
         assert!(done.load(std::sync::atomic::Ordering::SeqCst));
     }
@@ -1697,7 +1739,8 @@ mod tests {
     #[test]
     fn extract_cover_maps_a_nonzero_ffmpeg_exit_to_a_cover_error() {
         skip_unless_ffmpeg!();
-        // No video stream to map -> ffmpeg exits non-zero -> CoverError::Ffmpeg.
+        // There is no video stream to map, so ffmpeg exits non-zero:
+        // `CoverError::Ffmpeg`.
         let dir = scratch("cover-fail");
         let bad = dir.join("notaudio.m4a");
         std::fs::write(&bad, b"no video here").unwrap();
@@ -1709,8 +1752,8 @@ mod tests {
     #[test]
     fn extract_cover_thumb_maps_a_bad_input_to_a_cover_error() {
         skip_unless_ffmpeg!();
-        // A non-image input -> ffmpeg can't decode it -> CoverError (Ffmpeg or the
-        // empty-output guard), never a panic.
+        // ffmpeg cannot decode a non-image input: a `CoverError` (Ffmpeg or
+        // the empty-output guard), never a panic.
         let dir = scratch("thumb-fail");
         let bad = dir.join("notanimage.png");
         std::fs::write(&bad, b"definitely not an image").unwrap();
@@ -1726,8 +1769,9 @@ mod tests {
 
     #[test]
     fn extract_cover_reports_create_dir_when_out_dir_is_a_file() {
-        // out_dir is an existing regular file -> create_dir_all fails BEFORE any
-        // ffmpeg spawn -> CoverError::CreateDir. ffmpeg-free, so it runs everywhere.
+        // out_dir is an existing regular file, so create_dir_all fails BEFORE
+        // any ffmpeg spawn: `CoverError::CreateDir`. The test is ffmpeg-free,
+        // so it runs everywhere.
         let dir = scratch("cover-createdir");
         let file_as_dir = dir.join("iam-a-file");
         std::fs::write(&file_as_dir, b"x").unwrap();
@@ -1738,8 +1782,9 @@ mod tests {
 
     #[test]
     fn split_book_reports_create_dir_when_out_dir_is_a_file() {
-        // Same guard on the chaptered path: out_dir is a file -> SplitError::CreateDir
-        // before any chapter is cut (ffmpeg-free).
+        // The same guard on the chaptered path: out_dir is a file, so
+        // `SplitError::CreateDir` fires before any chapter is cut
+        // (ffmpeg-free).
         let dir = scratch("split-createdir");
         let file_as_dir = dir.join("iam-a-file");
         std::fs::write(&file_as_dir, b"x").unwrap();

@@ -25,15 +25,16 @@ pub fn ffmpeg_available() -> bool {
 /// encoder for the format the test needs.
 ///
 /// The `eprintln!` and the `return` live here, once, instead of at every call
-/// site. Wherever ffmpeg IS installed — CI, most dev machines — they cannot
-/// execute, and 62 copies of them dominated the uncovered-line count (35 of the
-/// 56 lines in PR 152's diff).
+/// site. Wherever ffmpeg IS installed (CI, most dev machines), they cannot
+/// execute, and 62 copies of them dominated the uncovered-line count (35 of
+/// the 56 lines in PR 152's diff).
 ///
-/// Measured, not assumed: llvm-cov attributes a macro body to each **expansion**,
-/// not to the definition, so a call site still reports one unreachable line —
-/// one instead of two, which took 63 lines off the report (scanner 158 → 105
-/// misses, splitter 45 → 35). One line per skip is the floor for deciding at
-/// runtime; something has to stand for "this didn't run".
+/// Measured, not assumed: llvm-cov attributes a macro body to each
+/// **expansion**, not to the definition, so a call site still reports one
+/// unreachable line. One line instead of two took 63 lines off the report
+/// (scanner 158 → 105 misses, splitter 45 → 35). One line per skip is the
+/// floor for a runtime decision; something has to stand for "this did not
+/// run".
 #[macro_export]
 macro_rules! skip {
     ($($why:tt)*) => {{
@@ -42,7 +43,7 @@ macro_rules! skip {
     }};
 }
 
-/// [`skip!`] the test unless ffmpeg is invocable — the opener of every
+/// [`skip!`] the test unless ffmpeg is invocable: the opener of every
 /// ffmpeg-gated test.
 #[macro_export]
 macro_rules! skip_unless_ffmpeg {
@@ -54,9 +55,9 @@ macro_rules! skip_unless_ffmpeg {
 }
 
 /// A per-test scratch directory under the system temp dir, wiped on creation
-/// and removed again on drop — so a panicking test leaves no litter behind.
-/// Derefs to [`Path`], so call sites use it exactly like the `PathBuf` the
-/// old hand-rolled dances produced.
+/// and removed again on drop, so that a test that panics leaves no litter
+/// behind. It derefs to [`Path`], so call sites use it exactly like the
+/// `PathBuf` that the old hand-rolled code produced.
 pub struct ScratchDir {
     path: PathBuf,
 }
@@ -67,9 +68,9 @@ impl ScratchDir {
         &self.path
     }
 
-    /// Defuse the drop cleanup and hand the path over — for the rare test
+    /// Defuse the drop cleanup and hand the path over, for the rare test
     /// that must leave the directory alive past its body (e.g. one that
-    /// spawned a detached watcher thread still holding the dir open).
+    /// spawned a detached watcher thread that still holds the dir open).
     pub fn keep(self) -> PathBuf {
         let path = self.path.clone();
         std::mem::forget(self);

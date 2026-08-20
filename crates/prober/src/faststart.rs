@@ -1,4 +1,4 @@
-//! Faststart detection for whole-file MP4 (`.m4a`/`.m4b`) — pure byte parsing,
+//! Faststart detection for whole-file MP4 (`.m4a`/`.m4b`): pure byte parsing,
 //! **no ffprobe**.
 //!
 //! An MP4 seeks quickly only when its `moov` atom (the index) sits BEFORE the
@@ -14,17 +14,17 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-/// Upper bound on top-level boxes scanned, so a malformed or hostile file can't
-/// spin the loop. A real MP4 reaches `moov`/`mdat` within a handful of boxes.
+/// Upper bound on top-level boxes scanned, so that a malformed or hostile
+/// file cannot spin the loop. A real MP4 reaches `moov`/`mdat` within a handful of boxes.
 const MAX_BOXES: usize = 256;
 
-/// Whether `path` is a **non-faststart MP4** — i.e. it IS an MP4 (a `ftyp` box is
-/// present) and its `mdat` box precedes `moov`.
+/// Whether `path` is a **non-faststart MP4**: it IS an MP4 (a `ftyp` box is
+/// present), and its `mdat` box precedes `moov`.
 ///
-/// Returns `false` for a faststart MP4 (`moov` first), a non-MP4 (MP3/OGG/FLAC —
-/// no `ftyp`/`moov`/`mdat` boxes), or any read/parse error. Failing to `false` is
-/// deliberate: a file we can't classify is served in place unchanged, never
-/// remuxed on a guess.
+/// Return `false` for a faststart MP4 (`moov` first), a non-MP4
+/// (MP3/OGG/FLAC: no `ftyp`/`moov`/`mdat` boxes), or any read/parse error.
+/// The fail-to-`false` is deliberate: a file that cannot be classified is
+/// served in place unchanged, never remuxed on a guess.
 pub fn needs_faststart(path: &Path) -> bool {
     scan(path).unwrap_or(false)
 }
@@ -60,21 +60,22 @@ fn scan(path: &Path) -> std::io::Result<bool> {
             n => u64::from(n),
         };
         if box_size < 8 {
-            break; // malformed header — give up (serve in place)
+            break; // A malformed header: give up (serve in place).
         }
 
         match &kind {
             b"ftyp" => saw_ftyp = true,
-            // `moov` seen before any `mdat` => already faststart.
+            // `moov` before any `mdat` means the file is already faststart.
             b"moov" => return Ok(false),
-            // `mdat` seen before `moov` => needs faststart, but only for a real
-            // MP4 (a stray `mdat`-like tag in a non-MP4 shouldn't trigger a remux).
+            // `mdat` before `moov` means the file needs faststart, but only
+            // for a real MP4 (a stray `mdat`-like tag in a non-MP4 must not
+            // trigger a remux).
             b"mdat" => return Ok(saw_ftyp),
             _ => {}
         }
 
-        // Advance to the next top-level box; stop on overflow or a non-advancing
-        // size so a crafted file can't loop.
+        // Advance to the next top-level box. Stop on overflow or a
+        // non-advancing size, so that a crafted file cannot loop.
         match pos.checked_add(box_size) {
             Some(next) if next > pos => pos = next,
             _ => break,
@@ -133,7 +134,8 @@ mod tests {
 
     #[test]
     fn mdat_first_without_ftyp_is_not_treated_as_mp4() {
-        // No `ftyp` => not an MP4 we should touch, even if an `mdat`-like tag leads.
+        // No `ftyp` means this is not an MP4 to touch, even when an
+        // `mdat`-like tag leads.
         let p = write(
             "nottyp",
             &[mp4_box(b"mdat", &[0u8; 32]), mp4_box(b"moov", &[0u8; 8])],
@@ -165,8 +167,8 @@ mod tests {
 
     #[test]
     fn a_box_smaller_than_its_8_byte_header_is_malformed() {
-        // A size field below the 8-byte box header (here 4) is malformed → give up
-        // (return false), never loop or misread.
+        // A size field below the 8-byte box header (here 4) is malformed:
+        // give up (return false), never loop or misread.
         let p = write("tinybox", &[vec![0, 0, 0, 4, b'f', b't', b'y', b'p']]);
         assert!(!needs_faststart(&p));
         let _ = std::fs::remove_file(&p);
@@ -175,7 +177,8 @@ mod tests {
     #[test]
     fn a_box_size_overflowing_the_offset_terminates() {
         // A valid `ftyp`, then a 64-bit largesize box whose size overflows
-        // `pos + size` → `checked_add` returns None → clean break (no panic/loop).
+        // `pos + size`. `checked_add` returns None, and the loop breaks
+        // cleanly (no panic, no spin).
         let mut bytes = mp4_box(b"ftyp", b"isom");
         bytes.extend_from_slice(&1u32.to_be_bytes()); // size32 = 1 (largesize follows)
         bytes.extend_from_slice(b"free");
@@ -188,8 +191,9 @@ mod tests {
     #[test]
     fn a_crafted_64bit_largesize_box_does_not_overflow() {
         // First box: size32 == 1 (a 64-bit largesize follows the type), type
-        // "free", largesize near u64::MAX. Advancing `pos` by it must not overflow
-        // the `pos + 8` guard (would panic under overflow-checks); returns false.
+        // "free", largesize near u64::MAX. An advance of `pos` by it must not
+        // overflow the `pos + 8` guard (a plain add would panic under
+        // overflow-checks); the result is false.
         let mut bytes = 1u32.to_be_bytes().to_vec(); // size32 = 1
         bytes.extend_from_slice(b"free");
         bytes.extend_from_slice(&(u64::MAX - 4).to_be_bytes()); // largesize
@@ -206,7 +210,7 @@ mod tests {
         bytes.extend_from_slice(b"free");
         bytes.extend_from_slice(&[0u8; 16]);
         let p = write("zerobox", &[bytes]);
-        // free-to-EOF with no moov/mdat => false, and returns promptly.
+        // free-to-EOF with no moov/mdat gives false, and it returns promptly.
         assert!(!needs_faststart(&p));
         let _ = std::fs::remove_file(&p);
     }

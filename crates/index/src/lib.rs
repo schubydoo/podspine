@@ -1,17 +1,18 @@
 //! `index` — the `rusqlite` (bundled SQLite) access layer.
 //!
-//! Owns the schema (TAD §5.1) and provides idempotent upserts keyed on stable
-//! ids (`book.id`, `episode.guid`) so re-scans of an unchanged source don't churn
-//! the database. `rusqlite::Connection` is not `Sync`, so the server accesses an
-//! [`Index`] behind a mutex / `spawn_blocking` (Sprint 2.4); this layer is
-//! synchronous.
+//! This crate owns the schema (TAD §5.1) and provides idempotent upserts
+//! keyed on stable ids (`book.id`, `episode.guid`), so re-scans of an
+//! unchanged source do not churn the database. `rusqlite::Connection` is not
+//! `Sync`, so the server accesses an [`Index`] behind a mutex /
+//! `spawn_blocking` (Sprint 2.4); this layer is synchronous.
 //!
 //! Feed privacy (v1.5) is a **capability URL**: each book carries a random,
-//! unguessable `feed_id` (128 bits) that is the public key for its feed, audio,
-//! and cover — the human `slug` is only for the LAN browse UI. The `feed_id` is
-//! stable across re-scans (preserved on upsert) and rotated only on an explicit
-//! [`Index::regenerate_feed_id`] (leak recovery). Feeds are always kept out of
-//! podcast directories (`itunes:block`) — they're private capability URLs.
+//! unguessable `feed_id` (128 bits) that is the public key for its feed,
+//! audio, and cover. The human `slug` is only for the LAN browse UI. The
+//! `feed_id` is stable across re-scans (preserved on upsert) and rotated only
+//! by an explicit [`Index::regenerate_feed_id`] (leak recovery). Feeds are
+//! always kept out of podcast directories (`itunes:block`): they are private
+//! capability URLs.
 
 use std::path::Path;
 
@@ -22,9 +23,9 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 // their own.
 pub use podspine_config::{StorageMode, TranscodeMode};
 
-/// Capability-id generation: an unguessable, URL-safe feed id. Stored raw (it is
-/// the owner's own retrievable link, shown in the UI and QR — not a hashed
-/// per-subscriber secret).
+/// Capability-id generation: an unguessable, URL-safe feed id. Stored raw (it
+/// is the owner's own retrievable link, shown in the UI and QR; it is not a
+/// hashed per-subscriber secret).
 pub mod capability {
     use base64::Engine;
 
@@ -41,9 +42,10 @@ pub mod capability {
     }
 }
 
-/// Schema, created on open. `IF NOT EXISTS` makes open idempotent. Pre-release:
-/// changing this is a fresh-schema change (delete an old `data/podspine.db` and
-/// re-scan) — no migration path is maintained before v1.
+/// Schema, created on open. `IF NOT EXISTS` makes open idempotent.
+/// Pre-release: a change here is a fresh-schema change (delete an old
+/// `data/podspine.db` and re-scan); no migration path is maintained before
+/// v1.
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS book (
     id           TEXT PRIMARY KEY,
@@ -81,10 +83,11 @@ CREATE INDEX IF NOT EXISTS episode_book_idx ON episode(book_id, idx);
 pub struct BookRow {
     /// Opaque stable id.
     pub id: String,
-    /// URL slug (unique) — the human key for the LAN browse UI only.
+    /// URL slug (unique): the human key for the LAN browse UI only.
     pub slug: String,
-    /// Capability id (unique, unguessable) — the public key for feed/audio/cover.
-    /// Stable across re-scans; rotated only by [`Index::regenerate_feed_id`].
+    /// Capability id (unique, unguessable): the public key for
+    /// feed/audio/cover. Stable across re-scans; rotated only by
+    /// [`Index::regenerate_feed_id`].
     pub feed_id: String,
     /// Title.
     pub title: String,
@@ -127,20 +130,22 @@ pub struct EpisodeRow {
     pub idx: i64,
     /// Episode title.
     pub title: String,
-    /// Path to the served audio file. Extracted (chaptered) episode → the split
-    /// under `<data_dir>`. Whole-file episode served in place → the original
-    /// library file (`== source_path`). Whole-file episode remuxed to faststart
-    /// (Sprint 6.3) → the cache file under `<data_dir>` (`!= source_path`).
+    /// Path to the served audio file. For an extracted (chaptered) episode,
+    /// this is the split under `<data_dir>`. For a whole-file episode served
+    /// in place, it is the original library file (`== source_path`). For a
+    /// whole-file episode remuxed to faststart (Sprint 6.3), it is the cache
+    /// file under `<data_dir>` (`!= source_path`).
     pub file_path: String,
-    /// When non-empty, the episode IS a whole source file (MP3-folder track, or a
-    /// chapterless single file). `file_path == source_path` ⇒ streamed in place
-    /// from the library; `file_path != source_path` ⇒ remuxed to faststart and
-    /// cached under `<data_dir>`. Empty ⇒ an extracted sub-range (`full`/`saver`).
-    /// See TAD §5.3.
+    /// When non-empty, the episode IS a whole source file (an MP3-folder
+    /// track, or a chapterless single file). `file_path == source_path` means
+    /// streamed in place from the library. `file_path != source_path` means
+    /// remuxed to faststart and cached under `<data_dir>`. Empty means an
+    /// extracted sub-range (`full`/`saver`). See TAD §5.3.
     pub source_path: String,
-    /// `true` when the source is a non-faststart MP4 (`moov` after `mdat`), so a
-    /// whole-file serve seeks slowly. Recorded at ingest; drives the callout and,
-    /// with `PODSPINE_REMUX_NON_FASTSTART` on, the remux-vs-in-place decision.
+    /// `true` when the source is a non-faststart MP4 (`moov` after `mdat`),
+    /// so a whole-file serve seeks slowly. It is recorded at ingest. It
+    /// drives the log notice and, with `PODSPINE_REMUX_NON_FASTSTART` on, the
+    /// remux-vs-in-place decision.
     pub needs_faststart: bool,
     /// Real output size in bytes.
     pub byte_length: i64,
@@ -188,15 +193,16 @@ impl Index {
         Ok(Self { conn })
     }
 
-    /// Additive migrations for databases created by an older Podspine. Pre-v1 we
-    /// don't keep a full migration path, but silently breaking an existing DB at
-    /// request time is worse than a cheap `ADD COLUMN` here: `CREATE TABLE IF NOT
-    /// EXISTS` won't add a column to a table that already exists, so an older
-    /// `episode` table would be missing `start_sec` and every audio/feed query
-    /// would fail mid-request. `ADD COLUMN` preserves all rows (and the
-    /// capability `feed_id`s — a drop+recreate would rotate every feed URL).
-    /// Existing episodes get `start_sec = 0`; that value is only read for
-    /// `saver`-mode regeneration and is corrected on the next re-scan.
+    /// Additive migrations for databases created by an older Podspine.
+    /// Podspine keeps no full migration path before v1, but a silent break of
+    /// an existing DB at request time is worse than a cheap `ADD COLUMN`
+    /// here. `CREATE TABLE IF NOT EXISTS` will not add a column to a table
+    /// that already exists, so an older `episode` table would lack
+    /// `start_sec`, and every audio/feed query would fail mid-request.
+    /// `ADD COLUMN` preserves all rows, and also the capability `feed_id`s (a
+    /// drop+recreate would rotate every feed URL). Existing episodes get
+    /// `start_sec = 0`; that value is only read for `saver`-mode
+    /// regeneration, and the next re-scan corrects it.
     fn migrate(conn: &Connection) -> Result<(), IndexError> {
         // `episode.start_sec` (saver-mode regeneration). Existing rows get 0;
         // corrected on the next re-scan.
@@ -229,38 +235,39 @@ impl Index {
         // matching how every pre-5.2 book was actually produced.
         add_column_if_missing(conn, "book", "transcode", "TEXT NOT NULL DEFAULT ''")?;
         // `book.created_at` (first-seen time, epoch millis). Its only use is
-        // picking the survivor when healing a database that holds two rows for one
-        // source: the earliest-created row is the feed subscribers have held
-        // longest (`collapse_duplicate_source_rows`).
+        // to pick the survivor when a database that holds two rows for one
+        // source is healed: the earliest-created row is the feed that
+        // subscribers have held longest (`collapse_duplicate_source_rows`).
         //
-        // Pre-existing rows are back-filled from `rowid`, NOT a flat 0. rowid is
-        // SQLite's monotonic insertion counter, so it reproduces the order rows
-        // were first written — which is exactly "created_at" for rows we didn't
-        // stamp. A flat 0 would tie every migrated row, and a database that already
-        // held a duplicate (an established suffixed `book-2` plus a later base
-        // `book`) would then fall back to id order and delete the established feed
-        // (Greptile). rowid keeps them distinct and correctly ordered. rowid values
-        // are tiny next to the epoch-millis stamps new rows get, so a migrated row
-        // always sorts before any row written afterwards — still correct, since it
-        // is genuinely older.
+        // Pre-existing rows are back-filled from `rowid`, NOT a flat 0. rowid
+        // is SQLite's monotonic insertion counter, so it reproduces the order
+        // in which rows were first written. That order is exactly
+        // "created_at" for rows that were never stamped. A flat 0 would tie
+        // every migrated row, and a database that already held a duplicate
+        // (an established suffixed `book-2` plus a later base `book`) would
+        // then fall back to id order and delete the established feed
+        // (Greptile). rowid keeps them distinct and correctly ordered. rowid
+        // values are tiny next to the epoch-millis stamps that new rows get,
+        // so a migrated row always sorts before any row written afterwards.
+        // That is still correct: the migrated row is genuinely older.
         if add_column_if_missing(conn, "book", "created_at", "INTEGER NOT NULL DEFAULT 0")? {
             conn.execute("UPDATE book SET created_at = rowid", [])?;
         }
-        // `book.status` is gone: it was write-only — always `"ready"`, never read
-        // anywhere in the workspace — so it was dead weight in every SELECT and
-        // struct literal. A database created by an older Podspine still carries
-        // the column (with `NOT NULL`, which would break the column-less INSERT
-        // in `upsert_book`), so drop it rather than leave fresh and migrated
-        // schemas divergent.
+        // `book.status` is gone: it was write-only (always `"ready"`, never
+        // read anywhere in the workspace), so it was dead weight in every
+        // SELECT and struct literal. A database created by an older Podspine
+        // still carries the column (with `NOT NULL`, which would break the
+        // column-less INSERT in `upsert_book`). So drop it; fresh and migrated
+        // schemas must not diverge.
         drop_column_if_present(conn, "book", "status")?;
         Ok(())
     }
 
-    /// Insert or update a book by `id` (idempotent — no duplicate rows).
+    /// Insert or update a book by `id` (idempotent: no duplicate rows).
     ///
-    /// On conflict, `feed_id` is **preserved**, not overwritten: a re-scan
-    /// supplies a fresh `feed_id` it doesn't know is already set, and the
-    /// capability must stay stable across re-scans (it changes only via
+    /// On conflict, `feed_id` is **preserved**, not overwritten. A re-scan
+    /// supplies a fresh `feed_id`; it does not know one is already set. And
+    /// the capability must stay stable across re-scans (it changes only via
     /// [`Index::regenerate_feed_id`]).
     pub fn upsert_book(&self, b: &BookRow) -> Result<(), IndexError> {
         self.conn.execute(
@@ -273,9 +280,9 @@ impl Index {
                source_mtime=excluded.source_mtime,
                storage_mode=excluded.storage_mode, default_cover_url=excluded.default_cover_url,
                force_embedded=excluded.force_embedded, transcode=excluded.transcode",
-            // created_at is set on first insert and deliberately absent from the
-            // UPDATE set, so a re-scan preserves a book's first-seen time — the same
-            // way feed_id is preserved.
+            // created_at is set on first insert and deliberately absent from
+            // the UPDATE set, so a re-scan preserves a book's first-seen time,
+            // the same way feed_id is preserved.
             params![
                 b.id,
                 b.slug,
@@ -285,9 +292,10 @@ impl Index {
                 b.cover_path,
                 b.source_path,
                 b.source_mtime,
-                // The enum↔TEXT boundary (write side): `None` persists as `""`,
-                // a known mode as its canonical label — byte-identical to what
-                // pre-typed builds wrote, so a re-scan never churns rows.
+                // The enum↔TEXT boundary (write side): `None` persists as
+                // `""`, and a known mode persists as its canonical label. That
+                // is byte-identical to what pre-typed builds wrote, so a
+                // re-scan never churns rows.
                 b.storage_mode.map_or("", StorageMode::label),
                 b.default_cover_url,
                 b.force_embedded,
@@ -360,10 +368,11 @@ impl Index {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// `(id, source_path, created_at)` for every book — the minimum the scanner
-    /// needs to collapse duplicate-source rows to their earliest-created survivor,
-    /// without pulling every full [`BookRow`]. Ordered oldest-first, id-tiebroken,
-    /// so a caller keeping the first of a source-group keeps the established feed.
+    /// `(id, source_path, created_at)` for every book: the minimum that the
+    /// scanner needs to collapse duplicate-source rows to their
+    /// earliest-created survivor, without a pull of every full [`BookRow`].
+    /// Ordered oldest-first, id-tiebroken, so a caller that keeps the first of
+    /// a source-group keeps the established feed.
     pub fn book_source_identities(&self) -> Result<Vec<(String, String, i64)>, IndexError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, source_path, created_at FROM book ORDER BY created_at ASC, id ASC",
@@ -383,8 +392,8 @@ impl Index {
     }
 
     /// Fetch a book by its capability `feed_id` (the public feed/audio/cover
-    /// lookup key). Unknown ids return `None` → 404, so a guessed id reveals
-    /// nothing.
+    /// lookup key). Unknown ids return `None`, which the caller maps to 404,
+    /// so a guessed id reveals nothing.
     pub fn get_book_by_feed_id(&self, feed_id: &str) -> Result<Option<BookRow>, IndexError> {
         Ok(self
             .conn
@@ -397,8 +406,8 @@ impl Index {
     }
 
     /// Rotate a book's capability id (leak recovery): the old feed/audio/cover
-    /// URLs stop resolving immediately. Returns the new `feed_id`. No-op returns
-    /// `Ok(None)` if the book id is unknown.
+    /// URLs stop resolving immediately. Return the new `feed_id`. An unknown
+    /// book id is a no-op that returns `Ok(None)`.
     pub fn regenerate_feed_id(&self, book_id: &str) -> Result<Option<String>, IndexError> {
         let new_id = capability::generate();
         let n = self.conn.execute(
@@ -418,7 +427,7 @@ impl Index {
 }
 
 /// Add `column` to `table` if it is missing; `ddl` is the type + constraints
-/// clause. Returns whether the column was added, so a migration can run a
+/// clause. Return whether the column was added, so that a migration can run a
 /// one-time backfill on exactly the databases that migrated.
 fn add_column_if_missing(
     conn: &Connection,
@@ -432,8 +441,8 @@ fn add_column_if_missing(
         |r| r.get(0),
     )?;
     if present == 0 {
-        // table/column/ddl are compile-time literals from `migrate`, never user
-        // input — safe to splice.
+        // table/column/ddl are compile-time literals from `migrate`, never
+        // user input. They are safe to splice.
         conn.execute(
             &format!("ALTER TABLE {table} ADD COLUMN {column} {ddl}"),
             [],
@@ -443,10 +452,11 @@ fn add_column_if_missing(
     Ok(false)
 }
 
-/// Drop `column` from `table` if present — [`add_column_if_missing`]'s inverse,
-/// for retiring a column an older Podspine wrote that nothing reads anymore.
-/// Same `pragma_table_info` probe; `ALTER TABLE … DROP COLUMN` needs SQLite ≥
-/// 3.35, and the bundled SQLite in rusqlite 0.40 is far past that.
+/// Drop `column` from `table` if present: [`add_column_if_missing`]'s
+/// inverse, used to retire a column that an older Podspine wrote and nothing
+/// reads anymore. It uses the same `pragma_table_info` probe.
+/// `ALTER TABLE … DROP COLUMN` needs SQLite ≥ 3.35, and the bundled SQLite in
+/// rusqlite 0.40 is far past that.
 fn drop_column_if_present(conn: &Connection, table: &str, column: &str) -> Result<(), IndexError> {
     let present: i64 = conn.query_row(
         "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
@@ -454,15 +464,17 @@ fn drop_column_if_present(conn: &Connection, table: &str, column: &str) -> Resul
         |r| r.get(0),
     )?;
     if present > 0 {
-        // table/column are compile-time literals from `migrate` — safe to splice.
+        // table/column are compile-time literals from `migrate`. They are
+        // safe to splice.
         conn.execute(&format!("ALTER TABLE {table} DROP COLUMN {column}"), [])?;
     }
     Ok(())
 }
 
-/// Wall-clock **milliseconds** since the Unix epoch, for a book's first-seen time.
-/// Milliseconds (not seconds) so two books indexed close together still order
-/// distinctly. A clock before 1970 (unset RTC) clamps to 0 rather than panicking.
+/// Wall-clock **milliseconds** since the Unix epoch, for a book's first-seen
+/// time. Milliseconds (not seconds), so that two books indexed close together
+/// still order distinctly. A clock before 1970 (an unset RTC) clamps to 0; it
+/// does not panic.
 fn now_epoch_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -470,8 +482,9 @@ fn now_epoch_millis() -> i64 {
         .unwrap_or(0)
 }
 
-/// The `book` SELECT column list. Order must match `book_from_row`'s ordinals —
-/// one definition so adding a column edits exactly one string and one mapper.
+/// The `book` SELECT column list. The order must match `book_from_row`'s
+/// ordinals. One definition, so that a new column edits exactly one string and
+/// one mapper.
 const BOOK_COLUMNS: &str = "id, slug, feed_id, title, author, cover_path, source_path, source_mtime, storage_mode, default_cover_url, force_embedded, transcode";
 
 fn book_from_row(row: &Row) -> rusqlite::Result<BookRow> {
@@ -484,10 +497,11 @@ fn book_from_row(row: &Row) -> rusqlite::Result<BookRow> {
         cover_path: row.get(5)?,
         source_path: row.get(6)?,
         source_mtime: row.get(7)?,
-        // The enum↔TEXT boundary (read side): `""` — a pre-6.4/pre-5.2 row — and
-        // any unrecognized value both map to `None`, preserving the historical
-        // fall-through-to-global behavior (a typo'd or future mode can never
-        // crash a serve; it just follows the server config until re-scanned).
+        // The enum↔TEXT boundary (read side): `""` (a pre-6.4/pre-5.2 row) and
+        // any unrecognized value both map to `None`, which preserves the
+        // historical fall-through-to-global behavior. A typo'd or future mode
+        // can never crash a serve; it follows the server config until the book
+        // is re-scanned.
         storage_mode: StorageMode::from_label(&row.get::<_, String>(8)?),
         default_cover_url: row.get(9)?,
         force_embedded: row.get(10)?,
@@ -606,7 +620,7 @@ mod tests {
     #[test]
     fn foreign_key_is_enforced() {
         let idx = Index::open_in_memory().unwrap();
-        // No such book -> FK violation.
+        // No such book, so the insert is an FK violation.
         let err = idx.upsert_episode(&episode("ghost", 0)).unwrap_err();
         assert!(matches!(err, IndexError::Sqlite(_)));
     }
@@ -666,8 +680,8 @@ mod tests {
             .unwrap();
         }
 
-        // Opening runs the additive migration: start_sec is added (default 0),
-        // existing rows and the capability feed_id survive.
+        // The open runs the additive migration: start_sec is added
+        // (default 0), and existing rows and the capability feed_id survive.
         let idx = Index::open(&db).unwrap();
         let eps = idx.episodes_for_book("b1").unwrap();
         assert_eq!(eps.len(), 1);
@@ -717,7 +731,7 @@ mod tests {
             "a migrated row is back-filled from its rowid (the only book, so rowid 1)"
         );
 
-        // Idempotent: reopening an already-migrated DB is a no-op.
+        // Idempotent: a reopen of an already-migrated DB is a no-op.
         drop(idx);
         assert!(Index::open(&db).is_ok());
     }
@@ -725,12 +739,13 @@ mod tests {
     #[test]
     fn migration_backfills_created_at_from_insertion_order() {
         // Greptile's case: a pre-`created_at` database that already holds an
-        // established suffixed row (`book-2`, inserted first) and a later base-id
-        // duplicate (`book`) for ONE source. Back-filling both to a flat 0 would
-        // tie them and let survivor-selection fall back to id order, deleting the
-        // established feed. rowid preserves insertion order, so `book-2` keeps the
-        // earlier `created_at` and `book_source_identities` returns it first — which
-        // is the row the heal keeps.
+        // established suffixed row (`book-2`, inserted first) and a later
+        // base-id duplicate (`book`) for ONE source. A back-fill of both to a
+        // flat 0 would tie them and let survivor-selection fall back to id
+        // order, which would delete the established feed. rowid preserves
+        // insertion order, so `book-2` keeps the earlier `created_at`, and
+        // `book_source_identities` returns it first. That is the row the heal
+        // keeps.
         let dir = scratch("index-createdat-order");
         let db = dir.join("old.db");
         {
@@ -742,7 +757,8 @@ mod tests {
                     source_mtime INTEGER NOT NULL, status TEXT NOT NULL);",
             )
             .unwrap();
-            // Established row FIRST (smaller rowid), duplicate SECOND — same source.
+            // The established row is FIRST (smaller rowid), the duplicate
+            // SECOND; both share one source.
             conn.execute(
                 "INSERT INTO book VALUES ('book-2','book-2','cap-established','Book',NULL,NULL,'/lib/book.m4b',1,'ready')",
                 [],
@@ -804,7 +820,7 @@ mod tests {
         assert!(idx.delete_book("b1").unwrap());
         assert_eq!(idx.get_book("b1").unwrap(), None);
         assert!(idx.episodes_for_book("b1").unwrap().is_empty());
-        // Deleting a missing book is a no-op.
+        // A delete of a missing book is a no-op.
         assert!(!idx.delete_book("b1").unwrap());
     }
 
@@ -813,8 +829,8 @@ mod tests {
         let idx = Index::open_in_memory().unwrap();
         idx.upsert_book(&book("b1", "a-book", "A Book")).unwrap();
 
-        // A re-scan supplies a different feed_id; the capability must be preserved
-        // (only title/etc update).
+        // A re-scan supplies a different feed_id; the capability must be
+        // preserved (only title etc. update).
         let mut rescan = book("b1", "a-book", "A Book v2");
         rescan.feed_id = "cap-DIFFERENT".to_string();
         idx.upsert_book(&rescan).unwrap();
@@ -837,7 +853,7 @@ mod tests {
             None,
             "old capability URL 404s after regenerate"
         );
-        // Unknown book → no-op.
+        // An unknown book is a no-op.
         assert_eq!(idx.regenerate_feed_id("ghost").unwrap(), None);
     }
 

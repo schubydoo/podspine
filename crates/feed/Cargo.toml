@@ -14,3 +14,6 @@ rss = { workspace = true }
 blake3 = { workspace = true }
 time = { workspace = true }
 thiserror = { workspace = true }
+
+[lints]
+workspace = true

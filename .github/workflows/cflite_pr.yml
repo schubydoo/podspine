@@ -1,16 +1,18 @@
-# ClusterFuzzLite — fuzz code changed by each PR (cargo-fuzz harnesses in fuzz/).
-# Informational / Phase-1: a short per-PR run on the address sanitizer; NOT a
-# required check, so a flaky finding never blocks a merge, but a reproducible
-# crash surfaces here (and as SARIF in the Security tab). Deeper runs live in the
-# scheduled cflite_batch.yml. No corpus secret here (fork-PR-safe).
+# ClusterFuzzLite: fuzz the code that each PR changes (cargo-fuzz harnesses
+# in fuzz/). Informational / Phase-1: a short per-PR run on the address
+# sanitizer. It is NOT a required check, so a flaky finding never blocks a
+# merge, but a reproducible crash surfaces here (and as SARIF in the Security
+# tab). Deeper runs live in the scheduled cflite_batch.yml. No corpus secret
+# lives here (fork-PR-safe).
 # Docs: https://google.github.io/clusterfuzzlite/
 name: ClusterFuzzLite PR fuzzing
 
 on:
   pull_request:
     branches: [main]
-    # Fuzz only when fuzz-relevant code changes, and only on open/reopen/ready
-    # (not every `synchronize` push). The nightly batch is the deep fuzzer.
+    # Fuzz only when fuzz-relevant code changes, and only on
+    # open/reopen/ready (not on every `synchronize` push). The nightly batch
+    # is the deep fuzzer.
     types: [opened, reopened, ready_for_review]
     paths:
       - "src/**"

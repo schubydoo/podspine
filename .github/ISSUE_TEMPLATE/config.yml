@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 # No contact_links, deliberately:
-#   - Discussions is not enabled for this repo, so a link to /discussions 404s.
-#     Usage questions belong in Issues (Bug Report / Feature Request).
+#   - Discussions is not enabled for this repo, so a link to /discussions
+#     404s. Usage questions belong in Issues (Bug Report / Feature Request).
 #   - Private vulnerability reporting IS enabled, so GitHub renders its own
 #     "Report a security vulnerability" entry in the chooser. The hand-written
-#     link to /security/advisories/new duplicated it — the same option appeared
+#     link to /security/advisories/new duplicated it: the same option appeared
 #     twice, with two different descriptions.

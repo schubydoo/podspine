@@ -3,8 +3,8 @@
 //!
 //! The library path is the only required input; everything else has a default,
 //! so `podspine --library ./books` just works. Failures (missing library,
-//! unparseable bind address, absent ffmpeg/ffprobe) surface as a clear fatal
-//! error at startup — never mid-request. See TAD §4.
+//! unparsable bind address, absent ffmpeg/ffprobe) surface as a clear fatal
+//! error at startup, never mid-request. See TAD §4.
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -23,8 +23,9 @@ const DEFAULT_DATA_DIR: &str = "./data";
 const DEFAULT_CACHE_SIZE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// How a **chaptered** book's per-chapter episodes are produced and stored.
-/// Whole-file episodes (MP3-folder tracks, chapterless single files) ignore this
-/// — they are streamed in place from the library, never extracted (Sprint 6.2).
+/// Whole-file episodes (MP3-folder tracks, chapterless single files) ignore
+/// this: they are streamed in place from the library, never extracted
+/// (Sprint 6.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StorageMode {
@@ -38,7 +39,7 @@ pub enum StorageMode {
 }
 
 impl StorageMode {
-    /// The canonical label for this mode (`"full"`/`"saver"`) — the TOML/CLI
+    /// The canonical label for this mode (`"full"`/`"saver"`): the TOML/CLI
     /// spelling, and the TEXT the index persists in `book.storage_mode`.
     #[must_use]
     pub fn label(self) -> &'static str {
@@ -59,27 +60,30 @@ impl StorageMode {
     }
 }
 
-/// Whether to re-encode sources no podcatcher can play, and to what (Task 5.2).
+/// Whether to re-encode sources that no podcatcher can play, and to what
+/// (Task 5.2).
 ///
 /// Off by default: Podspine is copy-first, and a re-encode both costs CPU at
-/// ingest and loses quality. Turn it on for a library of FLAC/Ogg/Opus/ALAC books
-/// that clients refuse to play. Podcast-safe sources (MP3, AAC) are never
-/// re-encoded, whatever this is set to.
+/// ingest and loses quality. Turn it on for a library of FLAC/Ogg/Opus/ALAC
+/// books that clients refuse to play. Podcast-safe sources (MP3, AAC) are
+/// never re-encoded, independent of this setting.
 ///
-/// A transcoded book is always stored `full`, even under `storage_mode = "saver"`:
-/// a re-encode is not byte-reproducible across ffmpeg builds, so regenerating a
-/// chapter on demand could serve bytes whose length no longer matches the
-/// `enclosure length` already published in the feed.
+/// A transcoded book is always stored `full`, even under
+/// `storage_mode = "saver"`: a re-encode is not byte-reproducible across
+/// ffmpeg builds, so a chapter regenerated on demand could serve bytes whose
+/// length no longer matches the `enclosure length` already published in the
+/// feed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TranscodeMode {
-    /// Never re-encode — serve every source stream-copied (the default).
+    /// Never re-encode: serve every source stream-copied (the default).
     #[default]
     Off,
     /// Re-encode non-podcast-safe sources to AAC 128 kbps (`.m4a`).
     Aac,
-    /// Re-encode non-podcast-safe sources to MP3 128 kbps — the fallback for
-    /// clients that still choke on AAC. Needs an ffmpeg built with `libmp3lame`.
+    /// Re-encode non-podcast-safe sources to MP3 128 kbps: the fallback for
+    /// clients that still do not play AAC. This needs an ffmpeg built with
+    /// `libmp3lame`.
     Mp3,
 }
 
@@ -90,7 +94,7 @@ impl TranscodeMode {
         !matches!(self, TranscodeMode::Off)
     }
 
-    /// The canonical label for this mode (`"off"`/`"aac"`/`"mp3"`) — the
+    /// The canonical label for this mode (`"off"`/`"aac"`/`"mp3"`): the
     /// TOML/CLI spelling, and the TEXT the index persists in `book.transcode`.
     #[must_use]
     pub fn label(self) -> &'static str {
@@ -140,10 +144,11 @@ pub struct Cli {
     /// Force embedded chapters, ignoring any `.cue`/`.ffmeta` sidecar.
     #[arg(long, env = "PODSPINE_FORCE_EMBEDDED_CHAPTERS")]
     pub force_embedded_chapters: bool,
-    /// Remux a non-faststart whole-file mp4 (`moov` after `mdat`) to faststart on
-    /// demand so podcast clients seek quickly, instead of serving it in place. The
-    /// remux is stream-copied and cache-managed (counts against the `saver` cache
-    /// cap), never a pinned duplicate. Default off: serve in place + log a callout.
+    /// Remux a non-faststart whole-file mp4 (`moov` after `mdat`) to faststart
+    /// on demand, so that podcast clients seek quickly, instead of serving it
+    /// in place. The remux is stream-copied and cache-managed (it counts
+    /// against the `saver` cache cap), never a pinned duplicate. Default off:
+    /// serve in place and log a notice.
     #[arg(long, env = "PODSPINE_REMUX_NON_FASTSTART")]
     pub remux_non_faststart: bool,
     /// Chapter storage strategy for **chaptered** books: `full` pre-splits every
@@ -153,10 +158,11 @@ pub struct Cli {
     /// chapterless singles), which are served in place from the library.
     #[arg(long, env = "PODSPINE_STORAGE_MODE")]
     pub storage_mode: Option<StorageMode>,
-    /// Re-encode sources podcatchers can't play (FLAC/Ogg/Opus/ALAC) to `aac`
-    /// 128k or `mp3` 128k; `off` (default) serves every source stream-copied.
-    /// MP3/AAC sources are never re-encoded. A transcoded book is always stored
-    /// `full` (a re-encode can't be regenerated byte-for-byte on demand).
+    /// Re-encode sources that podcatchers cannot play (FLAC/Ogg/Opus/ALAC) to
+    /// `aac` 128k or `mp3` 128k; `off` (default) serves every source
+    /// stream-copied. MP3/AAC sources are never re-encoded. A transcoded book
+    /// is always stored `full` (a re-encode cannot be regenerated
+    /// byte-for-byte on demand).
     #[arg(long, env = "PODSPINE_TRANSCODE")]
     pub transcode: Option<TranscodeMode>,
     /// Max disk for the on-demand chapter cache in `saver` mode (e.g. `2GB`,
@@ -167,11 +173,12 @@ pub struct Cli {
     /// size-only eviction). Ignored in `full` mode.
     #[arg(long, env = "PODSPINE_CACHE_TTL")]
     pub cache_ttl: Option<String>,
-    /// Serve Prometheus metrics on this address, e.g. `127.0.0.1:9090`. Unset =
-    /// no metrics endpoint and no recorder (the instrumentation compiles to
-    /// no-ops). Deliberately a *separate* listener from `--bind`: metrics expose
-    /// operator data — library size, error counts — that has no business on the
-    /// same surface as internet-facing feeds. Bind it to loopback or the LAN.
+    /// Serve Prometheus metrics on this address, e.g. `127.0.0.1:9090`. Unset
+    /// means no metrics endpoint and no recorder (the instrumentation compiles
+    /// to no-ops). This is deliberately a *separate* listener from `--bind`:
+    /// metrics expose operator data (library size, error counts) that has no
+    /// business on the same surface as internet-facing feeds. Bind it to
+    /// loopback or the LAN.
     #[arg(long, env = "PODSPINE_METRICS_BIND")]
     pub metrics_bind: Option<String>,
     /// Optional TOML config file.
@@ -225,35 +232,38 @@ pub struct Config {
     pub default_cover_url: Option<String>,
     /// Ignore `.cue`/`.ffmeta` sidecars and always use embedded chapters.
     pub force_embedded_chapters: bool,
-    /// Remux a non-faststart whole-file mp4 (`moov` after `mdat`) to faststart on
-    /// demand rather than serving it in place — so podcast clients seek quickly.
-    /// The remuxed copy is stream-copied and cache-managed (evicted under the
-    /// `saver` cap, regenerated on demand), never a pinned duplicate. Default off:
-    /// such books serve in place and a one-line callout is logged at ingest. No
-    /// effect on faststart mp4, MP3/OGG/FLAC, or chaptered books (Sprint 6.3).
+    /// Remux a non-faststart whole-file mp4 (`moov` after `mdat`) to faststart
+    /// on demand, instead of serving it in place, so that podcast clients seek
+    /// quickly. The remuxed copy is stream-copied and cache-managed (evicted
+    /// under the `saver` cap, regenerated on demand), never a pinned
+    /// duplicate. Default off: such books serve in place, and the ingest logs
+    /// a one-line notice. There is no effect on faststart mp4, MP3/OGG/FLAC,
+    /// or chaptered books (Sprint 6.3).
     pub remux_non_faststart: bool,
     /// How **chaptered** books are produced/stored: `full` (pre-split every
-    /// chapter to disk) or `saver` (split at ingest, then cache regenerations on
-    /// demand). Applies library-wide to chaptered books, which materialize under
-    /// `data_dir`. Whole-file episodes (MP3-folder tracks, chapterless single
-    /// files) are unaffected — they stream in place from the library (Sprint 6.2).
+    /// chapter to disk) or `saver` (split at ingest, then cache regenerations
+    /// on demand). This applies library-wide to chaptered books, which
+    /// materialize under `data_dir`. Whole-file episodes (MP3-folder tracks,
+    /// chapterless single files) are unaffected: they stream in place from the
+    /// library (Sprint 6.2).
     pub storage_mode: StorageMode,
-    /// Whether non-podcast-safe sources (FLAC/Vorbis/Opus/ALAC) are re-encoded at
-    /// ingest, and to what (Task 5.2). `Off` by default — Podspine is copy-first.
-    /// MP3/AAC sources are never re-encoded. A transcoded book is materialized
-    /// `full` regardless of `storage_mode`; see [`TranscodeMode`].
+    /// Whether non-podcast-safe sources (FLAC/Vorbis/Opus/ALAC) are re-encoded
+    /// at ingest, and to what (Task 5.2). `Off` by default: Podspine is
+    /// copy-first. MP3/AAC sources are never re-encoded. A transcoded book is
+    /// materialized `full`, independent of `storage_mode`; see
+    /// [`TranscodeMode`].
     pub transcode: TranscodeMode,
     /// Cache size cap in bytes for `saver` mode (`None` = unbounded).
     pub cache_size_bytes: Option<u64>,
     /// TTL for cached chapters in `saver` mode (`None` = size-only eviction).
     pub cache_ttl: Option<Duration>,
     /// Address for the Prometheus metrics listener (`None` = metrics disabled,
-    /// no recorder installed). Always a second listener, never `bind` — see the
+    /// no recorder installed). Always a second listener, never `bind`; see the
     /// `Cli::metrics_bind` note on why this surface is kept separate.
     pub metrics_bind: Option<SocketAddr>,
 }
 
-/// Configuration failures — all fatal, all reported at startup.
+/// Configuration failures: all fatal, all reported at startup.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     /// No library path from any source.
@@ -332,7 +342,7 @@ pub enum ConfigError {
     ParseConfig {
         /// The path.
         path: PathBuf,
-        /// TOML error (boxed — `toml::de::Error` is large, keeping
+        /// TOML error (boxed: `toml::de::Error` is large, and the box keeps
         /// `ConfigError`/`Result` small; see clippy `result_large_err`).
         source: Box<toml::de::Error>,
     },
@@ -350,7 +360,7 @@ impl Config {
         Ok(config)
     }
 
-    /// Merge CLI/env over TOML over defaults (pure — no filesystem or process
+    /// Merge CLI/env over TOML over defaults (pure: no filesystem or process
     /// checks). `validate`/`preflight` do the environment-touching work.
     pub fn resolve(cli: &Cli, file: &FileConfig) -> Result<Self, ConfigError> {
         let library = cli
@@ -447,8 +457,9 @@ impl Config {
         if !self.library.is_dir() {
             return Err(ConfigError::LibraryNotDir(self.library.clone()));
         }
-        // Catch the metrics/feed surface collision here rather than as an opaque
-        // "address in use" from the second listener half a second into startup.
+        // Catch the metrics/feed surface collision here, not as an opaque
+        // "address in use" from the second listener half a second into
+        // startup.
         if let Some(metrics) = self.metrics_bind
             && binds_collide(metrics, self.bind)
         {
@@ -465,8 +476,8 @@ impl Config {
     }
 }
 
-/// Load a TOML config file. `None` yields an empty config; an explicit path that
-/// can't be read or parsed is a fatal error.
+/// Load a TOML config file. `None` yields an empty config; an explicit path
+/// that cannot be read or parsed is a fatal error.
 fn load_file(path: Option<&Path>) -> Result<FileConfig, ConfigError> {
     let Some(path) = path else {
         return Ok(FileConfig::default());
@@ -483,7 +494,7 @@ fn load_file(path: Option<&Path>) -> Result<FileConfig, ConfigError> {
 
 /// Whether two listeners would fight over the same port.
 ///
-/// Equality isn't enough on two counts:
+/// Equality is not enough, for two reasons:
 ///
 /// - A wildcard bind claims every interface, so `0.0.0.0:8080` and
 ///   `127.0.0.1:8080` collide even though the addresses differ.
@@ -511,8 +522,9 @@ fn canonical_ip(ip: IpAddr) -> IpAddr {
     }
 }
 
-/// Verify `ffmpeg` and `ffprobe` are on PATH by execing `-version`. Fails fast so
-/// a missing toolchain is a startup error, not a mid-request surprise.
+/// Verify that `ffmpeg` and `ffprobe` are on PATH: exec `-version`. This
+/// fails fast, so a missing toolchain is a startup error, not a mid-request
+/// surprise.
 pub fn preflight() -> Result<(), ConfigError> {
     for tool in ["ffmpeg", "ffprobe"] {
         let ran = Command::new(tool)
@@ -559,7 +571,8 @@ fn parse_size(s: &str) -> Result<Option<u64>, String> {
         other => return Err(format!("unknown size unit {other:?} (use B/KB/MB/GB/TB)")),
     };
     let bytes = (value * mult as f64) as u64;
-    // A positive-but-tiny value rounding to 0 bytes is a mistake, not "unbounded".
+    // A positive but tiny value that rounds to 0 bytes is a mistake, not
+    // "unbounded".
     Ok(if bytes == 0 { None } else { Some(bytes) })
 }
 
@@ -663,7 +676,7 @@ mod tests {
 
     #[test]
     fn default_cover_url_resolves_from_cli_over_file_and_defaults_none() {
-        // Unset everywhere -> None.
+        // Unset everywhere gives `None`.
         let c = Config::resolve(&cli(Some("/books")), &FileConfig::default()).unwrap();
         assert_eq!(c.default_cover_url, None);
 
@@ -755,8 +768,9 @@ mod tests {
 
     #[test]
     fn a_wildcard_feed_bind_collides_with_a_specific_metrics_bind() {
-        // 0.0.0.0:8080 already claims 127.0.0.1:8080 — without this the second
-        // listener dies with a bare "address already in use" at startup.
+        // 0.0.0.0:8080 already claims 127.0.0.1:8080. Without this check, the
+        // second listener dies with a bare "address already in use" at
+        // startup.
         assert!(matches!(
             validate_binds("cfg-collide-wild", "0.0.0.0:8080", "127.0.0.1:8080"),
             Err(ConfigError::MetricsBindConflict { .. })
@@ -816,7 +830,7 @@ mod tests {
         // Folding must not make unrelated addresses collide.
         let elsewhere: SocketAddr = "[::ffff:192.0.2.1]:8080".parse().unwrap();
         assert!(!binds_collide(elsewhere, loopback));
-        // ...nor override the port check.
+        // It must also not override the port check.
         let mapped_other_port: SocketAddr = "[::ffff:127.0.0.1]:9090".parse().unwrap();
         assert!(!binds_collide(mapped_other_port, loopback));
     }
@@ -892,9 +906,10 @@ mod tests {
 
     #[test]
     fn preflight_matches_ffmpeg_availability() {
-        // ffmpeg/ffprobe aren't on every runner (e.g. the informational Windows
-        // leg, or a bare dev box), so don't hard-require them — assert instead that
-        // preflight's result MATCHES whether they're actually invocable.
+        // ffmpeg/ffprobe are not on every runner (e.g. the informational
+        // Windows leg, or a bare dev box), so do not hard-require them.
+        // Instead, assert that preflight's result MATCHES whether they are
+        // actually invocable.
         let have = ["ffmpeg", "ffprobe"].iter().all(|t| {
             std::process::Command::new(t)
                 .arg("-version")
@@ -965,8 +980,8 @@ mod tests {
     #[test]
     fn mode_labels_are_pinned_and_round_trip() {
         // These labels are persisted in the index (`book.storage_mode` /
-        // `book.transcode`), so changing one would re-ingest every library on
-        // upgrade — pin all values.
+        // `book.transcode`), so a change to one would re-ingest every library
+        // on upgrade. Pin all values.
         for (mode, label) in [(StorageMode::Full, "full"), (StorageMode::Saver, "saver")] {
             assert_eq!(mode.label(), label);
             assert_eq!(StorageMode::from_label(label), Some(mode));
@@ -979,7 +994,7 @@ mod tests {
             assert_eq!(mode.label(), label);
             assert_eq!(TranscodeMode::from_label(label), Some(mode));
         }
-        // Unknown or empty labels don't parse (the index reads them as None).
+        // Unknown or empty labels do not parse (the index reads them as None).
         assert_eq!(StorageMode::from_label(""), None);
         assert_eq!(StorageMode::from_label("Saver"), None);
         assert_eq!(TranscodeMode::from_label(""), None);
@@ -1022,12 +1037,14 @@ mod tests {
 
     #[test]
     fn validate_rejects_a_missing_or_non_dir_library() {
-        // Own subdir — must NOT share a fixed path with any sibling test, or the
-        // parallel runner races `scratch()`'s wipe-and-recreate against
-        // `validate_accepts_a_real_dir_and_creates_data_dir` (uses `-validate`).
+        // Own subdir: it must NOT share a fixed path with any sibling test.
+        // Otherwise the parallel runner races `scratch()`'s wipe-and-recreate
+        // against `validate_accepts_a_real_dir_and_creates_data_dir` (which
+        // uses `-validate`).
         let tmp = scratch("cfg-validate-reject");
 
-        // --library points at a real FILE (not a directory) → LibraryNotDir.
+        // --library points at a real FILE (not a directory), which gives
+        // `LibraryNotDir`.
         let as_file = tmp.join("not-a-dir");
         std::fs::write(&as_file, b"x").unwrap();
         let c = Config::resolve(
@@ -1037,7 +1054,7 @@ mod tests {
         .unwrap();
         assert!(matches!(c.validate(), Err(ConfigError::LibraryNotDir(_))));
 
-        // A missing --library → LibraryNotFound.
+        // A missing --library gives `LibraryNotFound`.
         let missing = tmp.join("nope");
         let c2 = Config::resolve(
             &cli(Some(missing.to_str().unwrap())),
@@ -1060,8 +1077,8 @@ mod tests {
 
     #[test]
     fn validate_reports_data_dir_when_the_path_is_unwritable() {
-        // library is a real dir (passes exists/is_dir), but data_dir sits UNDER a
-        // regular file, so create_dir_all fails -> ConfigError::DataDir.
+        // library is a real dir (passes exists/is_dir), but data_dir sits
+        // UNDER a regular file, so create_dir_all fails: `ConfigError::DataDir`.
         let tmp = scratch("cfg-datadir");
         let blocker = tmp.join("iam-a-file");
         std::fs::write(&blocker, b"x").unwrap();

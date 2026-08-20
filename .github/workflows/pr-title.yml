@@ -1,11 +1,12 @@
 name: PR Title
 
-# Validate that the pull-request title follows Conventional Commits. The repo
-# squash-merges, so the PR title becomes the squashed commit subject — keeping a
-# clean, conventional history that Knope can drive releases/CHANGELOG from later.
+# Validate that the pull-request title follows Conventional Commits. The
+# repo squash-merges, so the PR title becomes the squashed commit subject.
+# That keeps a clean, conventional history.
 #
-# Keep `synchronize` in the triggers: if this is made a REQUIRED check, required
-# checks are evaluated per head-SHA, so a fixup push needs a fresh check run.
+# Keep `synchronize` in the triggers: if this becomes a REQUIRED check,
+# required checks are evaluated per head-SHA, so a fixup push needs a fresh
+# check run.
 
 on:
   pull_request:
@@ -26,12 +27,13 @@ jobs:
     permissions:
       pull-requests: read
     steps:
-      # Mint a short-lived podspine-ci App installation token (≥5,000 REST req/hr,
-      # vs the 1,000/hr github-actions[bot] pool that fails spuriously under
-      # multi-PR bursts). Same-repo PRs only — fork PRs can't read the App secrets,
-      # so the step is skipped there and the action falls back to GITHUB_TOKEN.
-      # Soft-fail: until the App secrets exist the mint yields an empty token and
-      # this required check still runs under GITHUB_TOKEN instead of erroring.
+      # Mint a short-lived podspine-ci App installation token (≥5,000 REST
+      # req/hr, vs the 1,000/hr github-actions[bot] pool that fails spuriously
+      # under multi-PR bursts). Same-repo PRs only: fork PRs cannot read the
+      # App secrets, so the step is skipped there, and the action falls back
+      # to GITHUB_TOKEN. Soft-fail: until the App secrets exist, the mint
+      # yields an empty token, and this check still runs under GITHUB_TOKEN;
+      # it does not error.
       - name: Mint podspine-ci App token
         id: app-token
         if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}

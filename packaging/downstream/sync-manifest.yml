@@ -1,10 +1,11 @@
 # INSTALL THIS INTO the schubydoo/scoop-podspine repo at
 # .github/workflows/sync-manifest.yml  (it does NOT run from the main podspine repo).
 #
-# The canonical Scoop manifest lives in the main repo (schubydoo/podspine) at
-# packaging/scoop/podspine.json, regenerated on every release by packaging-bump.yml.
-# This bucket mirrors it to bucket/podspine.json so `scoop bucket add podspine
-# https://github.com/schubydoo/scoop-podspine; scoop install podspine` works. Auth-free.
+# The canonical Scoop manifest lives in the main repo (schubydoo/podspine)
+# at packaging/scoop/podspine.json; packaging-bump.yml regenerates it on
+# every release. This bucket mirrors it to bucket/podspine.json, so that
+# `scoop bucket add podspine https://github.com/schubydoo/scoop-podspine;
+# scoop install podspine` works. Auth-free.
 name: Sync manifest from podspine
 
 on:
@@ -38,7 +39,8 @@ jobs:
             echo "::notice::could not fetch $SRC (not on main yet?) — skipping this run"
             exit 0
           fi
-          # Fail closed unless it parses as JSON with a version (never commit garbage).
+          # Fail closed unless it parses as JSON with a version (never commit
+          # garbage).
           if ! python3 -c "import json,sys; d=json.load(open('$tmp')); sys.exit(0 if d.get('version') else 1)"; then
             echo "::error::fetched content is not a valid podspine Scoop manifest"
             exit 1

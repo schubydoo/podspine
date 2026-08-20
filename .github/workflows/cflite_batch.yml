@@ -1,14 +1,16 @@
-# ClusterFuzzLite — scheduled BATCH fuzzing (the deep counterpart to cflite_pr).
-# Runs EVERY harness in fuzz/ on a schedule (`mode: batch`), so unchanged code is
-# re-fuzzed regularly and each target gets a longer run. A reproducible crash
-# surfaces here + as SARIF. NOT a required check — it signals, never gates.
+# ClusterFuzzLite: scheduled BATCH fuzzing (the deep counterpart to
+# cflite_pr). It runs EVERY harness in fuzz/ on a schedule (`mode: batch`),
+# so unchanged code is re-fuzzed regularly and each target gets a longer run.
+# A reproducible crash surfaces here and as SARIF. NOT a required check: it
+# signals, never gates.
 #
-# Corpus persistence (optional): clones a private storage-repo, fuzzes, and pushes
-# the grown corpus back so coverage compounds across runs. Needs a
-# `schubydoo/podspine-fuzz-corpus` repo + a `FUZZ_STORAGE_TOKEN` PAT (write) — see
-# the publish checklist. The PR job deliberately carries no such secret. If the
-# secret is unset the job still runs (fuzzing from seed), it just won't accumulate.
-# `fuzz-seconds` is PER target → wall-clock ≈ fuzz-seconds × harness count + build.
+# Corpus persistence (optional): the job clones a private storage-repo,
+# fuzzes, and pushes the grown corpus back, so coverage compounds across
+# runs. This needs a `schubydoo/podspine-fuzz-corpus` repo and a
+# `FUZZ_STORAGE_TOKEN` PAT (write); see the publish checklist. The PR job
+# deliberately carries no such secret. If the secret is unset, the job still
+# runs (it fuzzes from seed); it only does not accumulate. `fuzz-seconds` is
+# PER target, so wall-clock ≈ fuzz-seconds × harness count + build.
 # Docs: https://google.github.io/clusterfuzzlite/
 name: ClusterFuzzLite batch fuzzing
 

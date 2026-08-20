@@ -1,0 +1,8 @@
+# Configuration for `typos` (the Typos CI step and local runs).
+# Add a word here only when `typos` flags a term that is correct.
+
+[default.extend-words]
+# `.opf` is the Calibre/EPUB metadata sidecar extension (never a chapter source).
+opf = "opf"
+# in-toto is the supply-chain attestation format (`podspine.intoto.jsonl`).
+intoto = "intoto"

@@ -17,3 +17,6 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 podspine-test-support = { path = "../test-support" }
+
+[lints]
+workspace = true

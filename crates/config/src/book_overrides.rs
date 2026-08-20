@@ -205,9 +205,10 @@ mod tests {
         std::fs::write(&audio, b"x").unwrap();
         assert_eq!(load(&audio, &lib).unwrap(), None, "no sidecar → Ok(None)");
 
-        // An unknown key (typo) is a parse error → per-book warning, not fatal.
-        std::fs::write(lib.join("Book.podspine.toml"), b"stroage_mode = \"saver\"").unwrap();
-        assert!(load(&audio, &lib).is_err(), "unknown key → Err");
+        // An unknown key (a typo, here a stray plural) is a parse error: a
+        // per-book warning, not fatal.
+        std::fs::write(lib.join("Book.podspine.toml"), b"storage_modes = \"saver\"").unwrap();
+        assert!(load(&audio, &lib).is_err(), "an unknown key must give Err");
         let _ = std::fs::remove_dir_all(&lib);
     }
 }

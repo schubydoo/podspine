@@ -14,3 +14,6 @@ podspine-prober = { path = "../prober" }
 
 [dev-dependencies]
 podspine-test-support = { path = "../test-support" }
+
+[lints]
+workspace = true

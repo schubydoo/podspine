@@ -1,8 +1,8 @@
-# Rust build artifacts (Cargo.lock IS committed — this is a binary/app)
+# Rust build artifacts (Cargo.lock IS committed: this is a binary/app)
 /target/
 **/*.rs.bk
 
-# Scratch space — uncommitted docs, data, and scratch files
+# Scratch space: uncommitted docs, data, and scratch files
 /scratch/
 
 # Source planning docs (kept local, not committed for now)
