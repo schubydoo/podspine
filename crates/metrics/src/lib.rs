@@ -7,14 +7,15 @@
 //!
 //! The endpoint is a **standalone listener**, never a route on the feed server.
 //! Feeds are capability URLs meant to be safe to expose publicly ([TAD §5.3]);
-//! metrics are operator data — how many books exist, how often things fail —
-//! and putting them on that same surface would hand an anonymous caller a
+//! metrics are operator data (how many books exist, how often things fail),
+//! and to put them on that same surface would hand an anonymous caller a
 //! library-size oracle. Bind this to loopback or the LAN.
 //!
 //! Label cardinality is deliberately bounded: the only label anywhere is
 //! [`ErrorKind`], a closed set of three static strings. Book titles, slugs,
-//! capability ids, and filesystem paths are never emitted — they would both
-//! explode series count and leak exactly what the private-feed design protects.
+//! capability ids, and filesystem paths are never emitted: they would both
+//! explode the series count and leak exactly what the private-feed design
+//! protects.
 
 use std::time::Duration;
 
@@ -34,26 +35,27 @@ pub const SPLIT_DURATION: &str = "podspine_split_duration_seconds";
 /// Request failures, labelled by [`ErrorKind`] (counter).
 pub const ERRORS: &str = "podspine_errors_total";
 
-/// Bucket bounds (seconds) for [`SPLIT_DURATION`]. Chosen around the measured
-/// ingest profile — a stream-copy chapter split lands in the tens of
-/// milliseconds to a few seconds — with a long tail up to two minutes so a
-/// pathological source is visible rather than lumped into `+Inf`.
+/// Bucket bounds (seconds) for [`SPLIT_DURATION`]. The bounds are chosen
+/// around the measured ingest profile (a stream-copy chapter split lands in
+/// the tens of milliseconds to a few seconds), with a long tail up to two
+/// minutes, so that a pathological source is visible and not lumped into
+/// `+Inf`.
 const SPLIT_BUCKETS: &[f64] = &[0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0];
 
-/// How often histogram data is drained. Without this the recorder's histograms
-/// grow unboundedly — with the crate's own HTTP listener disabled, running
-/// upkeep is our job.
+/// How often histogram data is drained. Without this, the recorder's
+/// histograms grow without bound. The crate's own HTTP listener is disabled,
+/// so the upkeep run is this crate's job.
 const UPKEEP_INTERVAL: Duration = Duration::from_secs(30);
 
-/// What failed, as a bounded label set. Kept to a closed enum of static strings
-/// so series count can't grow with traffic.
+/// What failed, as a bounded label set. Kept to a closed enum of static
+/// strings, so that the series count cannot grow with traffic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
     /// Unknown book, episode, or capability id (also every rejected slug).
     NotFound,
     /// A resolved path escaped its trusted root, or an origin check failed.
     Forbidden,
-    /// Anything we consider our own fault: I/O, ffmpeg, index, render.
+    /// Anything that is Podspine's own fault: I/O, ffmpeg, index, render.
     Internal,
 }
 
@@ -73,7 +75,7 @@ impl ErrorKind {
 /// Call once, before serving. Until this runs every helper below is a no-op.
 ///
 /// # Errors
-/// Returns [`BuildError`] if the recorder can't be built, or if a global
+/// Returns [`BuildError`] if the recorder cannot be built, or if a global
 /// recorder was already installed.
 pub fn install() -> Result<PrometheusHandle, BuildError> {
     let handle = PrometheusBuilder::new()
@@ -85,13 +87,13 @@ pub fn install() -> Result<PrometheusHandle, BuildError> {
     metrics::describe_histogram!(SPLIT_DURATION, "Seconds spent splitting one chapter");
     metrics::describe_counter!(ERRORS, "Request failures by kind");
 
-    // Touch every counter/gauge at zero. The exporter only renders a series once
-    // it has been recorded, so without this a freshly started server exposes
-    // nothing and dashboards read "no data" — indistinguishable from a scrape
-    // failure — until the first feed request happens to arrive. The histogram is
-    // deliberately left out: there is no way to register it without recording an
-    // observation, and a fake 0s split would skew the very distribution it exists
-    // to measure.
+    // Touch every counter/gauge at zero. The exporter only renders a series
+    // once it has been recorded. Without this, a freshly started server
+    // exposes nothing, and dashboards read "no data" (indistinguishable from
+    // a scrape failure) until the first feed request happens to arrive. The
+    // histogram is deliberately left out: there is no way to register it
+    // without an observation, and a fake 0s split would skew the very
+    // distribution it exists to measure.
     metrics::gauge!(BOOKS_INDEXED).set(0.0);
     metrics::counter!(FEEDS_SERVED).increment(0);
     for kind in [
@@ -145,12 +147,12 @@ async fn render(State(handle): State<PrometheusHandle>) -> impl IntoResponse {
 }
 
 /// Serve the metrics endpoint on an already-bound listener until shutdown,
-/// draining histograms on an interval alongside it.
+/// and drain histograms on an interval alongside it.
 ///
 /// Takes a bound listener rather than an address on purpose: this runs as a
 /// detached background task, so a bind failure here would only reach a log
-/// line. The caller binds first and treats that failure as fatal — if the
-/// operator asked for metrics and the port is taken, they should hear about it
+/// line. The caller binds first and treats that failure as fatal. If the
+/// operator asked for metrics and the port is taken, they must hear about it
 /// at startup, not discover a silently missing endpoint at scrape time.
 ///
 /// # Errors
@@ -179,7 +181,7 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    /// One recorder per process — `install` on a second test would fail with
+    /// One recorder per process: `install` on a second test would fail with
     /// `FailedToSetGlobalRecorder`, so the tests that need real output share
     /// this one handle.
     ///
@@ -311,7 +313,7 @@ mod tests {
     #[tokio::test]
     async fn serve_answers_a_real_scrape_over_tcp() {
         // The oneshot tests above exercise the router; this covers `serve`
-        // itself — the listener, the spawned upkeep task, and the wiring in
+        // itself: the listener, the spawned upkeep task, and the wiring in
         // between, which is what a Prometheus scrape actually talks to.
         let installed = handle();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -327,8 +329,8 @@ mod tests {
         server.abort();
     }
 
-    /// Minimal HTTP/1.1 GET — enough to prove the listener answers, without
-    /// adding an HTTP client dependency for one test.
+    /// Minimal HTTP/1.1 GET: enough to prove that the listener answers,
+    /// without an HTTP client dependency for one test.
     async fn reqwest_get(url: &str) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (host, path) = url.trim_start_matches("http://").split_once('/').unwrap();

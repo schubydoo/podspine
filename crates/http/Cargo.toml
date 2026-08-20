@@ -34,3 +34,6 @@ axum = { workspace = true }
 tokio = { workspace = true }
 tower = { version = "=0.5.3", features = ["util"] }
 http-body-util = "=0.1.5"
+
+[lints]
+workspace = true

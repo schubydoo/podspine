@@ -42,7 +42,8 @@ function Uninstall-Podspine {
     Write-Info "Removing $dest"
     Remove-Item -LiteralPath $dest -Force
 
-    # Drop the install dir from the user PATH (only the entry we added).
+    # Drop the install dir from the user PATH (only the entry that
+    # install.ps1 added).
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     if ($userPath) {
         $kept = ($userPath -split ';') | Where-Object { $_ -and $_ -ne $dir }

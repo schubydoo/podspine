@@ -16,9 +16,9 @@ use qrcode::render::svg;
 
 /// One book as shown in the grid on `GET /`.
 pub struct BookCard {
-    /// URL slug — the human `/book/{slug}` key (browse UI only).
+    /// URL slug: the human `/book/{slug}` key (browse UI only).
     pub slug: String,
-    /// Capability id — the `/cover/{feed_id}` key (unguessable).
+    /// Capability id: the `/cover/{feed_id}` key (unguessable).
     pub feed_id: String,
     /// Human title.
     pub title: String,
@@ -30,10 +30,10 @@ pub struct BookCard {
 
 /// A single book's detail page (`GET /book/{slug}`).
 pub struct BookDetail {
-    /// URL slug — the human `/book/{slug}` key (also the base for the
+    /// URL slug: the human `/book/{slug}` key (also the base for the
     /// regenerate POST action).
     pub slug: String,
-    /// Capability id — the `/cover/{feed_id}` key (unguessable).
+    /// Capability id: the `/cover/{feed_id}` key (unguessable).
     pub feed_id: String,
     /// Human title.
     pub title: String,
@@ -54,11 +54,11 @@ pub struct BookDetail {
 /// The palette is chosen for WCAG AA contrast (NFR-C3): `#18181b` text on white
 /// (~16:1), `#52525b` muted (~7:1), and white on the `#1d4ed8` accent (~5.3:1).
 /// Everything is driven through the `--*` custom properties, so a theme is just an
-/// override of those same variables — no per-rule duplication. The default (no
+/// override of those same variables, with no per-rule duplication. The default (no
 /// `data-theme`) follows the OS via `prefers-color-scheme`; an explicit choice from
 /// the header picker sets `<html data-theme="light|dark">` (persisted in a cookie,
 /// read server-side) which wins over the media query. `color-scheme` keeps native
-/// controls/scrollbars in step. AA-contrast dark palette — `#f4f4f5` text on
+/// controls/scrollbars in step. The AA-contrast dark palette: `#f4f4f5` text on
 /// `#18181b` (~16:1), `#a1a1aa` muted (~7:1), `#0b1120` on the lighter `#60a5fa`
 /// accent (~7:1). The QR SVGs keep their own white background (`.appqr svg`) so a
 /// phone can still scan in dark mode.
@@ -266,7 +266,7 @@ fn page(title: &str, theme: Theme, body: Markup) -> Markup {
 }
 
 /// A cover `<img>` when available, else an accessible lettered placeholder.
-/// `id` is the book's capability `feed_id` — covers are served at
+/// `id` is the book's capability `feed_id`: covers are served at
 /// `/cover/{feed_id}`, never the guessable slug.
 fn cover(id: &str, title: &str, has_cover: bool, class: &str) -> Markup {
     let initial = title
@@ -395,7 +395,7 @@ pub fn book_page(book: &BookDetail, theme: Theme) -> Markup {
 /// The "private link" controls: regenerate the capability URL (leak recovery).
 /// A plain `POST` form — no JS required. `slug` is the (LAN-only) UI key the
 /// route acts on; `feed_id` never appears in the action URL. Feeds are always
-/// kept out of podcast directories, so there's nothing to toggle.
+/// kept out of podcast directories, so there is nothing to toggle.
 fn private_panel(slug: &str) -> Markup {
     html! {
         section.private {
@@ -423,16 +423,17 @@ pub struct AppLink {
     pub url: String,
 }
 
-/// Strip the URL scheme (`http://` / `https://`) — the `feedURL` form most app
-/// subscribe schemes expect.
+/// Strip the URL scheme (`http://` / `https://`): the `feedURL` form that
+/// most app subscribe schemes expect.
 fn strip_scheme(url: &str) -> &str {
     url.strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))
         .unwrap_or(url)
 }
 
-/// Percent-encode per RFC 3986 (unreserved chars pass through) — for embedding the
-/// feed URL as a query parameter (Overcast's `?url=`). Avoids a url-encoding dep.
+/// Percent-encode per RFC 3986 (unreserved chars pass through), used to embed
+/// the feed URL as a query parameter (Overcast's `?url=`). This avoids a
+/// url-encoding dependency.
 fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -482,12 +483,12 @@ pub fn subscribe_links(feed_url: &str) -> Vec<AppLink> {
     ]
 }
 
-/// The `/subscribe/{feed_id}` helper page: big per-app "Open in…" buttons (deep
-/// links), each app's QR code tucked behind its own `<details>` expand — a shared
-/// `name` makes them an exclusive accordion, so only one code is ever on screen to
-/// scan (desktop→phone handoff) — and a copy-the-URL fallback. This is what the
-/// book-page QR points at, so an iOS Camera scan lands on real app links instead of
-/// raw feed XML.
+/// The `/subscribe/{feed_id}` helper page: big per-app "Open in…" buttons
+/// (deep links), each app's QR code behind its own `<details>` expand, and a
+/// copy-the-URL fallback. A shared `name` makes the sections an exclusive
+/// accordion, so only one code is ever on screen to scan (desktop→phone
+/// handoff). The book-page QR points here, so an iOS Camera scan lands on
+/// real app links instead of raw feed XML.
 pub fn subscribe_page(book: &BookDetail, theme: Theme) -> Markup {
     let apps = subscribe_links(&book.feed_url);
     page(
@@ -508,23 +509,26 @@ pub fn subscribe_page(book: &BookDetail, theme: Theme) -> Markup {
                         }
                     }
 
-                    // One collapsible <details> per app, not a grid of all codes at
-                    // once: with every QR on screen a phone camera readily locks onto
-                    // an adjacent app's code and opens the wrong app. A collapsed
-                    // section shows nothing scannable, so expanding one puts exactly
-                    // that app's code on screen. Native <details> — no JS. For the
-                    // desktop→phone case: expand an app and scan to open it on a phone.
+                    // One collapsible <details> per app, not a grid of all
+                    // codes at once: with every QR on screen, a phone camera
+                    // readily locks onto an adjacent app's code and opens the
+                    // wrong app. A collapsed section shows nothing scannable,
+                    // so one expanded section puts exactly that app's code on
+                    // screen. Native <details>, no JS. For the desktop→phone
+                    // case: expand an app and scan to open it on a phone.
                     section.qrpanel {
                         h2 { "Scan a code from another device" }
                         p.qrhint { "On a computer? Expand an app and point your phone's camera at just that code." }
                         ul.qraccordion {
                             @for app in &apps {
                                 li {
-                                    // Shared `name` makes these an exclusive accordion
-                                    // group (like radio buttons): opening one closes
-                                    // any other — enforcing one-code-on-screen without
-                                    // JS. Browsers without `<details name>` support just
-                                    // treat them as independent (still collapsed by
+                                    // A shared `name` makes these an
+                                    // exclusive accordion group (like radio
+                                    // buttons): to open one closes any other,
+                                    // which enforces one-code-on-screen
+                                    // without JS. Browsers without
+                                    // `<details name>` support treat them as
+                                    // independent (still collapsed by
                                     // default), so it degrades safely.
                                     details.qrapp name="podcatcher-qr" {
                                         summary { (app.name) }
@@ -561,8 +565,9 @@ fn qr_svg(data: &str) -> String {
     qr_svg_sized(data, 180)
 }
 
-/// Render `data` as an inline SVG QR code at `px` minimum size. Empty string if
-/// the data can't be encoded (never panics on the request path).
+/// Render `data` as an inline SVG QR code at `px` minimum size. Return an
+/// empty string if the data cannot be encoded (this never panics on the
+/// request path).
 fn qr_svg_sized(data: &str, px: u32) -> String {
     match QrCode::new(data.as_bytes()) {
         Ok(code) => code
@@ -570,8 +575,9 @@ fn qr_svg_sized(data: &str, px: u32) -> String {
             .min_dimensions(px, px)
             .quiet_zone(true)
             .build(),
-        // Practically unreachable (QR capacity ~2.9 KB; feed URLs are far
-        // shorter) — logged so the impossible is noticed if it ever happens.
+        // Practically unreachable (QR capacity is ~2.9 KB; feed URLs are far
+        // shorter). It is logged, so the impossible is noticed if it ever
+        // happens.
         Err(err) => {
             tracing::warn!(error = %err, "QR encoding failed; rendering without a code");
             String::new()
@@ -596,8 +602,8 @@ mod tests {
     #[test]
     fn an_unencodable_qr_yields_an_empty_string_not_a_panic() {
         // QR capacity tops out around 2953 bytes; a longer base_url would
-        // otherwise panic on a page request. Empty string = the page still
-        // renders, just without a code.
+        // otherwise panic on a page request. An empty string means the page
+        // still renders, only without a code.
         let too_long = "u".repeat(4000);
         assert!(qr_svg_sized(&too_long, 180).is_empty());
         // Sanity: a normal URL still produces a code, so the assert above is

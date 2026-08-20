@@ -1,39 +1,45 @@
-//! `scanner` — orchestrate `prober -> splitter -> index`.
+//! The `scanner` crate runs the ingest pipeline: `prober` -> `splitter` -> `index`.
 //!
-//! [`scan_book`] probes one audio file, resolves its chapter source (a sibling
-//! `.cue`/`.ffmeta` sidecar wins over embedded markers unless `force_embedded`,
-//! Task 3.8), splits those chapters into `<data>/books/<id>/`, and persists a
-//! book + episodes to the index. It:
-//! - falls back to a single episode for a chapter-less file,
-//! - is **idempotent**: an unchanged source that is already fully indexed is not
-//!   re-split (guids/pubDates are stable),
-//! - **skips DRM-protected input** (AAX/AAXC/`.aa`/`.odm`) with a typed error —
-//!   Podspine ships no circumvention (PRD W5).
+//! [`scan_book`] ingests one audio file. It probes the file, resolves the
+//! chapter source, splits the chapters into `<data>/books/<id>/`, and persists
+//! one book and its episodes to the index. A sibling `.cue`/`.ffmeta` sidecar
+//! wins over embedded markers unless `force_embedded` is set (Task 3.8).
+//! Three more rules apply:
+//! - A file with no chapters becomes a single episode.
+//! - The scan is **idempotent**. If an unchanged source is already fully
+//!   indexed, the scanner does not split it again. The `guid`s and `pubDate`s
+//!   stay stable.
+//! - The scanner **skips DRM-protected input** (AAX/AAXC/`.aa`/`.odm`) and
+//!   returns a typed error. Podspine ships no circumvention (PRD W5).
 //!
-//! [`scan_library`] walks a library root of many audiobooks (Task 3.1): each
-//! top-level audio file and each per-book subfolder becomes one independent
-//! book. It distinguishes single-file books (`.m4b`/`.m4a`, or a lone `.mp3`),
-//! split by chapters, from multi-track **MP3 folders** (Task 3.3) — a folder of
-//! per-chapter MP3s ingested as one episode per file with **no splitting and no
-//! re-encode** (ordered by track number, falling back to filename order). It
-//! assigns collision-free slugs deterministically and never lets one bad book
-//! abort the whole scan. Tier-2 inputs (Ogg Vorbis/Opus/FLAC) are stream-copied
-//! into a matching container (Task 3.9); DRM inputs (AAX/AAXC/`.aa`/`.odm`) are
-//! skipped with a logged notice (PRD W5).
+//! [`scan_library`] walks a library root that holds many audiobooks (Task 3.1).
+//! Each top-level audio file and each per-book subfolder becomes one
+//! independent book. Books have two shapes:
+//! - A single-file book (`.m4b`/`.m4a`, or a lone `.mp3`). The scanner splits
+//!   it by chapters.
+//! - A multi-track **MP3 folder** (Task 3.3): a folder of per-chapter MP3s.
+//!   The scanner ingests one episode per file, with **no split and no
+//!   re-encode**. Track number sets the order; filename order is the fallback.
 //!
-//! **Whole-file episodes are served in place (Sprint 6.2):** when an episode IS
-//! a whole source file — every MP3-folder track, or a chapterless single file —
-//! it is streamed directly from the read-only library and its `source_path` is
-//! recorded; nothing is copied under `<data_dir>`. Only chaptered books, whose
-//! episodes are sub-ranges of a container, are extracted (`full`/`saver`).
+//! The scanner assigns collision-free slugs deterministically. One bad book
+//! never aborts the whole scan. The scanner stream-copies Tier-2 inputs
+//! (Ogg Vorbis/Opus/FLAC) into a matching container (Task 3.9). It skips DRM
+//! inputs (AAX/AAXC/`.aa`/`.odm`) and logs a notice (PRD W5).
+//!
+//! **The server serves whole-file episodes in place (Sprint 6.2).** An episode
+//! can be a whole source file: every MP3-folder track, and each chapterless
+//! single file. The server streams such an episode directly from the read-only
+//! library, and the scanner records its `source_path`. The scanner copies
+//! nothing under `<data_dir>`. Only chaptered books are extracted
+//! (`full`/`saver`), because their episodes are sub-ranges of one container.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-// Re-exported: all three are part of this crate's public surface — `BookOverrides`
-// is a parameter of the scan API, `StorageMode`/`TranscodeMode` fields of
-// [`ScanOptions`].
+// All three re-exports are part of this crate's public surface. `BookOverrides`
+// is a parameter of the scan API. `StorageMode` and `TranscodeMode` are fields
+// of [`ScanOptions`].
 use podspine_config::book_overrides;
 pub use podspine_config::{BookOverrides, StorageMode, TranscodeMode};
 use podspine_feed::{episode_guid, pubdate_epoch};
@@ -45,27 +51,29 @@ use podspine_splitter::{
     transcode_whole,
 };
 
-/// Extensions we refuse to ingest (DRM). Matched case-insensitively.
+/// DRM extensions that the scanner refuses to ingest. The match ignores case.
 const DRM_EXTENSIONS: &[&str] = &["aax", "aaxc", "aa", "odm"];
 
-/// The server-global ingest knobs, threaded through the scan API as one value.
+/// The server-global ingest options, passed through the scan API as one value.
 ///
-/// Per-book `.podspine.toml` overrides refine these per book (Sprint 6.4), so a
-/// field here is the *default* for a book, not the last word.
+/// Per-book `.podspine.toml` overrides refine these values per book
+/// (Sprint 6.4). A field here is the *default* for a book, not the final value.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ScanOptions {
     /// Ignore any `.cue`/`.ffmeta` sidecar and use embedded chapters (Task 3.8).
     pub force_embedded: bool,
-    /// Storage strategy for chaptered books (Sprint 5.1): `Saver` splits at
-    /// ingest to record each real `byte_length`, then deletes and regenerates on
-    /// demand; `Full` (the default) pre-splits and keeps the files.
+    /// Storage strategy for chaptered books (Sprint 5.1). `Saver` splits at
+    /// ingest to record each real `byte_length`, then deletes the files and
+    /// regenerates them on demand. `Full` (the default) pre-splits and keeps
+    /// the files.
     pub storage: StorageMode,
     /// Remux a non-faststart whole-file mp4 to a faststart cache copy instead of
     /// serving it in place (Sprint 6.3).
     pub remux_non_faststart: bool,
-    /// Re-encode sources no podcatcher can be relied on to play (FLAC/Vorbis/
-    /// Opus/ALAC) to AAC or MP3 at ingest (Task 5.2). Off by default: Podspine is
-    /// copy-first, and MP3/AAC sources are never re-encoded whatever this says.
+    /// Re-encode sources that podcatchers do not play reliably (FLAC/Vorbis/
+    /// Opus/ALAC) to AAC or MP3 at ingest (Task 5.2). The default is off:
+    /// Podspine is copy-first. Podspine never re-encodes MP3/AAC sources,
+    /// independent of this setting.
     pub transcode: TranscodeMode,
 }
 
@@ -75,10 +83,10 @@ pub enum ScanError {
     /// The input path is not a regular file.
     #[error("not a file: {0}")]
     NotAFile(PathBuf),
-    /// The input is DRM-protected and was skipped.
+    /// The input is DRM-protected, so the scanner skipped it.
     #[error("DRM-protected input skipped (Podspine ships no circumvention): {0}")]
     UnsupportedDrm(PathBuf),
-    /// The source mtime could not be read.
+    /// The scanner could not read the source `mtime`.
     #[error("could not read source mtime for {path}: {source}")]
     Mtime {
         /// The path.
@@ -109,7 +117,8 @@ pub enum ScanError {
 }
 
 /// Scan one audiobook `input` into `index` under a slug derived from its file
-/// name. Convenience wrapper over [`scan_book_as`] for single-book callers.
+/// name. This is a convenience wrapper over [`scan_book_as`] for single-book
+/// callers.
 pub fn scan_book(input: &Path, data_dir: &Path, index: &Index) -> Result<BookRow, ScanError> {
     let id = slugify(&file_stem(input));
     scan_book_as(
@@ -122,19 +131,20 @@ pub fn scan_book(input: &Path, data_dir: &Path, index: &Index) -> Result<BookRow
     )
 }
 
-/// Scan one audiobook `input` into `index` under the explicit `id` (also used as
-/// the slug), writing split episodes under `<data_dir>/books/<id>/`. Returns the
-/// persisted [`BookRow`]. The library scanner uses this to assign collision-free
-/// slugs; single-book callers should use [`scan_book`].
+/// Scan one audiobook `input` into `index` under the explicit `id`, which is
+/// also the slug. Write the split episodes under `<data_dir>/books/<id>/`.
+/// Return the persisted [`BookRow`]. The library scanner uses this function to
+/// assign collision-free slugs. Single-book callers should use [`scan_book`].
 ///
-/// `force_embedded` skips sidecar (`.cue`/`.ffmeta`) chapter resolution and uses
-/// the embedded chapters even when a sidecar exists (Task 3.8).
+/// `force_embedded` skips sidecar (`.cue`/`.ffmeta`) chapter resolution. It
+/// uses the embedded chapters even when a sidecar exists (Task 3.8).
 ///
-/// `saver` is the on-demand storage mode (Sprint 5.1): each chapter is still
-/// split once so its real `byte_length` (the `enclosure length`) is recorded,
-/// but the file is deleted immediately afterwards — the http layer regenerates
-/// it on demand. Peak extra disk is one chapter, not a full second copy of the
-/// book. `false` is the default (pre-split, files kept).
+/// `saver` is the on-demand storage mode (Sprint 5.1). The scan still splits
+/// each chapter once, so that it records the real `byte_length` (the
+/// `enclosure length`). It then deletes the file immediately; the http layer
+/// regenerates the file on demand. The peak extra disk usage is one chapter,
+/// not a full second copy of the book. The default is `false` (pre-split, keep
+/// the files).
 pub fn scan_book_as(
     input: &Path,
     id: &str,
@@ -149,16 +159,16 @@ pub fn scan_book_as(
     if is_drm(input) {
         return Err(ScanError::UnsupportedDrm(input.to_path_buf()));
     }
-    // Persist an ABSOLUTE, symlink-resolved source path. In-place serving (and
-    // saver regeneration) resolves this later from the server's cwd, so a
-    // relative `--library` stored verbatim would 404 after a restart from a
-    // different directory (systemd/Docker). `is_file` above proved it exists, so
-    // canonicalize succeeds; the fallback only guards a race.
+    // Persist an ABSOLUTE, symlink-resolved source path. In-place serving and
+    // saver regeneration resolve this path later from the server's cwd. A
+    // relative `--library` path stored verbatim would 404 after a restart from
+    // a different directory (systemd/Docker). `is_file` above proved that the
+    // file exists, so `canonicalize` succeeds. The fallback only guards a race.
     let input_canonical = input.canonicalize().unwrap_or_else(|_| input.to_path_buf());
     let input = input_canonical.as_path();
 
     // Per-book `.podspine.toml` overrides refine the global flags for this book
-    // (Sprint 6.4); `disabled` is handled by the caller before we're reached.
+    // (Sprint 6.4). The caller handles `disabled` before it calls this function.
     let force_embedded = overrides
         .force_embedded_chapters
         .unwrap_or(opts.force_embedded);
@@ -169,9 +179,10 @@ pub fn scan_book_as(
     let saver = storage == StorageMode::Saver;
     let force_reingest = overrides.force_reingest == Some(true);
 
-    // Effective per-book metadata (override → default). Computed up here so the
-    // idempotency check can spot a `.podspine.toml` edit (which doesn't change the
-    // audio mtime) and re-ingest, and so the BookRow build below reuses it.
+    // Compute the effective per-book metadata (override → default) up here, for
+    // two reasons. The idempotency check can then spot a `.podspine.toml` edit
+    // and re-ingest (such an edit does not change the audio mtime). And the
+    // `BookRow` build below reuses these values.
     let eff_title = overrides.title.clone().unwrap_or_else(|| file_stem(input));
     let eff_author = overrides.author.clone();
     let eff_cover = overrides.default_cover_url.clone();
@@ -180,66 +191,72 @@ pub fn scan_book_as(
     let source_mtime = mtime_epoch(input)?;
     let book_out = data_dir.join("books").join(&id);
 
-    // Idempotency: already indexed at this mtime with all files present -> done,
-    // no re-probe / re-split.
+    // Idempotency check: if the book is already indexed at this mtime and all
+    // files are present, the scan is done. Do not re-probe or re-split.
     if let Some(existing) = index.get_book(&id)?
         && existing.source_mtime == source_mtime
     {
         let eps = index.episodes_for_book(&id)?;
-        // In `saver` mode the split files are intentionally absent (regenerated
-        // on demand), so don't require them on disk — the index entry is enough.
+        // In `saver` mode the split files are intentionally absent (the http
+        // layer regenerates them on demand). Do not require them on disk. The
+        // index entry is enough.
         //
-        // BUT guard against a migrated database: `Index::migrate` back-fills
-        // `start_sec = 0` for pre-5.1 rows, and a non-first chapter with
-        // `start_sec == 0` can't drive correct on-demand regeneration (it would
-        // ffmpeg `-ss 0` and serve the book's opening seconds). Force a one-time
-        // re-split (skip this early return) so the real offsets are recorded
-        // before any eviction can serve the wrong segment. Chapter 0 legitimately
-        // starts at 0, so only non-first chapters are checked.
+        // BUT guard against a migrated database. `Index::migrate` back-fills
+        // `start_sec = 0` for pre-5.1 rows. A non-first chapter with
+        // `start_sec == 0` cannot drive correct on-demand regeneration: it
+        // would run ffmpeg with `-ss 0` and serve the book's opening seconds.
+        // Force a one-time re-split (skip this early return), so that the
+        // re-split records the real offsets before any eviction can serve the
+        // wrong segment. Chapter 0 legitimately starts at 0, so this check
+        // covers only non-first chapters.
         let start_secs_recorded =
             !saver || eps.iter().filter(|e| e.idx > 0).all(|e| e.start_sec > 0.0);
-        // Faststart re-ingest guard (Sprint 6.3): if PODSPINE_REMUX_NON_FASTSTART
-        // was toggled since the last scan, a `needs_faststart` whole-file episode's
-        // recorded serve mode (in place ⇒ `file_path == source_path`; remuxed ⇒
-        // `file_path != source_path`) no longer matches the flag — re-ingest so
-        // `byte_length`/`file_path` are re-recorded for the current mode.
+        // Faststart re-ingest guard (Sprint 6.3). `PODSPINE_REMUX_NON_FASTSTART`
+        // can change between scans. The recorded serve mode of a
+        // `needs_faststart` whole-file episode (in place ⇒
+        // `file_path == source_path`; remuxed ⇒ `file_path != source_path`)
+        // then no longer matches the flag. Re-ingest, so that the scan records
+        // `byte_length`/`file_path` again for the current mode.
         let faststart_consistent = eps.iter().all(|e| {
             !e.needs_faststart
                 || e.source_path.is_empty()
                 || (e.file_path != e.source_path) == remux_non_faststart
         });
-        // An episode's file may legitimately be absent when it's regenerated on
-        // demand: a saver chapter, or a remuxed whole-file cache copy. Everything
-        // else (full chapters, in-place whole files) must be present on disk.
+        // An episode's file may legitimately be absent when the server
+        // regenerates it on demand: a saver chapter, or a remuxed whole-file
+        // cache copy. Everything else (full chapters, in-place whole files)
+        // must be present on disk.
         let files_present = eps.iter().all(|e| {
             let regenerable = (saver && e.source_path.is_empty())
                 || (!e.source_path.is_empty() && e.file_path != e.source_path);
             regenerable || Path::new(&e.file_path).exists()
         });
-        // A `.podspine.toml` edit doesn't change the audio mtime, so also re-ingest
-        // when the persisted metadata no longer matches the current overrides
-        // (Greptile 6.4 P1) — otherwise a changed title/author/storage_mode/cover
-        // would stay stale in the index. `source_mtime` is unchanged, so episode
-        // guids stay stable (no spurious client re-downloads).
+        // A `.podspine.toml` edit does not change the audio mtime. So also
+        // re-ingest when the persisted metadata no longer matches the current
+        // overrides (Greptile 6.4 P1). Otherwise a changed
+        // title/author/storage_mode/cover would stay stale in the index.
+        // `source_mtime` is unchanged, so episode `guid`s stay stable (clients
+        // do not re-download anything).
         let metadata_consistent = existing.title == eff_title
             && existing.author == eff_author
             && existing.storage_mode == Some(storage)
             && existing.default_cover_url == eff_cover
-            // `force_embedded_chapters` changes the chapter SOURCE (embedded vs a
-            // `.cue`/`.ffmeta` sidecar) without touching the fields above, so a
-            // toggle must also re-ingest (Greptile 6.4 P1).
+            // `force_embedded_chapters` changes the chapter SOURCE (embedded vs
+            // a `.cue`/`.ffmeta` sidecar) and touches none of the fields above.
+            // So a toggle must also re-ingest (Greptile 6.4 P1).
             && existing.force_embedded == force_embedded;
-        // Transcode toggle guard (Task 5.2): flipping `PODSPINE_TRANSCODE` changes
-        // the episode container AND every recorded `byte_length`, and touches no
-        // source mtime — so re-ingest when the persisted mode no longer matches
-        // what this setting would produce. A pre-5.2 row (`None`) was produced by
-        // a stream copy, which is exactly what `Off` means, so it is not a
-        // mismatch and doesn't re-split anyone's library on upgrade.
+        // Transcode toggle guard (Task 5.2). A `PODSPINE_TRANSCODE` flip changes
+        // the episode container AND every recorded `byte_length`, and touches
+        // no source mtime. So re-ingest when the persisted mode no longer
+        // matches what this setting would produce. A stream copy produced each
+        // pre-5.2 row (`None`), and a stream copy is exactly what `Off` means.
+        // Such a row is therefore not a mismatch, and an upgrade re-splits
+        // nobody's library.
         let stored_transcode = existing.transcode.unwrap_or(TranscodeMode::Off);
         let transcode_consistent = expected_transcode(input, opts.transcode)
             .is_none_or(|expected| stored_transcode == expected);
-        // `force_reingest` (a troubleshooting knob) always skips the early return
-        // so the book is re-processed on every scan while set.
+        // `force_reingest` (a troubleshooting option) always skips the early
+        // return. While it is set, every scan re-processes the book.
         if !force_reingest
             && metadata_consistent
             && !eps.is_empty()
@@ -248,10 +265,11 @@ pub fn scan_book_as(
             && transcode_consistent
             && files_present
         {
-            // The book is up to date, but a browse-UI thumbnail may be missing — an
-            // existing library from before thumbnails, or one deleted from the cache.
-            // Backfill it from the already-extracted cover without a re-split, so the
-            // grid gets thumbnails on the next reconcile rather than a re-index.
+            // The book is up to date, but a browse-UI thumbnail can be missing:
+            // a library that predates thumbnails, or a thumbnail deleted from
+            // the cache. Backfill it from the already-extracted cover, without
+            // a re-split. The grid then gets thumbnails on the next reconcile,
+            // not on a re-index.
             if let Some(cover) = existing.cover_path.as_deref()
                 && !cover_thumb_path(&book_out).exists()
                 && let Err(err) = extract_cover_thumb(Path::new(cover), &book_out)
@@ -265,16 +283,17 @@ pub fn scan_book_as(
     let probed = probe(input)?;
 
     // Resolve the chapter source: a sibling `.cue`/`.ffmeta` sidecar wins over
-    // embedded markers unless overridden (Task 3.8).
+    // embedded markers unless `force_embedded` overrides it (Task 3.8).
     let resolved =
         podspine_chapters::resolve(input, &probed.chapters, probed.duration_sec, force_embedded);
     if resolved.source != podspine_chapters::ChapterSource::Embedded {
         tracing::info!(id = %id, source = ?resolved.source, "using sidecar chapters");
     }
 
-    // Transcoding (Task 5.2): a source no podcatcher can be relied on to play
-    // (FLAC/Vorbis/Opus/ALAC) is re-encoded at ingest when the operator opts in.
-    // MP3/AAC sources are always stream-copied, whatever the flag says.
+    // Transcoding (Task 5.2). When the operator opts in, the scan re-encodes at
+    // ingest each source that podcatchers do not play reliably
+    // (FLAC/Vorbis/Opus/ALAC). The scan always stream-copies MP3/AAC sources,
+    // independent of the flag.
     let enc = encoding_for(probed.audio_codec.as_deref(), opts.transcode);
     let transcoding = enc != Encoding::Copy;
     if transcoding {
@@ -286,14 +305,15 @@ pub fn scan_book_as(
         );
     }
 
-    // A chapterless file is ONE whole-file episode → streamed in place from the
-    // library (no split, no copy under <data_dir>). A chaptered book is extracted
-    // per chapter (full/saver). See TAD §5.3. A transcoded book is never served in
-    // place: the bytes clients get are the re-encoded ones, which only exist under
-    // <data_dir>.
+    // A chapterless file becomes ONE whole-file episode. The server streams it
+    // in place from the library (no split, no copy under `<data_dir>`). The
+    // splitter extracts a chaptered book per chapter (full/saver). See TAD
+    // §5.3. The server never serves a transcoded book in place: clients get
+    // the re-encoded bytes, and those bytes exist only under `<data_dir>`.
     let chapterless = resolved.chapters.is_empty();
     let serve_in_place = chapterless && !transcoding;
-    // Chapters -> (cut, title). Chapter-less -> a single episode over the file.
+    // Map chapters to (cut, title) pairs. A chapterless file gets a single
+    // episode that spans the whole file.
     let specs: Vec<(ChapterCut, String)> = if chapterless {
         tracing::warn!(
             id = %id,
@@ -327,17 +347,19 @@ pub fn scan_book_as(
     };
     let n = specs.len();
     let cuts: Vec<ChapterCut> = specs.iter().map(|(cut, _)| cut.clone()).collect();
-    // Stream-copy into a container matching the source codec (Task 3.9), or into
-    // the transcode target's container when re-encoding (Task 5.2).
+    // Pick the output container: one that matches the source codec for a stream
+    // copy (Task 3.9), or the transcode target's container for a re-encode
+    // (Task 5.2).
     let out_ext = episode_ext(probed.audio_codec.as_deref(), enc);
-    // Set for the single whole-file episode below; chaptered episodes never need
-    // faststart (`split_chapter` already writes `moov`-first).
+    // The whole-file branch below sets this flag. Chaptered episodes never need
+    // faststart (`split_chapter` already writes `moov` first).
     let mut needs_ft = false;
-    // A re-encode is not byte-reproducible across ffmpeg builds, so a transcoded
-    // book is always materialized here and never regenerated on demand — that is
-    // what keeps the published `enclosure length` equal to the bytes served. The
-    // serve/evict layers read `book.transcode` and skip regeneration + eviction to
-    // match, so an explicit `saver` request is deliberately overridden per book.
+    // A re-encode is not byte-reproducible across ffmpeg builds. So the scan
+    // always materializes a transcoded book here, and nothing regenerates it on
+    // demand. That rule keeps the published `enclosure length` equal to the
+    // bytes served. The serve/evict layers read `book.transcode` and skip
+    // regeneration and eviction to match. The scan therefore deliberately
+    // overrides an explicit `saver` request for such a book.
     if transcoding && saver {
         tracing::info!(
             id = %id,
@@ -345,8 +367,9 @@ pub fn scan_book_as(
         );
     }
     let episodes = if chapterless && transcoding {
-        // One whole-file episode, re-encoded into <data_dir> (no -ss/-t: the
-        // episode is the entire file, so a short probed duration can't clip it).
+        // One whole-file episode, re-encoded into `<data_dir>`. No `-ss`/`-t`:
+        // the episode is the entire file, so a short probed duration cannot
+        // clip it.
         vec![transcode_whole(
             input,
             &book_out,
@@ -356,15 +379,17 @@ pub fn scan_book_as(
             enc,
         )?]
     } else if serve_in_place {
-        // Whole source file — nothing to extract. (Any per-episode copy a previous
-        // ingest left is reclaimed after the index is updated, below.)
-        // Faststart (Sprint 6.3): a non-faststart whole-file mp4 (`moov` after
-        // `mdat`) seeks slowly when streamed in place. Detect it ffmpeg-free.
+        // The episode is the whole source file, so there is nothing to extract.
+        // (The cleanup below reclaims any per-episode copy that a previous
+        // ingest left, after the index update.) Faststart check (Sprint 6.3): a
+        // non-faststart whole-file mp4 (`moov` after `mdat`) seeks slowly when
+        // streamed in place. Detect it without ffmpeg.
         needs_ft = needs_faststart(input);
         if needs_ft && remux_non_faststart {
             // Opt-in remux: write a faststart cache copy (byte-deterministic
-            // `-c copy`), measure it, then delete — the http layer regenerates it
-            // on demand and evicts it under the cache cap. The source is untouched.
+            // `-c copy`), measure it, then delete it. The http layer
+            // regenerates the copy on demand and evicts it under the cache cap.
+            // The source stays untouched.
             std::fs::create_dir_all(&book_out).map_err(|source| ScanError::Io {
                 path: book_out.clone(),
                 source,
@@ -376,9 +401,10 @@ pub fn scan_book_as(
             })?;
             vec![ep]
         } else {
-            // Serve in place from the read-only library — no ffmpeg, no copy; the
-            // enclosure length is the real source size. A non-faststart mp4 still
-            // plays, so just log a one-line callout naming the (opt-in) fix.
+            // Serve in place from the read-only library: no ffmpeg, no copy.
+            // The enclosure length is the real source size. A non-faststart mp4
+            // still plays, so only log a one-line notice that names the
+            // (opt-in) fix.
             if needs_ft {
                 tracing::warn!(
                     id = %id,
@@ -400,9 +426,10 @@ pub fn scan_book_as(
             }]
         }
     } else if saver && !transcoding {
-        // Split each chapter to record its real byte size, then delete it — the
-        // http layer regenerates on demand (deterministic stream-copy, so the
-        // regenerated bytes match the recorded length). Peak disk = one chapter.
+        // Split each chapter to record its real byte size, then delete it. The
+        // http layer regenerates the file on demand (the stream copy is
+        // deterministic, so the regenerated bytes match the recorded length).
+        // The peak extra disk usage is one chapter.
         std::fs::create_dir_all(&book_out).map_err(|source| ScanError::Io {
             path: book_out.clone(),
             source,
@@ -421,21 +448,24 @@ pub fn scan_book_as(
         split_book_encoded(input, &book_out, &cuts, out_ext, enc)?
     };
 
-    // Extract the embedded cover, if any. A missing cover is a normal case, and
-    // an extraction failure never fails the book — we just serve no cover art.
+    // Extract the embedded cover, if any. A missing cover is a normal case. An
+    // extraction failure never fails the book; the server then serves no cover
+    // art.
     let cover_path = if probed.has_cover {
         let ext = cover_ext(probed.cover_codec.as_deref());
         match extract_cover(input, &book_out, ext) {
             Ok(path) => {
-                // Regenerate the browse-UI thumbnail from the freshly-extracted cover,
-                // in this same (single) scanner thread and atomically, so it always
-                // matches the cover — the http layer only ever *serves* it, which is
-                // what keeps thumbnail and cover consistent with no cross-thread race.
+                // Regenerate the browse-UI thumbnail from the freshly extracted
+                // cover, in this same (single) scanner thread and atomically,
+                // so that it always matches the cover. The http layer only ever
+                // *serves* the thumbnail. That split keeps thumbnail and cover
+                // consistent with no cross-thread race.
                 //
-                // Delete the previous thumbnail FIRST: if regeneration then fails, the
-                // book is left with NO thumbnail (the serve layer falls back to the
-                // current full cover, and the next reconcile backfills it) rather than
-                // a stale one derived from the old cover.
+                // Delete the previous thumbnail FIRST. If regeneration then
+                // fails, the book is left with NO thumbnail, not with a stale
+                // one derived from the old cover. (The serve layer falls back
+                // to the current full cover, and the next reconcile backfills
+                // the thumbnail.)
                 let _ = std::fs::remove_file(cover_thumb_path(&book_out));
                 if let Err(err) = extract_cover_thumb(&path, &book_out) {
                     tracing::warn!(error = %err, id = %id, "cover thumbnail failed; browse UI will use the full cover");
@@ -443,14 +473,14 @@ pub fn scan_book_as(
                 Some(path.to_string_lossy().into_owned())
             }
             Err(err) => {
-                // `extract_cover` publishes atomically (writes a `.part` sibling,
-                // renames only on success), so a failed extraction leaves the
-                // previous `cover.jpg` — and its thumbnail — intact on disk. Keep
-                // the stored path rather than dropping it to None and orphaning
-                // that still-valid art: None would 404 both cover routes and block
-                // the reconcile thumbnail backfill, which is gated on a populated
-                // cover_path. `upsert_book` below hasn't run yet, so this still
-                // reads the prior row.
+                // `extract_cover` publishes atomically: it writes a `.part`
+                // sibling and renames it only on success. A failed extraction
+                // therefore leaves the previous `cover.jpg`, and its thumbnail,
+                // intact on disk. Keep the stored path; do not drop it to
+                // `None` and orphan that still-valid art. `None` would 404 both
+                // cover routes and block the reconcile thumbnail backfill,
+                // which requires a populated `cover_path`. `upsert_book` below
+                // has not run yet, so this read still sees the prior row.
                 let kept = index
                     .get_book(&id)
                     .ok()
@@ -473,8 +503,9 @@ pub fn scan_book_as(
         id: id.clone(),
         slug: id.clone(),
         feed_id: podspine_index::capability::generate(),
-        // Per-book overrides (Sprint 6.4), computed above and re-checked by the
-        // idempotency guard so a sidecar edit re-persists them.
+        // Per-book overrides (Sprint 6.4). The code above computes them, and
+        // the idempotency guard re-checks them, so a sidecar edit re-persists
+        // them.
         title: eff_title,
         author: eff_author,
         cover_path,
@@ -484,9 +515,9 @@ pub fn scan_book_as(
         storage_mode: Some(storage),
         default_cover_url: eff_cover,
         force_embedded,
-        // What actually happened to this book's audio (Task 5.2): `Off` when it
-        // was stream-copied. Read by the serve/evict layers (a transcoded book is
-        // never regenerated) and by the toggle guard above.
+        // What actually happened to this book's audio (Task 5.2): `Off` means a
+        // stream copy. The serve/evict layers read this field (nothing
+        // regenerates a transcoded book), and so does the toggle guard above.
         transcode: Some(if transcoding {
             opts.transcode
         } else {
@@ -502,16 +533,18 @@ pub fn scan_book_as(
             idx: ep.idx as i64,
             title: title.clone(),
             file_path: ep.path.to_string_lossy().into_owned(),
-            // Non-empty for a whole-file episode (source path); empty for an
-            // extracted chapter under <data_dir>. `file_path == source_path` ⇒
-            // in place, `file_path != source_path` ⇒ remuxed to the faststart cache.
+            // This field is non-empty for a whole-file episode (the source
+            // path) and empty for an extracted chapter under `<data_dir>`.
+            // `file_path == source_path` means in-place serving.
+            // `file_path != source_path` means a remux to the faststart cache.
             source_path: if serve_in_place {
                 input.to_string_lossy().into_owned()
             } else {
                 String::new()
             },
-            // Only ever true for the single whole-file episode; drives the http
-            // remux-vs-in-place decision + the toggle guard above.
+            // This flag is only ever true for the single whole-file episode.
+            // It drives the http remux-vs-in-place decision and the toggle
+            // guard above.
             needs_faststart: needs_ft,
             byte_length: ep.byte_length as i64,
             duration_sec: ep.duration_sec,
@@ -520,28 +553,34 @@ pub fn scan_book_as(
         })?;
     }
 
-    // Sweep leftovers only now, AFTER the index points at this ingest's episodes.
-    // Until that upsert lands, the old files are the ones being served, and this
-    // function can sit inside a re-encode for minutes: deleting them up front
-    // would 404 every request for the whole window, and would leave the book with
-    // no playable episodes at all if the encode then failed. Once the rows are
-    // written, whatever is left in another container is unreferenced.
+    // Sweep leftovers only now, AFTER the index points at this ingest's
+    // episodes. Until that upsert lands, the server still serves the old files,
+    // and this function can sit inside a re-encode for minutes. An up-front
+    // delete would 404 every request for that whole window. And if the encode
+    // then failed, it would leave the book with no playable episodes at all.
+    // Once the rows are written, any file left in another container is
+    // unreferenced.
     //
-    // A residual window remains, deliberately unguarded: a request that snapshotted
-    // an episode row just before the upsert can reach its `File::open` just after
-    // the unlink, and gets a clean 404 (the http layer fails closed at three
-    // points; it never serves partial or wrong bytes). It is bounded by the few
-    // microseconds between that snapshot and the open, it can only fire on an
-    // ingest that actually CHANGED a book's container — a transcode flag or target
-    // flip, not a steady-state rescan, which deletes nothing — and on POSIX a
-    // reader that already opened the file keeps its inode regardless. Closing it
-    // would mean either holding the index lock across blocking file I/O, or a
-    // re-resolve-and-retry in the handler that no test can drive deterministically.
-    // Neither is worth it for one retryable 404 during an operator-triggered
-    // re-ingest.
+    // A residual window remains, deliberately unguarded. A request can
+    // snapshot an episode row just before the upsert and reach its
+    // `File::open` just after the unlink. That request gets a clean 404 (the
+    // http layer fails closed at three points; it never serves partial or
+    // wrong bytes). Three facts bound the window:
+    // - Only the few microseconds between that snapshot and the open are
+    //   exposed.
+    // - It can only fire on an ingest that actually CHANGED a book's
+    //   container: a transcode flag or target flip. A steady-state rescan
+    //   deletes nothing.
+    // - On POSIX, a reader that already opened the file keeps its inode
+    //   regardless.
+    // A guard would mean one of two bad options: hold the index lock across
+    // blocking file I/O, or add a re-resolve-and-retry in the handler that no
+    // test can drive deterministically. Neither is worth it for one retryable
+    // 404 during an operator-triggered re-ingest.
     if serve_in_place {
-        // Episodes stream from the library now, so any per-episode copy a pre-6.2
-        // ingest — or a previous transcode — left under <data_dir> is dead weight.
+        // Episodes stream from the library now. Any per-episode copy that a
+        // pre-6.2 ingest or a previous transcode left under `<data_dir>` is
+        // therefore dead weight.
         remove_stale_episode_copies(&book_out);
     } else {
         remove_episode_files_in_other_containers(&book_out, out_ext);
@@ -550,21 +589,22 @@ pub fn scan_book_as(
     Ok(book)
 }
 
-/// Remove episode files under `book_out` that this ingest will **not** overwrite:
-/// leftovers in a container the book no longer uses.
+/// Remove episode files under `book_out` that this ingest will **not**
+/// overwrite: leftovers in a container that the book no longer uses.
 ///
-/// Switching a book between stream-copy and a transcode target (Task 5.2), or
-/// between the AAC and MP3 targets, changes the episode extension — `001.flac`
-/// becomes `001.m4a`. The index points at the new path, so the old files are
-/// unreferenced from that moment on, and nothing else reclaims them: the cache
+/// A switch between stream copy and a transcode target (Task 5.2), or between
+/// the AAC and MP3 targets, changes the episode extension: `001.flac` becomes
+/// `001.m4a`. The index points at the new path, so the old files are
+/// unreferenced from that moment on. Nothing else reclaims them: the cache
 /// eviction only touches regenerable (`saver`, stream-copied) books, and a
-/// transcoded book is never regenerable. Left alone they cost a full extra copy of
-/// the audiobook per mode change.
+/// transcoded book is never regenerable. Left in place, the old files cost a
+/// full extra copy of the audiobook per mode change.
 ///
-/// Only numbered episode files (`NNN.<ext>`) and their `NNN.part.<ext>`
-/// temporaries are considered, so an extracted `cover.*` is never touched. Files
-/// already in `keep_ext` are left for the ingest to overwrite. Best-effort — a
-/// missing dir or a failed unlink is logged, never fatal.
+/// This sweep only considers numbered episode files (`NNN.<ext>`) and their
+/// `NNN.part.<ext>` temporaries, so it never touches an extracted `cover.*`.
+/// It leaves files already in `keep_ext` for the ingest to overwrite. It is
+/// best-effort: it logs a missing directory or a failed unlink, and neither is
+/// fatal.
 fn remove_episode_files_in_other_containers(book_out: &Path, keep_ext: &str) {
     let Ok(entries) = std::fs::read_dir(book_out) else {
         return;
@@ -586,11 +626,12 @@ fn remove_episode_files_in_other_containers(book_out: &Path, keep_ext: &str) {
     }
 }
 
-/// Remove per-episode audio copies a previous (pre-6.2) ingest wrote under
-/// `<data_dir>/books/<id>/` now that this book's episodes stream in place from
-/// the library. Only numbered episode files (`NNN.<ext>`) are removed; an
-/// extracted `cover.*` is left in place. Best-effort — a missing dir or a failed
-/// unlink is logged, never fatal (the book still serves from the library).
+/// Remove per-episode audio copies that a previous (pre-6.2) ingest wrote
+/// under `<data_dir>/books/<id>/`. This book's episodes now stream in place
+/// from the library. The sweep only removes numbered episode files
+/// (`NNN.<ext>`); it leaves an extracted `cover.*` in place. It is
+/// best-effort: it logs a missing directory or a failed unlink, and neither is
+/// fatal (the book still serves from the library).
 fn remove_stale_episode_copies(book_out: &Path) {
     let Ok(entries) = std::fs::read_dir(book_out) else {
         return;
@@ -606,11 +647,12 @@ fn remove_stale_episode_copies(book_out: &Path) {
     }
 }
 
-/// Whether `path` is a produced episode file rather than something else in the
-/// book directory: a numbered `NNN.<ext>` (the splitter's cross-crate
+/// Whether `path` is a produced episode file, not something else in the book
+/// directory. That means a numbered `NNN.<ext>` (the splitter's cross-crate
 /// [`podspine_splitter::episode_file_name`] contract), or the `NNN.part.<ext>`
-/// temporary an interrupted encode can leave (see `podspine_splitter::part_path`).
-/// An extracted `cover.*` matches neither, so no sweep ever removes it.
+/// temporary that an interrupted encode can leave (see
+/// `podspine_splitter::part_path`). An extracted `cover.*` matches neither, so
+/// no sweep ever removes it.
 fn is_episode_stem(path: &Path) -> bool {
     path.file_stem()
         .and_then(|s| s.to_str())
@@ -632,10 +674,11 @@ struct Mp3Track {
 }
 
 /// Ingest a folder of per-chapter MP3s as one book under `id`: one episode per
-/// file, **no splitting, no re-encode, and no copy** — each track is served in
-/// place from the library (Sprint 6.2). Files are ordered by track number when
-/// every track is present and distinct, otherwise by filename with a warning.
-/// Idempotent on an unchanged folder.
+/// file, with **no split, no re-encode, and no copy**. The server serves each
+/// track in place from the library (Sprint 6.2). Track number sets the file
+/// order when every track number is present and distinct; otherwise filename
+/// order applies and the scan logs a warning. The scan is idempotent on an
+/// unchanged folder.
 fn scan_mp3_folder(
     dir: &Path,
     id: &str,
@@ -644,8 +687,9 @@ fn scan_mp3_folder(
     overrides: &BookOverrides,
     library_root: &Path,
 ) -> Result<BookRow, ScanError> {
-    // Canonicalize the folder so every track path stored below is absolute and
-    // symlink-resolved — in-place serving must not depend on the server's cwd.
+    // Canonicalize the folder, so that every track path stored below is
+    // absolute and symlink-resolved. In-place serving must not depend on the
+    // server's cwd.
     let dir_canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     let dir = dir_canonical.as_path();
     let files = collect_mp3s(dir, library_root);
@@ -653,7 +697,8 @@ fn scan_mp3_folder(
         return Err(ScanError::EmptyFolder(dir.to_path_buf()));
     }
 
-    // Book mtime = newest track mtime: stable while unchanged, bumps on replace.
+    // The book mtime is the newest track mtime. It is stable while the folder
+    // is unchanged, and it bumps when a track is replaced.
     let source_mtime = files
         .iter()
         .map(|f| mtime_epoch(f))
@@ -663,18 +708,20 @@ fn scan_mp3_folder(
         .unwrap_or(0);
     let book_out = data_dir.join("books").join(id);
 
-    // Effective per-book metadata (override → default). `storage_mode`/`remux`/
-    // `force_embedded` are no-ops for MP3 folders, so only title/author/cover
-    // apply. Computed here to detect a `.podspine.toml` edit and reused below.
+    // Compute the effective per-book metadata (override → default) up here to
+    // detect a `.podspine.toml` edit; the `BookRow` build below reuses it.
+    // `storage_mode`/`remux`/`force_embedded` are no-ops for MP3 folders, so
+    // only title/author/cover apply.
     let eff_title = overrides.title.clone().unwrap_or_else(|| dir_name(dir));
     let eff_author = overrides.author.clone();
     let eff_cover = overrides.default_cover_url.clone();
 
-    // Idempotency: unchanged and already served in place -> no re-probe.
-    // The `source_path` guard forces a one-time re-ingest of a pre-6.2 book
-    // (tracks copied under <data_dir>, empty `source_path`) so it flips to
-    // in-place serving and its copies get reclaimed. The metadata checks re-ingest
-    // on a `.podspine.toml` edit that didn't change the folder mtime (Greptile P1).
+    // Idempotency check: if the folder is unchanged and already served in
+    // place, do not re-probe. The `source_path` guard forces a one-time
+    // re-ingest of a pre-6.2 book (tracks copied under `<data_dir>`, empty
+    // `source_path`). The book then flips to in-place serving, and the sweep
+    // reclaims its copies. The metadata checks re-ingest on a `.podspine.toml`
+    // edit that did not change the folder mtime (Greptile P1).
     if overrides.force_reingest != Some(true)
         && let Some(existing) = index.get_book(id)?
         && existing.source_mtime == source_mtime
@@ -692,8 +739,8 @@ fn scan_mp3_folder(
         }
     }
 
-    // Probe each track for duration/track/title; a corrupt file is skipped, not
-    // fatal to the book.
+    // Probe each track for duration/track/title. The scan skips a corrupt
+    // file; it is not fatal to the book.
     let mut tracks: Vec<Mp3Track> = Vec::new();
     for path in &files {
         match probe(path) {
@@ -717,10 +764,11 @@ fn scan_mp3_folder(
         id: id.to_string(),
         slug: id.to_string(),
         feed_id: podspine_index::capability::generate(),
-        // Per-book overrides (Sprint 6.4), computed above and re-checked by the
-        // idempotency guard so a sidecar edit re-persists them. storage_mode/remux/
-        // force_embedded are no-ops for MP3 folders (tracks are served in place),
-        // so persist no storage_mode (`None` = follow global).
+        // Per-book overrides (Sprint 6.4). The code above computes them, and
+        // the idempotency guard re-checks them, so a sidecar edit re-persists
+        // them. `storage_mode`/`remux`/`force_embedded` are no-ops for MP3
+        // folders (the server serves tracks in place), so persist no
+        // `storage_mode` (`None` = follow the global setting).
         title: eff_title,
         author: eff_author,
         cover_path: None,
@@ -728,16 +776,18 @@ fn scan_mp3_folder(
         source_mtime,
         storage_mode: None,
         default_cover_url: eff_cover,
-        // No chapters in an MP3 folder, so force_embedded never applies.
+        // An MP3 folder has no chapters, so `force_embedded` never applies.
         force_embedded: false,
-        // MP3 is podcast-safe: an MP3 folder is never re-encoded (Task 5.2).
+        // MP3 is podcast-safe: the scan never re-encodes an MP3 folder
+        // (Task 5.2).
         transcode: Some(TranscodeMode::Off),
     };
     index.upsert_book(&book)?;
 
     let n = tracks.len();
-    // Each track is a whole file → served in place from the library, no copy.
-    // Reclaim any verbatim copies a pre-6.2 ingest wrote under <data_dir>.
+    // Each track is a whole file. The server serves it in place from the
+    // library, with no copy. Reclaim any verbatim copies that a pre-6.2 ingest
+    // wrote under `<data_dir>`.
     remove_stale_episode_copies(&book_out);
     for (idx, t) in tracks.iter().enumerate() {
         let byte_length = std::fs::metadata(&t.path)
@@ -752,13 +802,14 @@ fn scan_mp3_folder(
             idx: idx as i64,
             title: t.title.clone(),
             file_path: t.path.to_string_lossy().into_owned(),
-            // A folder track IS a whole source file — stream it in place.
+            // A folder track IS a whole source file. Stream it in place.
             source_path: t.path.to_string_lossy().into_owned(),
             // MP3 has no `moov` atom, so faststart never applies.
             needs_faststart: false,
             byte_length: byte_length as i64,
             duration_sec: t.duration_sec,
-            // Whole files (not sub-ranges of a container), so each starts at 0.
+            // Tracks are whole files, not sub-ranges of a container, so each
+            // starts at 0.
             start_sec: 0.0,
             pubdate_epoch: pubdate_epoch(source_mtime, idx, n),
         })?;
@@ -767,8 +818,8 @@ fn scan_mp3_folder(
     Ok(book)
 }
 
-/// Order tracks by track number when every one is present and the numbers are
-/// distinct; otherwise fall back to a case-insensitive filename sort (warning).
+/// Order tracks by track number when every number is present and distinct.
+/// Otherwise fall back to a case-insensitive filename sort and log a warning.
 fn order_mp3_tracks(tracks: &mut [Mp3Track], dir: &Path) {
     let numbers: Option<Vec<u32>> = tracks.iter().map(|t| t.track).collect();
     let usable = numbers.as_ref().is_some_and(|v| {
@@ -800,11 +851,12 @@ fn collect_mp3s(dir: &Path, library_root: &Path) -> Vec<PathBuf> {
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.is_file() && ext_lower(p).as_deref() == Some("mp3"))
-        // A track can itself be a symlink out of the library even when its folder
-        // is inside it — `source_is_inside` only vetted the folder. Such a track
-        // would be indexed into the feed and then 404 at serve time, because the
-        // http layer canonicalizes each enclosure and refuses anything outside the
-        // library root. Drop it here, loudly (Greptile) — [`resolve_inside`] warns.
+        // A track can itself be a symlink out of the library even when its
+        // folder is inside it: `source_is_inside` only vetted the folder. Such
+        // a track would land in the feed and then 404 at serve time, because
+        // the http layer canonicalizes each enclosure and refuses anything
+        // outside the library root. Drop it here, loudly (Greptile):
+        // [`resolve_inside`] warns.
         .filter(|p| resolve_inside(p, library_root).is_some())
         .collect()
 }
@@ -816,8 +868,9 @@ fn dir_name(dir: &Path) -> String {
         .unwrap_or_else(|| "book".to_string())
 }
 
-/// Outcome of a library scan (counts only — a library of thousands of books is
-/// never held in memory; each is indexed and dropped in turn, NFR-P4).
+/// Outcome of a library scan. Counts only: the scan never holds a library of
+/// thousands of books in memory; it indexes each book and drops it in turn
+/// (NFR-P4).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ScanSummary {
     /// Books successfully indexed.
@@ -833,7 +886,7 @@ pub struct ScanSummary {
 enum BookSource {
     /// A single splittable audio file (`.m4b`/`.m4a`, or a lone `.mp3`).
     File(PathBuf),
-    /// A folder of per-track MP3s — recognized in v1, ingested in Task 3.3.
+    /// A folder of per-track MP3s (recognized in v1, ingested since Task 3.3).
     Mp3Folder(PathBuf),
 }
 
@@ -846,21 +899,23 @@ impl BookSource {
         }
     }
 
-    /// The base name a slug is derived from.
+    /// The base name that a slug is derived from.
     ///
-    /// For anything discoverable before recursive walking existed — a file at the
-    /// library root, or a book folder directly below it — this is exactly what it
-    /// always was: the file stem, or the folder name. That is deliberate and load
-    /// bearing. The slug becomes `book.id`, and a book's capability `feed_id` is
-    /// preserved per id across re-scans, so changing how an existing book's id is
-    /// derived would rotate its feed URL and silently break every subscriber.
+    /// Some books were discoverable before recursive walking existed: a file
+    /// at the library root, or a book folder directly below it. For those, the
+    /// base name is exactly what it always was: the file stem, or the folder
+    /// name. That is deliberate and load-bearing. The slug becomes `book.id`,
+    /// and a book's capability `feed_id` is preserved per id across re-scans.
+    /// A change to how an existing book's id is derived would therefore rotate
+    /// its feed URL and silently break every subscriber.
     ///
-    /// A book found *deeper* than that has never been indexed before, so its name
-    /// can be the better one: the path from the library root to its folder, joined
-    /// — `Jules Verne/The Mysterious Island/…m4b` → `Jules Verne - The Mysterious Island`. That reads well, and it
-    /// keeps two books of the same title under different authors from colliding
-    /// into `the-mysterious-island` and `-2`, whose assignment would depend on walk
-    /// order.
+    /// A book found *deeper* than that has never been indexed before, so its
+    /// name can be the better one: the path from the library root to its
+    /// folder, joined. `Jules Verne/The Mysterious Island/…m4b` becomes
+    /// `Jules Verne - The Mysterious Island`. That reads well. It also keeps
+    /// two books with the same title under different authors from colliding
+    /// into `the-mysterious-island` and `-2`, whose assignment would depend on
+    /// walk order.
     fn base_name(&self, library_root: &Path) -> String {
         match self {
             BookSource::File(p) => match nested_prefix(p.parent(), library_root) {
@@ -879,31 +934,35 @@ impl BookSource {
     }
 }
 
-/// The folder a nested book sits in, as its display title: `Jules Verne/The Mysterious
-/// Island/Jules Verne -   - The Mysterious Island.m4b` → `Some("The Mysterious Island")`.
+/// The folder that a nested book sits in, as its display title:
+/// `Jules Verne/The Mysterious Island/Jules Verne -   - The Mysterious Island.m4b`
+/// becomes `Some("The Mysterious Island")`.
 ///
 /// A nested library names the book on the folder and treats the filename as a
-/// dumping ground for author, narrator and separators, so the folder is almost
-/// always the better title. `None` for a book at or directly below the root, whose
-/// title stays the file stem — those books may already be indexed, and a feed
-/// title that changes under a subscriber is a change worth not making by accident.
-/// A `.podspine.toml` `title` still wins over this.
+/// dumping ground for author, narrator, and separators. So the folder is
+/// almost always the better title. The result is `None` for a book at or
+/// directly below the root; such a book keeps the file stem as its title.
+/// Those books may already be indexed, and a feed title must not change under
+/// a subscriber by accident. A `.podspine.toml` `title` still wins over this.
 fn nested_title(source: &BookSource, library_root: &Path) -> Option<String> {
     let BookSource::File(path) = source else {
         // An MP3-folder book is already titled by its folder.
         return None;
     };
     let dir = path.parent()?;
-    // Only for a book below the first level: `<root>/<author>/<title>/…`.
+    // This applies only to a book below the first level:
+    // `<root>/<author>/<title>/…`.
     nested_prefix(Some(dir), library_root)?;
     dir.file_name().map(|s| s.to_string_lossy().into_owned())
 }
 
-/// The joined path from `library_root` to a book folder, for a book nested deeper
-/// than one level: `<root>/Jules Verne/The Mysterious Island` → `Some("Jules Verne - The Mysterious Island")`.
+/// The joined path from `library_root` to a book folder, for a book nested
+/// deeper than one level: `<root>/Jules Verne/The Mysterious Island` becomes
+/// `Some("Jules Verne - The Mysterious Island")`.
 ///
-/// `None` for a book at or directly below the root — those keep their historical
-/// name (see [`BookSource::base_name`]) — and for anything outside the root.
+/// The result is `None` for a book at or directly below the root (those keep
+/// their historical name, see [`BookSource::base_name`]), and for anything
+/// outside the root.
 fn nested_prefix(book_dir: Option<&Path>, library_root: &Path) -> Option<String> {
     let rel = book_dir?.strip_prefix(library_root).ok()?;
     let parts: Vec<String> = rel
@@ -913,20 +972,22 @@ fn nested_prefix(book_dir: Option<&Path>, library_root: &Path) -> Option<String>
     (parts.len() > 1).then(|| parts.join(" - "))
 }
 
-/// Audio extensions Podspine ingests: Tier-1 (M4B/M4A/MP3) and Tier-2 (Ogg
-/// Vorbis/Opus/FLAC, Task 3.9). DRM inputs (AAX/AAXC/`.aa`/`.odm`) are
-/// deliberately absent and logged as skipped during discovery (PRD W5).
+/// Audio extensions that Podspine ingests: Tier-1 (M4B/M4A/MP3) and Tier-2
+/// (Ogg Vorbis/Opus/FLAC, Task 3.9). DRM inputs (AAX/AAXC/`.aa`/`.odm`) are
+/// deliberately absent from this list; discovery logs them as skipped
+/// (PRD W5).
 const AUDIO_EXTENSIONS: &[&str] = &["m4b", "m4a", "mp3", "ogg", "oga", "opus", "flac"];
 
-/// How far below the library root the walk descends before giving up. Deep
-/// enough for `shelf/author/series/title/`, shallow enough that a symlink the loop
-/// guard somehow misses can't spin.
+/// How far below the library root the walk descends before it gives up. The
+/// limit is deep enough for `shelf/author/series/title/`, and shallow enough
+/// that a symlink that the loop guard somehow misses cannot spin.
 const MAX_LIBRARY_DEPTH: usize = 8;
 
-/// Resolve + parse a book's `.podspine.toml` (Sprint 6.4). A missing sidecar
-/// yields the empty default; a bad sidecar or a server-global key that doesn't
-/// apply per book is logged and dropped — never fatal to the scan. `source` is
-/// canonicalized so the folder-vs-library-root check compares like-for-like.
+/// Resolve and parse a book's `.podspine.toml` (Sprint 6.4). A missing sidecar
+/// yields the empty default. The scan logs and drops a bad sidecar, and also a
+/// server-global key that does not apply per book; neither is fatal. `source`
+/// is canonicalized, so the folder-vs-library-root check compares like for
+/// like.
 fn resolve_book_overrides(source: &Path, library_root: &Path) -> BookOverrides {
     let source = source
         .canonicalize()
@@ -946,27 +1007,24 @@ fn resolve_book_overrides(source: &Path, library_root: &Path) -> BookOverrides {
     }
 }
 
-/// Scan a library root of many audiobooks into `index`, writing each book's
-/// episodes under `<data_dir>/books/<slug>/`. One independent book per top-level
-/// audio file or per-book subfolder. Slugs are collision-free and deterministic
-/// across re-scans; a single failing book is logged and skipped, never fatal.
-/// Collapse any set of index rows that share one source to a single row, keeping
-/// the **earliest-created** row (the feed subscribers have held longest) and
-/// deleting the rest with their extracted output.
+/// Collapse any set of index rows that share one source to a single row. Keep
+/// the **earliest-created** row (the one whose feed subscribers have held
+/// longest). Delete the rest, together with their extracted output.
 ///
-/// This is the floor the rest of the identity logic stands on: **one source, one
-/// book row, one feed.** Nothing the current scanner writes creates a second row
-/// for one source — the source→id reuse map in [`scan_library`] sees to that — but
-/// a database written by an earlier build, or edited by hand, can hold them, and
-/// neither reuse nor orphan pruning would ever reconcile it: the map keeps one id
-/// arbitrarily, and both rows survive pruning because their shared source still
-/// exists. The book would stay listed under two capability URLs forever. Running
-/// this first makes the reuse map unambiguous and heals such a database in one
-/// reconcile.
+/// This is the floor that the rest of the identity logic stands on: **one
+/// source, one book row, one feed.** Nothing the current scanner writes
+/// creates a second row for one source; the source→id reuse map in
+/// [`scan_library`] sees to that. But a database written by an earlier build,
+/// or edited by hand, can hold such rows, and neither reuse nor orphan pruning
+/// would ever reconcile it: the map keeps one id arbitrarily, and both rows
+/// survive pruning because their shared source still exists. The book would
+/// stay listed under two capability URLs forever. Running this first makes the
+/// reuse map unambiguous and heals such a database in one reconcile.
 ///
-/// A row whose source is *gone* is left for [`prune_orphans`] — grouping only
-/// canonicalizable paths also means an unmounted library (every source missing)
-/// collapses nothing. Best-effort: a failed lookup leaves the index untouched.
+/// A row whose source is *gone* is left for [`prune_orphans`]. The collapse
+/// groups only canonicalizable paths, so an unmounted library (every source
+/// missing) collapses nothing. It is best-effort: a failed lookup leaves the
+/// index untouched.
 fn collapse_duplicate_source_rows(index: &Index, data_dir: &Path) {
     let identities = match index.book_source_identities() {
         Ok(identities) => identities,
@@ -975,15 +1033,16 @@ fn collapse_duplicate_source_rows(index: &Index, data_dir: &Path) {
             return;
         }
     };
-    // `book_source_identities` is ordered oldest-first (created_at asc), so the
-    // FIRST row seen for a source is the earliest-created — the feed subscribers
-    // have held longest — and is the one to keep. Sorting by id instead would drop
-    // an established `foo-2` in favour of a `foo` a later bug duplicated, deleting
-    // the very feed people use (Greptile).
+    // `book_source_identities` is ordered oldest-first (`created_at` asc). So
+    // the FIRST row seen for a source is the earliest-created one (the feed
+    // that subscribers have held longest), and it is the one to keep. A sort
+    // by id instead would drop an established `foo-2` in favour of a `foo`
+    // that a later bug duplicated. That would delete the very feed people use
+    // (Greptile).
     let mut kept_for_source: HashMap<PathBuf, String> = HashMap::new();
     for (id, source_path, _created_at) in identities {
-        // A gone source is orphan-pruning's job; grouping only canonicalizable
-        // paths also means an unmounted library collapses nothing.
+        // A gone source is orphan-pruning's job. The grouping also covers only
+        // canonicalizable paths, so an unmounted library collapses nothing.
         let Ok(real) = Path::new(&source_path).canonicalize() else {
             continue;
         };
@@ -1011,30 +1070,36 @@ fn collapse_duplicate_source_rows(index: &Index, data_dir: &Path) {
     }
 }
 
+/// Scan a library root of many audiobooks into `index`. Write each book's
+/// episodes under `<data_dir>/books/<slug>/`. Each top-level audio file and
+/// each per-book subfolder becomes one independent book. Slugs are
+/// collision-free and deterministic across re-scans. The scan logs and skips a
+/// single failing book; it is never fatal.
 pub fn scan_library(
     library: &Path,
     data_dir: &Path,
     index: &Index,
     opts: ScanOptions,
 ) -> ScanSummary {
-    // Canonical library root, for resolving per-book `.podspine.toml` sidecars
-    // (Sprint 6.4) — matched against each book's canonical source path — and for
-    // naming books found below the top level.
+    // The canonical library root serves two purposes. It resolves per-book
+    // `.podspine.toml` sidecars (Sprint 6.4; the match is against each book's
+    // canonical source path). And it names books found below the top level.
     let library_root = library
         .canonicalize()
         .unwrap_or_else(|_| library.to_path_buf());
     let sources = discover(&library_root, data_dir);
 
-    // Enforce one row per source BEFORE the reuse map is read, so the map cannot
-    // inherit a duplicate (invariant A — see the function's doc).
+    // Enforce one row per source BEFORE this scan reads the reuse map, so that
+    // the map cannot inherit a duplicate (invariant A; see the function's doc).
     collapse_duplicate_source_rows(index, data_dir);
 
-    // Every already-indexed book, keyed by its (canonical) source path. A source
-    // that is already indexed keeps whatever id it has — including a `-2` suffix it
-    // once earned — instead of being re-derived from its name. Without this, a book
-    // that was suffixed because a now-pruned stale row occupied its base id would,
-    // on the next scan, ALSO be indexed under the freed base id: one audiobook
-    // under two capability feeds (Greptile). Reuse makes the id stable per source.
+    // Every already-indexed book, keyed by its (canonical) source path. A
+    // source that is already indexed keeps whatever id it has, including a
+    // `-2` suffix it once earned; the scan does not re-derive the id from the
+    // name. Without this map, a book once suffixed (because a now-pruned stale
+    // row occupied its base id) would ALSO be indexed under the freed base id
+    // on the next scan: one audiobook under two capability feeds (Greptile).
+    // Reuse makes the id stable per source.
     let existing_by_source: HashMap<PathBuf, String> = match index.list_books() {
         Ok(books) => books
             .into_iter()
@@ -1042,8 +1107,8 @@ pub fn scan_library(
             .collect(),
         Err(err) => {
             // Proceed with an empty map (same behavior as before), but say so:
-            // id reuse — the primary feed-URL stability mechanism — is skipped
-            // for this scan, leaving only the owns_a_different_source guard.
+            // this scan skips id reuse, the primary feed-URL stability
+            // mechanism. Only the `owns_a_different_source` guard remains.
             tracing::warn!(error = %err, "listing books failed; id reuse skipped this scan");
             HashMap::new()
         }
@@ -1053,10 +1118,11 @@ pub fn scan_library(
     let mut summary = ScanSummary::default();
     for source in sources {
         let source_path = source.path();
-        // If this exact source is already indexed, keep its id — that is what makes
-        // a feed URL stable across scans, and what stops a once-suffixed book from
-        // being re-indexed under a since-freed base id. Otherwise reserve a slug in
-        // deterministic order, never one a different still-present book holds.
+        // If this exact source is already indexed, keep its id. That rule
+        // makes a feed URL stable across scans, and it stops a once-suffixed
+        // book from landing under a since-freed base id. Otherwise reserve a
+        // slug in deterministic order, and never one that a different
+        // still-present book holds.
         let slug = match source_path
             .canonicalize()
             .ok()
@@ -1074,20 +1140,22 @@ pub fn scan_library(
             ),
         };
         let mut overrides = resolve_book_overrides(source_path, &library_root);
-        // A nested book's filename is usually `Author -   - Title.m4b`; its folder
-        // is just `Title`. Seed the title from the folder unless the book's own
-        // `.podspine.toml` says otherwise — an explicit title always wins.
+        // A nested book's filename is usually `Author -   - Title.m4b`; its
+        // folder is just `Title`. Seed the title from the folder unless the
+        // book's own `.podspine.toml` says otherwise. An explicit title always
+        // wins.
         if overrides.title.is_none()
             && let Some(title) = nested_title(&source, &library_root)
         {
             overrides.title = Some(title);
         }
-        // `disabled` (a `.podspine.toml` troubleshooting knob): drop the book from
-        // every surface — prune it if it was previously indexed, and skip.
+        // `disabled` (a `.podspine.toml` troubleshooting option): drop the
+        // book from every surface. Prune it if it was previously indexed, then
+        // skip it.
         if overrides.disabled == Some(true) {
-            // `delete_book` reports via its bool whether a row existed, so no
-            // pre-check is needed; a failed delete must be surfaced — the book
-            // would silently stay indexed and keep serving its feed.
+            // `delete_book` reports via its bool whether a row existed, so this
+            // code needs no pre-check. Surface a failed delete: the book would
+            // otherwise silently stay indexed and keep serving its feed.
             if let Err(err) = index.delete_book(&slug) {
                 tracing::warn!(slug = %slug, error = %err, "failed to prune disabled book");
             }
@@ -1130,14 +1198,15 @@ pub fn scan_library(
     summary
 }
 
-/// Remove indexed books whose source file/folder no longer exists, along with
-/// their split output under `<data_dir>/books/<id>/`. Returns the count pruned.
+/// Remove indexed books whose source file or folder no longer exists, together
+/// with their split output under `<data_dir>/books/<id>/`. Return the count of
+/// pruned books.
 ///
 /// **Empty-root guard:** if the library root is missing, unreadable, or empty,
-/// nothing is pruned. A transiently-unmounted library looks like "every source
-/// vanished"; without this guard an unmount would wipe the whole index. The cost
-/// is that genuinely deleting your *last* book leaves it indexed until another
-/// book is present — a safe trade.
+/// the prune removes nothing. A transiently unmounted library looks like
+/// "every source vanished"; without this guard, an unmount would wipe the
+/// whole index. The cost: when you genuinely delete your *last* book, it stays
+/// indexed until another book is present. That is a safe trade.
 pub fn prune_orphans(library: &Path, data_dir: &Path, index: &Index) -> Result<usize, ScanError> {
     let root_has_entries = std::fs::read_dir(library)
         .map(|mut rd| rd.next().is_some())
@@ -1169,19 +1238,20 @@ pub fn prune_orphans(library: &Path, data_dir: &Path, index: &Index) -> Result<u
     Ok(pruned)
 }
 
-/// Reconcile the index with the library: [`scan_library`] (add/update) then
-/// [`prune_orphans`] (remove sources that disappeared). This is what the
-/// auto-watch runs after each debounced batch of changes, and what the server
-/// runs at startup so a book deleted while it was down is cleaned up.
+/// Reconcile the index with the library: [`scan_library`] (add/update), then
+/// [`prune_orphans`] (remove sources that disappeared). The auto-watch runs
+/// this after each debounced batch of changes. The server also runs it at
+/// startup, so that it cleans up a book deleted while the server was down.
 pub fn reconcile(library: &Path, data_dir: &Path, index: &Index, opts: ScanOptions) -> ScanSummary {
     let mut summary = scan_library(library, data_dir, index, opts);
     summary.pruned = prune_orphans(library, data_dir, index).unwrap_or_else(|err| {
         tracing::warn!(error = %err, "orphan prune failed");
         0
     });
-    // Set from the index rather than accumulated from this run's adds, so a
-    // prune (or a book that failed to ingest) is reflected just as accurately.
-    // Reconcile is startup + debounced-watch only, so the extra read is cheap.
+    // Read the count from the index; do not accumulate this run's adds. The
+    // metric then also reflects a prune, and a book that failed to ingest,
+    // accurately. Reconcile runs only at startup and on the debounced watch,
+    // so the extra read is cheap.
     match index.list_books() {
         Ok(books) => podspine_metrics::set_books_indexed(books.len() as u64),
         Err(err) => tracing::warn!(error = %err, "could not count books for metrics"),
@@ -1189,27 +1259,29 @@ pub fn reconcile(library: &Path, data_dir: &Path, index: &Index, opts: ScanOptio
     summary
 }
 
-/// Debounce window: a burst of filesystem events (e.g. one big file copy lands
-/// as many) is coalesced into a single reconcile once things go quiet.
+/// Debounce window. One big file copy lands as many filesystem events; the
+/// watch loop coalesces such a burst into a single reconcile once the events
+/// stop.
 const WATCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Spawn a background thread that establishes the library watch, runs the
-/// **initial** reconcile, then [`reconcile`]s again whenever the library changes
-/// (debounced). The thread opens its **own** index connection on `db_path` — with
-/// WAL enabled, its rescans (including a long split of a newly-added book) don't
-/// block the server's feed/audio reads.
+/// **initial** reconcile, and then runs [`reconcile`] again whenever the
+/// library changes (debounced). The thread opens its **own** index connection
+/// on `db_path`. With WAL enabled, its rescans (including a long split of a
+/// newly added book) do not block the server's feed/audio reads.
 ///
-/// The watch is registered *before* the initial reconcile, so a change that lands
-/// during the first scan is buffered in the channel and picked up by the loop
-/// rather than missed until the next event or a restart (issue 159).
-/// `on_initial_scan` fires once the initial reconcile returns — the server uses it
-/// to leave its "Scanning…" holding state and start serving feeds. It runs even if
-/// the index can't be opened or the watch can't be established, so the server
-/// never hangs on "Scanning…".
+/// The thread registers the watch *before* the initial reconcile. A change
+/// that lands during the first scan is then buffered in the channel, and the
+/// loop picks it up; it is not missed until the next event or a restart
+/// (issue 159). `on_initial_scan` fires once the initial reconcile returns.
+/// The server uses it to leave its "Scanning…" holding state and start serving
+/// feeds. It runs even if the index cannot be opened or the watch cannot be
+/// established, so the server never hangs on "Scanning…".
 ///
-/// Returns immediately; the watcher runs for the process lifetime. A setup
-/// failure (or the watch ending) is logged and simply disables auto-refresh —
-/// the server keeps serving what's already indexed. (Task 4.3 / PRD C2.)
+/// This function returns immediately; the watcher runs for the process
+/// lifetime. The thread logs a setup failure (or the end of the watch) and
+/// simply disables auto-refresh; the server keeps serving what is already
+/// indexed. (Task 4.3 / PRD C2.)
 pub fn spawn_library_watcher(
     library: PathBuf,
     data_dir: PathBuf,
@@ -1235,9 +1307,9 @@ fn watch_loop(
 
     let index = match Index::open(db_path) {
         Ok(index) => index,
-        // No index → no scan and no watch. Flip readiness anyway so the server
-        // stops holding "Scanning…" (it serves whatever is already indexed), then
-        // surface the failure.
+        // No index means no scan and no watch. Flip readiness anyway, so that
+        // the server stops holding "Scanning…" (it serves whatever is already
+        // indexed). Then surface the failure.
         Err(err) => {
             on_initial_scan();
             return Err(err.into());
@@ -1245,22 +1317,26 @@ fn watch_loop(
     };
 
     let (tx, rx) = std::sync::mpsc::channel();
-    // Filter events at the source so an unrelated write can't spin the watcher into
-    // a rescan-every-few-seconds loop: ignore reads (another app streaming the
-    // files bumps atime but changes nothing), our own split output under `data_dir`
-    // (writing an episode there would otherwise self-trigger a rescan forever), and
-    // the dir names discovery never walks (dotdirs, `@eaDir`, `lost+found` — NAS
-    // junk / thumbnail caches). Only a real library change reaches the debounced
-    // reconcile below; an irrelevant trickle no longer defeats the debounce.
+    // Filter events at the source, so that an unrelated write cannot spin the
+    // watcher into a rescan-every-few-seconds loop. Ignore three groups:
+    // - reads (another app that streams the files bumps atime but changes
+    //   nothing),
+    // - our own split output under `data_dir` (an episode written there would
+    //   otherwise self-trigger a rescan forever),
+    // - the dir names discovery never walks (dotdirs, `@eaDir`, `lost+found`:
+    //   NAS junk and thumbnail caches).
+    // Only a real library change reaches the debounced reconcile below. An
+    // irrelevant trickle no longer defeats the debounce.
     let library_root = library.to_path_buf();
     let data_dir_owned = data_dir.to_path_buf();
     let data_canon = data_dir.canonicalize().ok();
-    // Bring the watch up BEFORE the initial reconcile: a change that lands during
-    // the scan's directory walk is then buffered in `rx` and picked up by the loop
-    // below, instead of being missed until the next event or a restart (issue 159).
+    // Bring the watch up BEFORE the initial reconcile. A change that lands
+    // during the scan's directory walk is then buffered in `rx`, and the loop
+    // below picks it up. It is not missed until the next event or a restart
+    // (issue 159).
     let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        // Drop irrelevant events; forward everything else (incl. errors, so the
-        // loop still sees a watch failure).
+        // Drop irrelevant events. Forward everything else, including errors,
+        // so that the loop still sees a watch failure.
         if let Ok(event) = &res
             && !watch_event_is_relevant(
                 event,
@@ -1282,17 +1358,18 @@ fn watch_loop(
             tracing::info!(library = %library.display(), "watching library for changes");
             Some(watcher)
         }
-        // Couldn't establish the watch (e.g. the inotify watch limit). Still run the
-        // initial scan and mark ready below — the server must not hang on
-        // "Scanning…" — we just lose auto-refresh.
+        // The watch could not be established (e.g. the inotify watch limit).
+        // Still run the initial scan and mark ready below; the server must not
+        // hang on "Scanning…". Only auto-refresh is lost.
         Err(err) => {
             tracing::error!(error = %err, "could not watch the library — auto-refresh disabled");
             None
         }
     };
 
-    // Initial reconcile: index new/changed books and prune ones removed while the
-    // server was down. Runs after the watch is live so no in-window change is lost.
+    // Initial reconcile: index new/changed books, and prune books removed
+    // while the server was down. It runs after the watch is live, so no
+    // in-window change is lost.
     let s = reconcile(library, data_dir, &index, opts);
     tracing::info!(
         indexed = s.indexed,
@@ -1303,14 +1380,14 @@ fn watch_loop(
     // The first scan is done: the server leaves its "Scanning…" holding state.
     on_initial_scan();
 
-    // Nothing to loop on if the watch never came up.
+    // If the watch never came up, there is nothing to loop on.
     let Some(_watcher) = watcher else {
         return Ok(());
     };
 
-    // Block for an event, then drain the burst until it's quiet for the debounce
-    // window, then reconcile once. `_watcher` stays alive in scope, so `rx` never
-    // disconnects and the loop runs for the process lifetime.
+    // Block for an event. Then drain the burst until it is quiet for the
+    // debounce window. Then reconcile once. `_watcher` stays alive in scope,
+    // so `rx` never disconnects and the loop runs for the process lifetime.
     while rx.recv().is_ok() {
         while rx.recv_timeout(WATCH_DEBOUNCE).is_ok() {}
         tracing::info!("library changed — reconciling");
@@ -1326,11 +1403,12 @@ fn watch_loop(
 }
 
 /// Whether a watch event should trigger a reconcile. Reads (open/close/access,
-/// including the atime bumps another app makes while streaming the files) never
-/// change content, so they're dropped; otherwise the event is relevant if *any* of
-/// its paths is a real library path (notify batches related paths, e.g. a rename's
-/// from+to). An event with no paths (a rescan hint) is treated as relevant — we
-/// can't judge it, so err toward reconciling.
+/// including the atime bumps another app makes while it streams the files)
+/// never change content, so the filter drops them. Otherwise the event is
+/// relevant if *any* of its paths is a real library path (notify batches
+/// related paths, e.g. a rename's from+to). An event with no paths (a rescan
+/// hint) counts as relevant: the filter cannot judge it, so it errs toward a
+/// reconcile.
 fn watch_event_is_relevant(
     event: &notify::Event,
     library_root: &Path,
@@ -1349,12 +1427,13 @@ fn watch_event_is_relevant(
         .any(|p| watch_path_is_relevant(p, library_root, data_dir, data_canon))
 }
 
-/// Whether a changed path is a real library source rather than something the walk
-/// ignores. Mirrors discovery so the watch and the walk agree: skip podspine's own
-/// output under `data_dir` (a nested `--data-dir` writing an episode must not read
-/// as a library change) and any path with an ignored component — dotdirs,
-/// `@eaDir`, `lost+found` — below the library root. Purely lexical (no fs calls):
-/// a `Remove` event's path is already gone, and this runs in the hot event handler.
+/// Whether a changed path is a real library source, not something the walk
+/// ignores. This mirrors discovery, so the watch and the walk agree. Skip
+/// podspine's own output under `data_dir` (an episode that a nested
+/// `--data-dir` writes must not read as a library change). Also skip any path
+/// with an ignored component (dotdirs, `@eaDir`, `lost+found`) below the
+/// library root. The check is purely lexical (no fs calls): a `Remove` event's
+/// path is already gone, and this runs in the hot event handler.
 fn watch_path_is_relevant(
     path: &Path,
     library_root: &Path,
@@ -1364,8 +1443,9 @@ fn watch_path_is_relevant(
     if path.starts_with(data_dir) || data_canon.is_some_and(|d| path.starts_with(d)) {
         return false;
     }
-    // Only inspect components *below* the root, so a library that itself lives under
-    // a dot-path (e.g. `…/.local/share/books`) isn't wholly ignored.
+    // Only inspect components *below* the root, so that a library that itself
+    // lives under a dot-path (e.g. `…/.local/share/books`) is not wholly
+    // ignored.
     let rel = path.strip_prefix(library_root).unwrap_or(path);
     !rel.components().any(|c| match c {
         std::path::Component::Normal(name) => name.to_str().is_some_and(is_ignored_name),
@@ -1373,15 +1453,16 @@ fn watch_path_is_relevant(
     })
 }
 
-/// Discover book sources one level under `library`, in a deterministic
-/// (path-sorted) order so slug disambiguation is stable across re-scans.
+/// Discover book sources under `library`, in a deterministic (path-sorted)
+/// order, so that slug disambiguation is stable across re-scans.
 fn discover(library: &Path, data_dir: &Path) -> Vec<BookSource> {
-    // Podspine's own output must never be walked. A `--data-dir` nested inside the
-    // library (a perfectly reasonable `-v /books:/library -e DATA_DIR=/library/.podspine`)
-    // holds extracted episodes, which a recursive walk would otherwise index as
-    // books and then re-split — feeding its own output back in.
+    // The walk must never enter Podspine's own output. A `--data-dir` nested
+    // inside the library (a perfectly reasonable
+    // `-v /books:/library -e DATA_DIR=/library/.podspine`) holds extracted
+    // episodes. A recursive walk would otherwise index them as books and then
+    // re-split them: it would feed its own output back in.
     let data_root = data_dir.canonicalize().ok();
-    // Containment is judged against the canonical root, but the walk descends the
+    // The containment check uses the canonical root, but the walk descends the
     // path as given, so discovered sources keep the caller's spelling.
     let root = library
         .canonicalize()
@@ -1402,15 +1483,15 @@ fn discover(library: &Path, data_dir: &Path) -> Vec<BookSource> {
 /// One level of the library walk.
 ///
 /// At every level: files are books in their own right, and a subdirectory is
-/// either a book (it holds audio *directly*) or a container to walk — an author,
-/// a series, a shelf. That is what makes an `Author/Title/book.m4b` library work
-/// without rearranging it, which is the layout Audiobookshelf, Plex and Jellyfin
-/// all produce.
+/// either a book (it holds audio *directly*) or a container to walk (an
+/// author, a series, a shelf). That rule makes an `Author/Title/book.m4b`
+/// library work without a rearrange, and that is the layout Audiobookshelf,
+/// Plex, and Jellyfin all produce.
 ///
-/// A directory that classifies as a book is **not** descended into: the first
-/// level holding audio wins. (Consequence, documented: a multi-disc book laid out
-/// as `Title/CD1/*.mp3` + `Title/CD2/*.mp3` becomes two books, since `Title/`
-/// itself holds no audio.)
+/// The walk does **not** descend into a directory that classifies as a book:
+/// the first level that holds audio wins. (Documented consequence: a
+/// multi-disc book laid out as `Title/CD1/*.mp3` + `Title/CD2/*.mp3` becomes
+/// two books, because `Title/` itself holds no audio.)
 fn walk_library(
     dir: &Path,
     depth: usize,
@@ -1427,17 +1508,18 @@ fn walk_library(
         );
         return;
     }
-    // Canonicalize for the loop guard: a symlink pointing back up the tree (or at
-    // a sibling already walked) would otherwise recurse until the depth cap, and
-    // index the same book twice on the way.
+    // Canonicalize for the loop guard. A symlink that points back up the tree
+    // (or at a sibling already walked) would otherwise recurse until the depth
+    // cap, and index the same book twice on the way.
     //
-    // Below the root, containment is enforced too ([`resolve_inside`]): `is_dir`
-    // follows symlinks, so a link inside the library pointing at audio elsewhere
-    // on the host would be walked and indexed — and then be unplayable, because
-    // the serve layer canonicalizes an episode's source and refuses anything
-    // outside the library root (TAD §7). A feed whose audio 404s is worse than a
-    // book that never appears, so the walk refuses to leave the tree. The root
-    // itself is exempt (it defines the tree).
+    // Below the root, the walk also enforces containment ([`resolve_inside`]).
+    // `is_dir` follows symlinks, so the walk would otherwise index a link
+    // inside the library that points at audio elsewhere on the host. That book
+    // would then be unplayable, because the serve layer canonicalizes an
+    // episode's source and refuses anything outside the library root (TAD §7).
+    // A feed whose audio 404s is worse than a book that never appears, so the
+    // walk refuses to leave the tree. The root itself is exempt (it defines
+    // the tree).
     let real = if depth == 0 {
         dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf())
     } else {
@@ -1456,9 +1538,9 @@ fn walk_library(
     let mut entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries.flatten().map(|e| e.path()).collect::<Vec<_>>(),
         Err(err) => {
-            // The root failing is an operator error worth shouting about; a
-            // subdirectory failing (permissions, a race with a move) is one book
-            // lost, not a broken scan.
+            // A root failure is an operator error worth a loud log. A
+            // subdirectory failure (permissions, a race with a move) is one
+            // book lost, not a broken scan.
             if depth == 0 {
                 tracing::error!(error = %err, library = %dir.display(), "cannot read library");
             } else {
@@ -1467,14 +1549,15 @@ fn walk_library(
             return;
         }
     };
-    // Sorted, so slug assignment (and therefore collision suffixes) is identical
-    // on every scan regardless of what the filesystem hands back.
+    // Sort, so that slug assignment (and therefore collision suffixes) is
+    // identical on every scan, independent of what the filesystem hands back.
     entries.sort();
 
-    // Below the root, a directory that holds audio IS a book (or several) and is
-    // not descended into: the first level with audio wins. That keeps a book's own
-    // `extras/` or `bonus/` folder from being ingested as another book. The cost,
-    // documented: a mixed `Author/{loose.m4b, Title/…}` yields only `loose.m4b`.
+    // Below the root, a directory that holds audio IS a book (or several), and
+    // the walk does not descend into it: the first level with audio wins. That
+    // rule keeps a book's own `extras/` or `bonus/` folder from becoming
+    // another book. The documented cost: a mixed `Author/{loose.m4b, Title/…}`
+    // yields only `loose.m4b`.
     if depth > 0 {
         let books: Vec<BookSource> = classify_dir(dir)
             .into_iter()
@@ -1486,16 +1569,18 @@ fn walk_library(
         }
     }
 
-    // The root, or a container. Files and subdirectories are emitted in one
-    // path-sorted pass, which is exactly the order discovery has always produced.
-    // It matters: the order decides which of two same-named books gets the bare
-    // slug and which gets the `-2` suffix, and that slug is the book id whose
-    // capability feed id is preserved across re-scans. Emitting all files ahead of
-    // all directories would swap `Dracula.m4b` and `Dracula/` — handing each subscriber
+    // This is the root, or a container. The loop emits files and
+    // subdirectories in one path-sorted pass, which is exactly the order
+    // discovery has always produced. It matters: the order decides which of
+    // two same-named books gets the bare slug and which gets the `-2` suffix,
+    // and that slug is the book id whose capability feed id is preserved
+    // across re-scans. A pass that emitted all files ahead of all directories
+    // would swap `Dracula.m4b` and `Dracula/`: it would hand each subscriber
     // the other audiobook under the URL they already have.
     //
-    // A root file is a book in its own right (never grouped: several loose `.mp3`
-    // at the root are separate books, not one book's tracks), again as before.
+    // A root file is a book in its own right, never grouped (several loose
+    // `.mp3` at the root are separate books, not one book's tracks), again as
+    // before.
     for path in entries {
         if path.is_file() {
             if depth > 0 {
@@ -1520,21 +1605,21 @@ fn walk_library(
 
 /// Whether a discovered source really lives inside the library.
 ///
-/// A symlinked *file* escapes the directory guard in [`walk_library`], and would
-/// be indexed into a feed the serve layer then refuses to play. Rejected sources
-/// are logged, not silently dropped: a book missing from the UI with nothing in
-/// the log is the worst version of this.
+/// A symlinked *file* escapes the directory guard in [`walk_library`], and it
+/// would land in a feed that the serve layer then refuses to play. The check
+/// logs rejected sources; it never drops them silently. A book missing from
+/// the UI with nothing in the log is the worst version of this.
 fn source_is_inside(src: &BookSource, library_root: &Path) -> bool {
     resolve_inside(src.path(), library_root).is_some()
 }
 
-/// Canonicalize `path` and keep it only if it resolves inside `root` — the
-/// symlink-containment rule shared by the walk, source vetting, and MP3-track
-/// collection: the serve layer canonicalizes every source and refuses anything
-/// outside the library root (TAD §7), so indexing an escapee would publish audio
-/// that 404s. A path that resolves outside the root, or can't be resolved at all,
-/// is dropped with a warning — a book missing from the UI with nothing in the log
-/// is the worst version of this.
+/// Canonicalize `path` and keep it only if it resolves inside `root`. This is
+/// the symlink-containment rule shared by the walk, source vetting, and
+/// MP3-track collection. The serve layer canonicalizes every source and
+/// refuses anything outside the library root (TAD §7), so an indexed escapee
+/// would publish audio that 404s. The check drops, with a warning, a path that
+/// resolves outside the root or cannot be resolved at all. A book missing from
+/// the UI with nothing in the log is the worst version of this.
 fn resolve_inside(path: &Path, root: &Path) -> Option<PathBuf> {
     match path.canonicalize() {
         Ok(real) if real.starts_with(root) => Some(real),
@@ -1553,9 +1638,10 @@ fn resolve_inside(path: &Path, root: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Directories the walk never enters: dotfiles (`.stfolder`, `.git`, …) and the
-/// thumbnail caches NAS software scatters through a share. None of them hold
-/// audiobooks, and walking them is pure cost on a large library.
+/// Directories that the walk never enters: dotfiles (`.stfolder`, `.git`, …)
+/// and the thumbnail caches that NAS software scatters through a share. None
+/// of them hold audiobooks, and a walk of them is pure cost on a large
+/// library.
 fn is_ignored_dir(dir: &Path) -> bool {
     dir.file_name()
         .and_then(|s| s.to_str())
@@ -1563,14 +1649,15 @@ fn is_ignored_dir(dir: &Path) -> bool {
 }
 
 /// The single ignore rule shared by the walk ([`is_ignored_dir`]) and the
-/// watch-event filter ([`watch_path_is_relevant`]), so the two never disagree on
-/// what to skip: dotfiles/dotdirs and the NAS junk caches `@eaDir` / `lost+found`.
+/// watch-event filter ([`watch_path_is_relevant`]), so that the two never
+/// disagree on what to skip: dotfiles/dotdirs and the NAS junk caches
+/// `@eaDir` / `lost+found`.
 fn is_ignored_name(name: &str) -> bool {
     name.starts_with('.') || name == "@eaDir" || name == "lost+found"
 }
 
-/// Classify a per-book subfolder: prefer a splittable `.m4b`/`.m4a`; a lone
-/// `.mp3` is a single-file book; several `.mp3`s are a multi-track folder
+/// Classify a per-book subfolder. Prefer a splittable `.m4b`/`.m4a`. A lone
+/// `.mp3` is a single-file book. Several `.mp3`s are a multi-track folder
 /// (Task 3.3). A folder with no audio yields nothing.
 fn classify_dir(dir: &Path) -> Vec<BookSource> {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -1578,16 +1665,18 @@ fn classify_dir(dir: &Path) -> Vec<BookSource> {
     };
     let mut m4x = Vec::new();
     let mut mp3 = Vec::new();
-    // Tier-2 containers (Ogg/Opus/FLAC): a lone one is a book in its own folder,
-    // exactly as it would be at the library root. A folder holding several is not
-    // a Tier-2 equivalent of an MP3 folder — that path only reads `.mp3` tracks —
-    // so it stays unclassified rather than being half-ingested.
+    // Tier-2 containers (Ogg/Opus/FLAC): a lone one is a book in its own
+    // folder, exactly as it would be at the library root. A folder that holds
+    // several is not a Tier-2 equivalent of an MP3 folder (that path only
+    // reads `.mp3` tracks). So it stays unclassified; a half-ingest would be
+    // worse.
     let mut tier2 = Vec::new();
     for path in entries.flatten().map(|e| e.path()) {
         if !path.is_file() {
             continue;
         }
-        // DRM is refused wherever it turns up in the tree, loudly (PRD W5).
+        // The scan refuses DRM wherever it turns up in the tree, loudly
+        // (PRD W5).
         if is_drm(&path) {
             tracing::warn!(
                 path = %path.display(),
@@ -1601,7 +1690,7 @@ fn classify_dir(dir: &Path) -> Vec<BookSource> {
         match ext_lower(&path).as_deref() {
             Some("m4b") | Some("m4a") => m4x.push(path),
             Some("mp3") => mp3.push(path),
-            // Everything else `is_audio` admits is Tier-2.
+            // Everything else that `is_audio` admits is Tier-2.
             _ => tier2.push(path),
         }
     }
@@ -1610,9 +1699,10 @@ fn classify_dir(dir: &Path) -> Vec<BookSource> {
     tier2.sort();
 
     if !m4x.is_empty() {
-        // One `.m4b`/`.m4a` is one whole book, so a folder holding several holds
-        // several books — an author folder of single-file audiobooks, typically.
-        // (`.mp3` is the opposite: several of those are usually one book's tracks.)
+        // One `.m4b`/`.m4a` is one whole book, so a folder that holds several
+        // holds several books: typically an author folder of single-file
+        // audiobooks. (`.mp3` is the opposite: several of those are usually
+        // one book's tracks.)
         m4x.into_iter().map(BookSource::File).collect()
     } else if mp3.len() == 1 {
         vec![BookSource::File(mp3.into_iter().next().unwrap())]
@@ -1632,23 +1722,26 @@ fn classify_dir(dir: &Path) -> Vec<BookSource> {
     }
 }
 
-/// Reserve `base` if free, else `base-2`, `base-3`, … Inserts the chosen slug
-/// into `seen` and returns it.
-/// Choose this source's slug, which becomes its `book.id`.
+/// Choose this source's slug, which becomes its `book.id`: reserve `base` if
+/// it is free, else `base-2`, `base-3`, … Insert the chosen slug into `seen`
+/// and return it.
 ///
-/// Two constraints, both about not stealing an identity:
+/// Two constraints apply, both about identity theft:
 ///
-/// - unique within this scan, so two same-named books get `x` and `x-2`;
-/// - **never a slug the index already holds for a different source that still
-///   exists.** `upsert_book` preserves a book's capability `feed_id` per id, so
-///   handing an existing id to another file keeps the subscriber's URL alive and
-///   swaps the audiobook underneath it. That is the one failure this crate must
-///   never produce, and dedup within a single scan cannot see it: the colliding
-///   book may not be discovered until later in the same walk, or may not be
-///   rediscovered at all.
+/// - The slug is unique within this scan, so two same-named books get `x` and
+///   `x-2`.
+/// - **The slug is never one that a live index row holds for a different
+///   source.** `upsert_book` preserves a book's capability `feed_id` per id.
+///   A hand-over of an existing id to another file would keep the
+///   subscriber's URL alive and swap the audiobook underneath it. That is the
+///   one failure this crate must never produce, and dedup within a single
+///   scan cannot see it: the walk may discover the colliding book later, or
+///   may not rediscover it at all.
 ///
-/// A row whose source no longer exists is fair game — that is a moved or renamed
-/// library, and the stale row is pruned in the same reconcile.
+/// A row whose source no longer exists still owns its id during this scan
+/// (see [`owns_a_different_source`] for why the guard never frees an id
+/// early). The same reconcile prunes that row afterwards ([`prune_orphans`]),
+/// so the id frees up for the next scan.
 fn assign_slug(base: &str, source: &Path, index: &Index, seen: &mut HashSet<String>) -> String {
     let mut n = 1;
     loop {
@@ -1657,10 +1750,11 @@ fn assign_slug(base: &str, source: &Path, index: &Index, seen: &mut HashSet<Stri
         } else {
             format!("{base}-{n}")
         };
-        // A candidate refused because someone else owns it is NOT consumed: the
-        // rightful owner is often discovered later in the same walk and must still
-        // be able to claim it. Consuming it here would push that book onto a fresh
-        // id — a new capability feed, and a stale row still serving the old one.
+        // A candidate refused because someone else owns it is NOT consumed.
+        // The walk often discovers the rightful owner later in the same scan,
+        // and that book must still be able to claim its slug. If this loop
+        // consumed the slug, it would push that book onto a fresh id: a new
+        // capability feed, plus a stale row that still serves the old one.
         if !seen.contains(&candidate) && !owns_a_different_source(index, &candidate, source) {
             seen.insert(candidate.clone());
             return candidate;
@@ -1669,27 +1763,31 @@ fn assign_slug(base: &str, source: &Path, index: &Index, seen: &mut HashSet<Stri
     }
 }
 
-/// Whether `slug` is an indexed book built from a *different* file than `source`.
+/// Whether `slug` is an indexed book built from a *different* file than
+/// `source`.
 ///
-/// Existence of that book's file is deliberately NOT consulted. An earlier version
-/// freed the id when the stored source was gone (to let a moved book reclaim it),
-/// but that reopened the exact theft this guard exists to stop: a newcomer sorting
-/// before a moved book's new location would inherit the vacated id — and its
-/// preserved capability feed — while the moved book was pushed onto a fresh feed
-/// (Greptile). There is no content identity to tell "the moved book" from "a
-/// different book of the same name" apart, so the safe rule is uniform: a live
-/// index row owns its id until [`prune_orphans`] retires it, one reconcile later.
-/// A book therefore keeps its feed across an in-place re-ingest (same path) but not
-/// across a move — the same feed-rotates-on-rename contract the flat scanner had.
+/// The guard deliberately does NOT consult the existence of that book's file.
+/// An earlier version freed the id when the stored source was gone (to let a
+/// moved book reclaim it). But that reopened the exact theft this guard
+/// exists to stop: a newcomer that sorts before a moved book's new location
+/// would inherit the vacated id, and its preserved capability feed, while the
+/// moved book was pushed onto a fresh feed (Greptile). No content identity
+/// can tell "the moved book" from "a different book of the same name". So the
+/// safe rule is uniform: a live index row owns its id until [`prune_orphans`]
+/// retires it, one reconcile later. A book therefore keeps its feed across an
+/// in-place re-ingest (same path) but not across a move. That is the same
+/// feed-rotates-on-rename contract the flat scanner had.
 ///
-/// Index errors count as "not owned": a failed lookup must not rename every book.
+/// Index errors count as "not owned": a failed lookup must not rename every
+/// book.
 fn owns_a_different_source(index: &Index, slug: &str, source: &Path) -> bool {
     let Ok(Some(existing)) = index.get_book(slug) else {
         return false;
     };
-    // Compare canonically where both resolve (the stored path is canonical, a
-    // discovered one need not be — `/tmp` is a symlink to `/private/var` on macOS);
-    // fall back to the raw strings when the stored file is gone.
+    // Compare canonically where both paths resolve. The stored path is
+    // canonical; a discovered one need not be (`/tmp` is a symlink to
+    // `/private/var` on macOS). Fall back to the raw strings when the stored
+    // file is gone.
     match (
         Path::new(&existing.source_path).canonicalize(),
         source.canonicalize(),
@@ -1699,7 +1797,6 @@ fn owns_a_different_source(index: &Index, slug: &str, source: &Path) -> bool {
     }
 }
 
-/// Whether a path has a recognized top-level audio extension.
 /// A path's extension, lowercased.
 fn ext_lower(p: &Path) -> Option<String> {
     p.extension()
@@ -1707,9 +1804,10 @@ fn ext_lower(p: &Path) -> Option<String> {
         .map(|e| e.to_ascii_lowercase())
 }
 
-/// Stream-copy output container extension for an audio codec. Each Tier-2 codec
-/// needs its own container (mp4 can't hold FLAC/Vorbis); unknown codecs default
-/// to `m4a` (the Tier-1 case). No re-encode — this only names the muxer.
+/// Stream-copy output container extension for an audio codec. Each Tier-2
+/// codec needs its own container (mp4 cannot hold FLAC/Vorbis). Unknown codecs
+/// default to `m4a` (the Tier-1 case). There is no re-encode; this only names
+/// the muxer.
 fn output_ext(codec: Option<&str>) -> &'static str {
     match codec {
         Some("mp3") => "mp3",
@@ -1720,18 +1818,18 @@ fn output_ext(codec: Option<&str>) -> &'static str {
     }
 }
 
-/// Whether a probed codec is one podcatchers can be relied on to play.
+/// Whether a probed codec is one that podcatchers play reliably.
 ///
-/// MP3 and AAC are the two every client handles. An unknown codec (`None` — a
-/// probe that named no audio codec) counts as safe: guessing wrong there would
-/// burn a whole re-encode on a file that probably plays fine.
+/// MP3 and AAC are the two that every client handles. An unknown codec
+/// (`None`: a probe that named no audio codec) counts as safe. A wrong guess
+/// there would burn a whole re-encode on a file that probably plays fine.
 fn is_podcast_safe(codec: Option<&str>) -> bool {
     matches!(codec, Some("mp3" | "aac") | None)
 }
 
-/// The [`Encoding`] this book's episodes are produced with (Task 5.2): a
-/// re-encode only when transcoding is on *and* the source codec isn't
-/// podcast-safe. Everything else is a stream copy.
+/// The [`Encoding`] that produces this book's episodes (Task 5.2): a re-encode
+/// only when transcoding is on *and* the source codec is not podcast-safe.
+/// Everything else is a stream copy.
 fn encoding_for(codec: Option<&str>, mode: TranscodeMode) -> Encoding {
     if is_podcast_safe(codec) {
         return Encoding::Copy;
@@ -1743,8 +1841,8 @@ fn encoding_for(codec: Option<&str>, mode: TranscodeMode) -> Encoding {
     }
 }
 
-/// The container extension for one produced episode: the transcode target's when
-/// re-encoding, else one matching the source codec (Task 3.9).
+/// The container extension for one produced episode: the transcode target's
+/// for a re-encode, else one that matches the source codec (Task 3.9).
 fn episode_ext(codec: Option<&str>, enc: Encoding) -> &'static str {
     match enc {
         Encoding::Copy => output_ext(codec),
@@ -1753,16 +1851,17 @@ fn episode_ext(codec: Option<&str>, enc: Encoding) -> &'static str {
     }
 }
 
-/// The `book.transcode` value an already-indexed book *should* carry under the
-/// current setting, judged from its file extension alone — the idempotency guard
-/// runs before the probe and must not force one.
+/// The `book.transcode` value that an already-indexed book *should* carry
+/// under the current setting, judged from its file extension alone. The
+/// idempotency guard runs before the probe and must not force one.
 ///
-/// `None` means "can't be known without probing, so accept whatever is stored":
-/// an `.m4a`/`.m4b` may hold AAC (podcast-safe, copied) or ALAC (re-encoded), and
-/// guessing either way would make the guard either miss a real toggle or re-ingest
-/// the book on every single scan. An ALAC book therefore keeps its existing
-/// episodes until its source changes; `force_reingest = true` in its
-/// `.podspine.toml` picks up the new setting immediately.
+/// `None` means "this cannot be known without a probe, so accept whatever is
+/// stored". An `.m4a`/`.m4b` may hold AAC (podcast-safe, copied) or ALAC
+/// (re-encoded). A guess either way would make the guard either miss a real
+/// toggle, or re-ingest the book on every single scan. An ALAC book therefore
+/// keeps its existing episodes until its source changes.
+/// `force_reingest = true` in its `.podspine.toml` picks up the new setting
+/// immediately.
 fn expected_transcode(input: &Path, mode: TranscodeMode) -> Option<TranscodeMode> {
     if !mode.is_on() {
         // Nothing may stay transcoded once the flag is off.
@@ -1771,7 +1870,7 @@ fn expected_transcode(input: &Path, mode: TranscodeMode) -> Option<TranscodeMode
     match ext_lower(input).as_deref() {
         // Tier-2 containers: never podcast-safe, so they get the target codec.
         Some("flac" | "ogg" | "oga" | "opus") => Some(mode),
-        // MP3 is podcast-safe and never re-encoded.
+        // MP3 is podcast-safe; the scan never re-encodes it.
         Some("mp3") => Some(TranscodeMode::Off),
         _ => None,
     }
@@ -1793,7 +1892,7 @@ fn is_audio(p: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Whether a path has a DRM extension we refuse to ingest.
+/// Whether a path has a DRM extension that Podspine refuses to ingest.
 fn is_drm(p: &Path) -> bool {
     p.extension()
         .and_then(|e| e.to_str())
@@ -1808,8 +1907,8 @@ fn file_stem(p: &Path) -> String {
         .unwrap_or_else(|| "book".to_string())
 }
 
-/// Lowercase ASCII slug: alphanumerics kept, runs of anything else become a
-/// single `-`; falls back to `"book"`.
+/// Lowercase ASCII slug: keep alphanumerics; each run of anything else becomes
+/// a single `-`. The fallback is `"book"`.
 fn slugify(s: &str) -> String {
     let mut out = String::new();
     let mut prev_dash = false;
@@ -1852,16 +1951,17 @@ mod tests {
     };
     use std::process::Command;
 
-    /// Crate-prefixed [`podspine_test_support::scratch`], so scanner test dirs
-    /// can't collide with another crate's over a shared short name.
+    /// Crate-prefixed [`podspine_test_support::scratch`], so that scanner test
+    /// dirs cannot collide with another crate's over a shared short name.
     fn scratch(name: &str) -> ScratchDir {
         podspine_test_support::scratch(&format!("scan-{name}"))
     }
 
     #[test]
     fn an_mp3_folder_with_no_tracks_is_a_typed_error() {
-        // A folder of cover art and metadata with no audio is a user mistake, not
-        // a crash and not a silently empty book: it must surface as EmptyFolder.
+        // A folder of cover art and metadata with no audio is a user mistake.
+        // It must surface as `EmptyFolder`, not as a crash, and not as a
+        // silently empty book.
         let dir = scratch("empty-mp3-folder");
         std::fs::write(dir.join("cover.jpg"), b"img").unwrap();
         std::fs::write(dir.join("notes.txt"), b"no audio here").unwrap();
@@ -1881,7 +1981,8 @@ mod tests {
         assert!(matches!(err, ScanError::EmptyFolder(_)), "got {err:?}");
     }
 
-    /// Synthesize an AAC file; `chapters` true embeds three 10s chapters.
+    /// Synthesize an AAC file. When `chapters` is true, embed three 10-second
+    /// chapters.
     fn synth(dir: &Path, chapters: bool) -> PathBuf {
         if chapters {
             synth_three_chapters(dir, "chapters.m4a")
@@ -1895,8 +1996,8 @@ mod tests {
         std::fs::write(path, b"x").unwrap();
     }
 
-    /// Synthesize a real MP3 with an optional `track` tag. Returns `None` if the
-    /// ffmpeg build has no MP3 encoder (test then skips).
+    /// Synthesize a real MP3 with an optional `track` tag. Return `None` if
+    /// the ffmpeg build has no MP3 encoder (the test then skips).
     fn synth_mp3(dir: &Path, name: &str, track: Option<u32>, dur: u32) -> Option<PathBuf> {
         std::fs::create_dir_all(dir).unwrap();
         let out = dir.join(name);
@@ -1942,7 +2043,8 @@ mod tests {
         let eps = index.episodes_for_book(&books[0].id).unwrap();
         assert_eq!(eps.len(), 3, "one episode per MP3");
 
-        // Track order (1,2,3) => durations ~2,4,2. Filename order would be ~4,2,2.
+        // Track order (1,2,3) gives durations of ~2,4,2 seconds. Filename
+        // order would give ~4,2,2.
         assert!(
             (eps[1].duration_sec - 4.0).abs() < 0.6,
             "middle is track 2 (4s)"
@@ -1968,7 +2070,7 @@ mod tests {
             assert!(w[0].pubdate_epoch < w[1].pubdate_epoch, "pubDates increase");
         }
 
-        // No per-track copies were written under <data>/books/<id>/.
+        // The scan wrote no per-track copies under `<data>/books/<id>/`.
         let book_out = data.join("books").join(&books[0].id);
         for i in 1..=eps.len() {
             assert!(
@@ -1985,7 +2087,8 @@ mod tests {
         skip_unless_ffmpeg!();
         let root = scratch("mp3-fallback");
         let book = root.join("Mixed Book");
-        // One track tagged, one missing -> mixed -> filename sort (01 before 02).
+        // One track is tagged and one is not. The mixed set falls back to the
+        // filename sort (01 before 02).
         let a = synth_mp3(&book, "01-intro.mp3", None, 2);
         let b = synth_mp3(&book, "02-body.mp3", Some(5), 4);
         if a.is_none() || b.is_none() {
@@ -2011,8 +2114,8 @@ mod tests {
     #[test]
     fn cue_sidecar_overrides_embedded_chapters() {
         skip_unless_ffmpeg!();
-        // synth() embeds THREE 10s chapters. A sibling .cue defines only TWO
-        // chapters (0–5s, 5–30s), which must win.
+        // synth() embeds THREE 10-second chapters. A sibling .cue defines only
+        // TWO chapters (0–5s, 5–30s). The cue chapters must win.
         let dir = scratch("cue-sidecar");
         let input = synth(&dir, true); // chapters.m4a, 3 embedded chapters
         std::fs::write(
@@ -2030,7 +2133,8 @@ mod tests {
         assert_eq!(eps[0].title, "Front");
         assert_eq!(eps[1].title, "Back");
 
-        // force_embedded ignores the sidecar -> back to 3 embedded chapters.
+        // `force_embedded` ignores the sidecar; the scan is back to 3 embedded
+        // chapters.
         let data2 = dir.join("data2");
         let index2 = Index::open_in_memory().unwrap();
         let book2 = scan_book_as(
@@ -2079,16 +2183,19 @@ mod tests {
         let eps = index.episodes_for_book(&book.id).unwrap();
         assert_eq!(eps.len(), 3);
         for (i, e) in eps.iter().enumerate() {
-            // The real enclosure length is recorded even though the file is gone.
+            // The scan records the real enclosure length even though the file
+            // is gone.
             assert!(e.byte_length > 0, "byte_length recorded for chapter {i}");
-            // The chapter start offset is persisted so http can regenerate it.
+            // The scan persists the chapter start offset, so that http can
+            // regenerate the file.
             assert!(
                 (e.start_sec - (i as f64) * 10.0).abs() < 0.5,
                 "start_sec ~= {}s, got {}",
                 i * 10,
                 e.start_sec
             );
-            // saver mode deleted the split file (peak disk = one chapter).
+            // Saver mode deleted the split file (the peak extra disk usage is
+            // one chapter).
             assert!(
                 !Path::new(&e.file_path).exists(),
                 "saver deletes the split file: {}",
@@ -2096,8 +2203,9 @@ mod tests {
             );
         }
 
-        // Idempotent: re-scanning at the same mtime is a no-op despite the files
-        // being absent (the index entry alone satisfies the check in saver mode).
+        // Idempotency: a re-scan at the same mtime is a no-op even though the
+        // files are absent (the index entry alone satisfies the check in saver
+        // mode).
         let again = scan_book_as(
             &input,
             "saver-book",
@@ -2125,7 +2233,8 @@ mod tests {
         let data = dir.join("data");
         let index = Index::open_in_memory().unwrap();
 
-        // A normal full-mode ingest first: files on disk, real offsets recorded.
+        // Run a normal full-mode ingest first: files land on disk, and the
+        // scan records real offsets.
         let book = scan_book_as(
             &input,
             "mig",
@@ -2141,7 +2250,8 @@ mod tests {
             "full ingest records real chapter offsets"
         );
 
-        // Simulate a pre-5.1 -> 5.1 migration: back-fill start_sec = 0 everywhere.
+        // Simulate a pre-5.1 -> 5.1 migration: back-fill `start_sec` = 0
+        // everywhere.
         for e in &eps {
             let mut zeroed = e.clone();
             zeroed.start_sec = 0.0;
@@ -2177,8 +2287,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Synthesize an audio file with a specific encoder. `None` if the ffmpeg
-    /// build lacks that encoder (test then skips).
+    /// Synthesize an audio file with a specific encoder. Return `None` if the
+    /// ffmpeg build lacks that encoder (the test then skips).
     fn synth_encoded(dir: &Path, name: &str, enc: &[&str], dur: u32) -> Option<PathBuf> {
         std::fs::create_dir_all(dir).unwrap();
         let out = dir.join(name);
@@ -2216,19 +2326,22 @@ mod tests {
     #[test]
     fn transcoding_only_touches_non_podcast_safe_codecs() {
         use TranscodeMode::{Aac, Mp3, Off};
-        // Off is the default: nothing is ever re-encoded.
+        // `Off` is the default: the scan never re-encodes anything.
         for codec in ["mp3", "aac", "flac", "vorbis", "opus", "alac"] {
             assert_eq!(encoding_for(Some(codec), Off), Encoding::Copy, "{codec}");
         }
-        // On: MP3/AAC sources are still stream-copied — they already play everywhere.
+        // On: the scan still stream-copies MP3/AAC sources; they already play
+        // everywhere.
         assert_eq!(encoding_for(Some("mp3"), Aac), Encoding::Copy);
         assert_eq!(encoding_for(Some("aac"), Aac), Encoding::Copy);
-        // On: the formats podcatchers choke on are re-encoded to the chosen target.
+        // On: the scan re-encodes the formats that podcatchers do not play to
+        // the chosen target.
         for codec in ["flac", "vorbis", "opus", "alac"] {
             assert_eq!(encoding_for(Some(codec), Aac), Encoding::Aac, "{codec}");
             assert_eq!(encoding_for(Some(codec), Mp3), Encoding::Mp3, "{codec}");
         }
-        // An unnamed codec is left alone rather than re-encoded on a guess.
+        // The scan leaves an unnamed codec alone; it does not re-encode on a
+        // guess.
         assert_eq!(encoding_for(None, Aac), Encoding::Copy);
     }
 
@@ -2249,7 +2362,7 @@ mod tests {
         let flac = Path::new("/lib/book.flac");
         let m4b = Path::new("/lib/book.m4b");
         let mp3 = Path::new("/lib/book.mp3");
-        // Flag off: nothing may stay transcoded, whatever the container.
+        // Flag off: nothing may stay transcoded, independent of the container.
         assert_eq!(
             expected_transcode(flac, TranscodeMode::Off),
             Some(TranscodeMode::Off)
@@ -2258,7 +2371,7 @@ mod tests {
             expected_transcode(m4b, TranscodeMode::Off),
             Some(TranscodeMode::Off)
         );
-        // Flag on: a Tier-2 container is definitely re-encoded...
+        // Flag on: the scan always re-encodes a Tier-2 container.
         assert_eq!(
             expected_transcode(flac, TranscodeMode::Aac),
             Some(TranscodeMode::Aac)
@@ -2267,19 +2380,20 @@ mod tests {
             expected_transcode(Path::new("/lib/b.opus"), TranscodeMode::Mp3),
             Some(TranscodeMode::Mp3)
         );
-        // ...MP3 definitely isn't...
+        // Flag on: the scan never re-encodes MP3.
         assert_eq!(
             expected_transcode(mp3, TranscodeMode::Aac),
             Some(TranscodeMode::Off)
         );
-        // ...and an mp4-family file is unknowable without a probe (AAC or ALAC), so
-        // the guard abstains rather than re-ingesting the book on every scan.
+        // Flag on: an mp4-family file is unknowable without a probe (AAC or
+        // ALAC). The guard abstains; it does not re-ingest the book on every
+        // scan.
         assert_eq!(expected_transcode(m4b, TranscodeMode::Aac), None);
     }
 
-    /// Acceptance: a FLAC source produces a playable AAC feed when transcoding is
-    /// on — right container, right codec, and an `enclosure length` that is the
-    /// real output size.
+    /// Acceptance: a FLAC source produces a playable AAC feed when transcoding
+    /// is on. That means the right container, the right codec, and an
+    /// `enclosure length` that is the real output size.
     #[test]
     fn flac_with_cue_transcodes_to_aac_when_enabled() {
         skip_unless_ffmpeg!();
@@ -2339,8 +2453,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A chapterless non-podcast-safe file can't be served in place once it's
-    /// re-encoded: the bytes clients get only exist under `<data_dir>`.
+    /// The server cannot serve a chapterless non-podcast-safe file in place
+    /// once it is re-encoded: the bytes clients get exist only under
+    /// `<data_dir>`.
     #[test]
     fn chapterless_flac_transcodes_into_the_data_dir_instead_of_serving_in_place() {
         skip_unless_ffmpeg!();
@@ -2380,8 +2495,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The MP3 fallback target, for clients that still choke on AAC. Skipped when
-    /// this ffmpeg has no `libmp3lame`.
+    /// The MP3 fallback target, for clients that still do not play AAC. The
+    /// test skips when this ffmpeg has no `libmp3lame`.
     #[test]
     fn flac_transcodes_to_mp3_when_that_target_is_chosen() {
         skip_unless_ffmpeg!();
@@ -2425,9 +2540,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `saver` is deliberately overridden for a transcoded book: a re-encode is not
-    /// byte-reproducible, so its episodes must stay on disk (the serve layer refuses
-    /// to regenerate or evict them).
+    /// The scan deliberately overrides `saver` for a transcoded book. A
+    /// re-encode is not byte-reproducible, so its episodes must stay on disk
+    /// (the serve layer refuses to regenerate or evict them).
     #[test]
     fn a_transcoded_saver_book_keeps_its_episodes_on_disk() {
         skip_unless_ffmpeg!();
@@ -2473,10 +2588,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Changing the target rewrites every episode into a new container. The files
-    /// in the old one are unreferenced from that moment, and nothing else reclaims
-    /// them — the cache eviction only touches regenerable books, and a transcoded
-    /// book is never regenerable — so the ingest must sweep them.
+    /// A target change rewrites every episode into a new container. The files
+    /// in the old one are unreferenced from that moment, and nothing else
+    /// reclaims them (the cache eviction only touches regenerable books, and a
+    /// transcoded book is never regenerable). So the ingest must sweep them.
     #[test]
     fn only_episode_files_and_their_temporaries_are_swept() {
         let dir = scratch("sweep-predicate");
@@ -2495,11 +2610,12 @@ mod tests {
         remove_episode_files_in_other_containers(&dir, "m4a");
 
         let left = |name: &str| dir.join(name).exists();
-        // The previous container's episodes and temporaries go.
+        // The sweep removes the previous container's episodes and temporaries.
         assert!(!left("001.flac"));
         assert!(!left("002.flac"));
         assert!(!left("003.part.flac"));
-        // The new container's files are left for the ingest to overwrite.
+        // The sweep leaves the new container's files for the ingest to
+        // overwrite.
         assert!(left("001.m4a"));
         // An extracted cover is not an episode file and must survive.
         assert!(left("cover.jpg"));
@@ -2555,7 +2671,8 @@ mod tests {
             );
         }
         let mp3 = scan(TranscodeMode::Mp3);
-        // No libmp3lame is a skip, not a failure: the sweep is what's under test.
+        // A missing libmp3lame is a skip, not a failure: the sweep is what is
+        // under test.
         if mp3.iter().all(|p| p.ends_with(".mp3")) {
             for old in &aac {
                 assert!(
@@ -2573,10 +2690,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The sweep runs after the index is updated, never before. Until then the old
-    /// files are the ones being served — and this scan can sit inside a re-encode
-    /// for minutes. A failed re-ingest must therefore leave the previous episodes
-    /// playable rather than deleting them and then failing to replace them.
+    /// The sweep runs after the index update, never before. Until then the
+    /// server still serves the old files, and this scan can sit inside a
+    /// re-encode for minutes. A failed re-ingest must therefore leave the
+    /// previous episodes playable; it must not delete them and then fail to
+    /// replace them.
     #[test]
     fn a_failed_reingest_leaves_the_previous_episodes_in_place() {
         skip_unless_ffmpeg!();
@@ -2646,9 +2764,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A book indexed before Task 5.2 carries `transcode = None`. It was necessarily
-    /// stream-copied, which is what `Off` means — so it must NOT be re-ingested
-    /// on upgrade, while a genuinely stale mode must be.
+    /// A book indexed before Task 5.2 carries `transcode = None`. Such a book
+    /// was necessarily stream-copied, and that is what `Off` means. So an
+    /// upgrade must NOT re-ingest it, while a genuinely stale mode must force
+    /// a re-ingest.
     #[test]
     fn a_pre_transcode_row_is_not_reingested_but_a_stale_mode_is() {
         skip_unless_ffmpeg!();
@@ -2656,8 +2775,9 @@ mod tests {
         let Some(flac) = synth_encoded(&dir, "book.flac", &["-c:a", "flac"], 12) else {
             skip!("no flac encoder");
         };
-        // Chaptered, so the episodes are extracted under the data dir — a
-        // chapterless book is served in place and `file_path` is the library file.
+        // The book is chaptered, so the episodes land under the data dir. (A
+        // chapterless book is served in place, and its `file_path` is the
+        // library file.)
         std::fs::write(
             flac.with_extension("cue"),
             "TRACK 01 AUDIO\n  TITLE \"One\"\n  INDEX 01 00:00:00\n\
@@ -2686,8 +2806,9 @@ mod tests {
                 })
                 .unwrap();
         };
-        // A sentinel in the episode file: an early return leaves it, a re-ingest
-        // overwrites it. (Nothing else in a `full`-mode scan rewrites the file.)
+        // A sentinel in the episode file: an early return leaves it, and a
+        // re-ingest overwrites it. (Nothing else in a `full`-mode scan
+        // rewrites the file.)
         let sentinel = |ep: &str| std::fs::write(ep, b"sentinel").unwrap();
         let survived = |ep: &str| std::fs::read(ep).unwrap() == b"sentinel";
 
@@ -2697,7 +2818,8 @@ mod tests {
             .file_path
             .clone();
 
-        // Pre-5.2 row: `None` means the same thing as `Off` — no re-split.
+        // Pre-5.2 row: `None` means the same thing as `Off`, so there is no
+        // re-split.
         stored_mode(None);
         sentinel(&ep);
         scan();
@@ -2706,7 +2828,8 @@ mod tests {
             "an upgraded database must not re-split every stream-copied book"
         );
 
-        // A row claiming a transcode while the flag is off is genuinely stale.
+        // A row that claims a transcode while the flag is off is genuinely
+        // stale.
         stored_mode(Some(TranscodeMode::Aac));
         sentinel(&ep);
         let back = scan();
@@ -2718,9 +2841,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Flipping the flag changes the container and every byte length, and touches no
-    /// source mtime — so the idempotency guard must re-ingest instead of serving
-    /// stale rows. And an unchanged setting must NOT re-ingest.
+    /// A flag flip changes the container and every byte length, and touches no
+    /// source mtime. So the idempotency guard must re-ingest instead of
+    /// serving stale rows. And an unchanged setting must NOT re-ingest.
     #[test]
     fn toggling_transcode_reingests_a_flac_book() {
         skip_unless_ffmpeg!();
@@ -2740,7 +2863,7 @@ mod tests {
         let before = index.episodes_for_book(&off.id).unwrap();
         assert!(before[0].file_path.ends_with(".flac"));
 
-        // Flag on -> re-ingest, even though the source is untouched.
+        // Flag on: the scan re-ingests, even though the source is untouched.
         let on = scan(ScanOptions {
             transcode: TranscodeMode::Aac,
             ..Default::default()
@@ -2752,8 +2875,9 @@ mod tests {
             "expected a re-ingest, got {}",
             after[0].file_path
         );
-        // This book is chapterless, so with the flag off it was served in place:
-        // `before` pointed at the library file itself, which must never be touched.
+        // This book is chapterless, so with the flag off it was served in
+        // place: `before` pointed at the library file itself, and that file
+        // must never be touched.
         assert_eq!(before[0].file_path, before[0].source_path);
         assert!(Path::new(&before[0].source_path).exists());
         assert!(
@@ -2769,8 +2893,9 @@ mod tests {
             "guid is mtime-keyed, so clients don't re-download the whole feed"
         );
 
-        // And back off -> re-ingest to a stream copy again, in place, with the
-        // transcoded copy under the data dir reclaimed rather than orphaned.
+        // Flag back off: the scan re-ingests to a stream copy again, in place.
+        // It reclaims the transcoded copy under the data dir; the copy is not
+        // orphaned.
         let transcoded_copy = after[0].file_path.clone();
         let back = scan(ScanOptions::default());
         assert_eq!(back.transcode, Some(TranscodeMode::Off));
@@ -2791,7 +2916,8 @@ mod tests {
     fn flac_with_cue_splits_by_sidecar_no_reencode() {
         skip_unless_ffmpeg!();
         let dir = scratch("flac-cue");
-        // FLAC has no titled embedded chapters, so it leans on a .cue (PRD S7).
+        // FLAC has no titled embedded chapters, so it relies on a .cue
+        // (PRD S7).
         let Some(flac) = synth_encoded(&dir, "book.flac", &["-c:a", "flac"], 20) else {
             skip!("no flac encoder");
         };
@@ -2832,8 +2958,8 @@ mod tests {
         let eps = index.episodes_for_book(&book.id).unwrap();
         assert_eq!(eps.len(), 1, "no chapters/cue -> single episode");
         assert!(eps[0].file_path.ends_with(".flac"));
-        // Chapterless single file → served in place from the library (the stored
-        // path is canonical/absolute), not copied.
+        // A chapterless single file is served in place from the library (the
+        // stored path is canonical/absolute); it is not copied.
         let flac_c = flac.canonicalize().unwrap();
         assert_eq!(eps[0].source_path, flac_c.to_string_lossy());
         assert_eq!(eps[0].file_path, flac_c.to_string_lossy());
@@ -2861,8 +2987,8 @@ mod tests {
             "got {}",
             eps[0].file_path
         );
-        // Served in place from the library (the original `.opus`), not remuxed
-        // into a data-dir container.
+        // The server serves the original `.opus` in place from the library; it
+        // is not remuxed into a data-dir container.
         assert_eq!(
             eps[0].source_path,
             opus.canonicalize().unwrap().to_string_lossy()
@@ -2911,8 +3037,9 @@ mod tests {
 
     // ---- recursive library discovery ----
 
-    /// End to end on the layout Audiobookshelf produces: real files, real ffprobe,
-    /// real index rows — the case that returned `indexed=0` before this walk.
+    /// End to end on the layout Audiobookshelf produces: real files, real
+    /// ffprobe, real index rows. This is the case that returned `indexed=0`
+    /// before this walk existed.
     #[test]
     fn scan_library_indexes_an_author_title_tree() {
         skip_unless_ffmpeg!();
@@ -2995,8 +3122,8 @@ mod tests {
 
     #[test]
     fn discover_walks_author_title_libraries() {
-        // The layout Audiobookshelf, Plex and Jellyfin all produce, and the one a
-        // large library is least likely to rearrange.
+        // This is the layout that Audiobookshelf, Plex, and Jellyfin all
+        // produce, and the one a large library is least likely to rearrange.
         let root = scratch("discover-nested");
         touch(
             &root.join("Jules Verne/The Mysterious Island/Jules Verne - The Mysterious Island.m4b"),
@@ -3040,8 +3167,8 @@ mod tests {
         let name = |src: &BookSource| slugify(&src.base_name(&root));
         let found = discover(&root, &root.join("data"));
         let names: Vec<String> = found.iter().map(name).collect();
-        // Files and directories interleaved, path-sorted, capitals first — the
-        // order discovery has always produced (see
+        // Files and directories are interleaved, path-sorted, capitals first:
+        // the order discovery has always produced (see
         // `root_files_and_directories_keep_their_historical_order`).
         assert_eq!(
             names,
@@ -3049,10 +3176,10 @@ mod tests {
                 // Nested: named by the path, not by an unhelpful file stem.
                 "jules-verne-the-mysterious-island",
                 "mary-shelley-frankenstein",
-                // Unchanged: a root file keeps its stem...
+                // Unchanged: a root file keeps its stem.
                 "top-book",
-                // ...and a book directly below the root keeps its FILE stem, not
-                // its folder name. Changing this would re-key the book and rotate
+                // A book directly below the root keeps its FILE stem, not its
+                // folder name. A change here would re-key the book and rotate
                 // its capability feed id.
                 "inner-name",
                 // An MP3 folder directly below the root keeps its folder name.
@@ -3062,19 +3189,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The order books are discovered in decides which of two same-named books
-    /// gets the bare slug and which gets `-2`. That slug is the book id, and a
-    /// book's capability feed id is preserved per id across re-scans — so a
-    /// reordering hands each subscriber the *other* audiobook under the URL they
-    /// already have. Root files and directories must stay interleaved by name.
-    /// A newly discovered file must not take the id of a book that already exists,
-    /// because `upsert_book` preserves the capability `feed_id` per id: the URL
-    /// would keep working and start serving a different audiobook. This is the
-    /// case a folder of several `.m4b` files opened up — its second file was never
-    /// discovered before, and its stem can collide with an existing book.
-    /// A database that already holds two rows for one source (an older build, a
-    /// manual edit) must heal to a single row — otherwise the book stays under two
-    /// capability feeds across every future reconcile, since both survive pruning.
+    /// Discovery order decides which of two same-named books gets the bare
+    /// slug and which gets `-2`. That slug is the book id, and a book's
+    /// capability feed id is preserved per id across re-scans. A reordering
+    /// would therefore hand each subscriber the *other* audiobook under the
+    /// URL they already have. Root files and directories must stay
+    /// interleaved by name.
+    ///
+    /// A newly discovered file must not take the id of a book that already
+    /// exists, because `upsert_book` preserves the capability `feed_id` per
+    /// id: the URL would keep working and start serving a different
+    /// audiobook. A folder of several `.m4b` files opened this case up: its
+    /// second file was never discovered before, and its stem can collide with
+    /// an existing book.
+    ///
+    /// A database that already holds two rows for one source (an older build,
+    /// a manual edit) must heal to a single row. Otherwise the book stays
+    /// under two capability feeds across every future reconcile, because both
+    /// rows survive pruning.
     #[test]
     fn duplicate_source_rows_collapse_to_one() {
         let root = scratch("collapse-dups");
@@ -3102,11 +3234,11 @@ mod tests {
             force_embedded: false,
             transcode: Some(TranscodeMode::Off),
         };
-        // The ESTABLISHED feed is the suffixed `book-2` (indexed first, so earlier
-        // created_at); the later duplicate is the base `book`. The survivor must be
-        // chosen by age, not by id — an id sort would delete the very feed
-        // subscribers use (Greptile). A few ms between inserts makes created_at
-        // distinct on any real clock.
+        // The ESTABLISHED feed is the suffixed `book-2` (indexed first, so it
+        // has the earlier `created_at`); the later duplicate is the base
+        // `book`. Age must choose the survivor, not the id: an id sort would
+        // delete the very feed subscribers use (Greptile). A few ms between
+        // inserts makes `created_at` distinct on any real clock.
         index.upsert_book(&row("book-2", "cap-book-2")).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(5));
         index.upsert_book(&row("book", "cap-book")).unwrap();
@@ -3137,9 +3269,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Two rows sharing a source whose file is GONE are prune_orphans' job, not
-    /// this one — and an unmounted library (every source missing) must collapse
-    /// nothing, so a mount blip can't wipe the index.
+    /// Two rows that share a source whose file is GONE are `prune_orphans`'
+    /// job, not this one. And an unmounted library (every source missing)
+    /// must collapse nothing, so that a mount blip cannot wipe the index.
     #[test]
     fn collapse_leaves_gone_sources_for_pruning() {
         let root = scratch("collapse-gone");
@@ -3173,11 +3305,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The two-scan hazard: a newcomer suffixed because a stale row held its base
-    /// id must not, once that stale row is pruned, be re-indexed under the freed
-    /// base id on the next scan — that is one audiobook under two feeds. Reusing an
-    /// already-indexed source'"'"'s id closes it. Exercised through `reconcile`, which
-    /// is scan-then-prune, run twice.
+    /// The two-scan hazard: a stale row held the base id, so the newcomer got
+    /// a suffix. Once that stale row is pruned, the next scan must not
+    /// re-index the newcomer under the freed base id: that is one audiobook
+    /// under two feeds. Reuse of an already-indexed source's id closes the
+    /// hazard. The test exercises `reconcile` (scan-then-prune), run twice.
     #[test]
     fn a_source_keeps_one_id_across_consecutive_reconciles() {
         skip_unless_ffmpeg!();
@@ -3209,9 +3341,10 @@ mod tests {
         }
         let newcomer = root.join("Foo.m4b").canonicalize().unwrap();
 
-        // Reconcile #1: newcomer is suffixed to `foo-2`, stale `foo` is pruned.
+        // Reconcile 1 suffixes the newcomer to `foo-2` and prunes the stale
+        // `foo`.
         reconcile(&root, &data, &index, ScanOptions::default());
-        // Reconcile #2: `foo` is free now, but the newcomer must keep `foo-2`.
+        // Reconcile 2: `foo` is free now, but the newcomer must keep `foo-2`.
         reconcile(&root, &data, &index, ScanOptions::default());
 
         let books = index.list_books().unwrap();
@@ -3267,16 +3400,17 @@ mod tests {
             })
             .unwrap();
 
-        // The newcomer is refused the slug even though it is processed first.
+        // `assign_slug` refuses the newcomer even though it runs first.
         let mut seen = HashSet::new();
         assert_eq!(assign_slug("b", &newcomer, &index, &mut seen), "b-2");
         // And the book that owns it still gets it.
         assert_eq!(assign_slug("b", &established, &index, &mut seen), "b");
 
-        // Even when the owner's file is gone (a move), the live index row still
-        // holds the id — a newcomer must NOT inherit its capability feed. The row
-        // is retired by `prune_orphans` in the same reconcile, freeing the id for a
-        // LATER scan; within this one, the newcomer stays on `b-2`.
+        // Even when the owner's file is gone (a move), the live index row
+        // still holds the id: a newcomer must NOT inherit its capability feed.
+        // `prune_orphans` retires the row in the same reconcile, which frees
+        // the id for a LATER scan. Within this one, the newcomer stays on
+        // `b-2`.
         std::fs::remove_file(&established).unwrap();
         let mut seen = HashSet::new();
         assert_eq!(assign_slug("b", &newcomer, &index, &mut seen), "b-2");
@@ -3286,9 +3420,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_mp3_track_that_links_outside_the_library_is_dropped() {
-        // The folder is inside the library, but a track within it symlinks out.
-        // `source_is_inside` only vetted the folder, so the track has to be caught
-        // where the tracks are gathered, or it 404s at serve time.
+        // The folder is inside the library, but a track within it symlinks
+        // out. `source_is_inside` only vetted the folder, so the collection
+        // step must catch the track; otherwise it 404s at serve time.
         let outside = scratch("mp3-outside");
         std::fs::write(outside.join("external.mp3"), b"x").unwrap();
 
@@ -3312,8 +3446,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_broken_link_is_skipped_rather_than_indexed() {
-        // `canonicalize` fails on a dangling link, which must not be treated as
-        // "inside the library" — nor panic the scan.
+        // `canonicalize` fails on a dangling link. The scan must not treat
+        // that as "inside the library", and it must not panic.
         let root = scratch("discover-broken-link");
         touch(&root.join("Author/Real/real.m4b"));
         let dangling_dir = root.join("Author/Dangling");
@@ -3414,9 +3548,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn links_that_leave_the_library_are_not_indexed() {
-        // The serve layer canonicalizes an episode's source and refuses anything
-        // outside the library root, so indexing these would publish feeds whose
-        // audio 404s. Both a linked directory and a linked file must be refused.
+        // The serve layer canonicalizes an episode's source and refuses
+        // anything outside the library root, so an index of these would
+        // publish feeds whose audio 404s. The walk must refuse both a linked
+        // directory and a linked file.
         let outside = scratch("discover-outside");
         touch(&outside.join("Elsewhere/external.m4b"));
         touch(&outside.join("loose-external.m4b"));
@@ -3504,7 +3639,8 @@ mod tests {
             .iter()
             .map(|s| assign_slug(&slugify(&s.base_name(&root)), s.path(), &index, &mut seen))
             .collect();
-        // Not `dracula` and `dracula-2`, whose assignment would hinge on walk order.
+        // Not `dracula` and `dracula-2`; that assignment would hinge on walk
+        // order.
         assert_eq!(slugs, vec!["author-one-dracula", "author-two-dracula"]);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3515,8 +3651,9 @@ mod tests {
         // audio files in numbered folders, so a naive walk would index podspine's
         // own output as books and re-split it.
         let root = scratch("discover-datadir");
-        // Deliberately NOT a dot-directory: those are skipped by name, which would
-        // let this test pass without the data-dir guard ever running.
+        // Deliberately NOT a dot-directory: those are skipped by name, and
+        // that skip would let this test pass without the data-dir guard ever
+        // running.
         let data = root.join("podspine-data");
         touch(&root.join("Author/Title/book.m4b"));
         touch(&data.join("books/author-title/001.m4a"));
@@ -3588,8 +3725,8 @@ mod tests {
         let root = scratch("discover-tier2");
         touch(&root.join("Author/A FLAC Book/book.flac"));
         touch(&root.join("Author/An Opus Book/book.opus"));
-        // Several Tier-2 files is NOT an MP3-folder equivalent: that path reads
-        // only `.mp3`, so half-ingesting these would be worse than skipping them.
+        // Several Tier-2 files are NOT an MP3-folder equivalent: that path
+        // reads only `.mp3`. A half-ingest would be worse than a skip.
         touch(&root.join("Author/Multi FLAC/01.flac"));
         touch(&root.join("Author/Multi FLAC/02.flac"));
 
@@ -3648,8 +3785,8 @@ mod tests {
     fn library_scan_disambiguates_same_named_books() {
         skip_unless_ffmpeg!();
         // Two books that slugify identically, in separate folders. The folder
-        // names must differ by more than case so they stay distinct on
-        // case-insensitive filesystems (Windows/macOS) — `Dracula` and
+        // names must differ by more than case, so that they stay distinct on
+        // case-insensitive filesystems (Windows/macOS). `Dracula` and
         // `Dracula!` both slugify to "dracula" but are two real directories.
         let root = scratch("dup-lib");
         let b1 = synth(
@@ -3746,7 +3883,8 @@ mod tests {
 
         let eps = index.episodes_for_book(&book.id).unwrap();
         assert_eq!(eps.len(), 3, "3 chapters -> 3 episodes");
-        // idx order, positive sizes, files on disk, strictly increasing pubDates.
+        // Check: idx order, positive sizes, files on disk, strictly increasing
+        // pubDates.
         for (i, e) in eps.iter().enumerate() {
             assert_eq!(e.idx, i as i64);
             assert!(e.byte_length > 0);
@@ -3773,7 +3911,8 @@ mod tests {
     fn non_faststart_single_file_is_flagged_and_optionally_remuxed() {
         skip_unless_ffmpeg!();
         let dir = scratch("faststart");
-        // ffmpeg's mp4 muxer writes `moov` at the END by default → non-faststart.
+        // ffmpeg's mp4 muxer writes `moov` at the END by default, so the file
+        // is non-faststart.
         let input = synth(&dir, false);
         assert!(
             needs_faststart(&input),
@@ -3781,7 +3920,8 @@ mod tests {
         );
         let input_c = input.canonicalize().unwrap();
 
-        // remux OFF (default): flagged, but still streamed in place.
+        // remux OFF (default): the episode is flagged, but still streamed in
+        // place.
         {
             let data = dir.join("data-off");
             let index = Index::open_in_memory().unwrap();
@@ -3806,8 +3946,9 @@ mod tests {
             );
         }
 
-        // remux ON: remuxed to a faststart cache file under the data dir; measured
-        // then deleted at ingest (regenerated on demand, like a saver chapter).
+        // remux ON: the scan remuxes to a faststart cache file under the data
+        // dir. It measures the file, then deletes it at ingest (the http layer
+        // regenerates it on demand, like a saver chapter).
         {
             let data = dir.join("data-on");
             let index = Index::open_in_memory().unwrap();
@@ -3906,7 +4047,7 @@ mod tests {
         let data = dir.join("data");
         let index = Index::open_in_memory().unwrap();
 
-        // remux OFF → in place.
+        // remux OFF: served in place.
         scan_book_as(
             &input,
             "t",
@@ -3939,7 +4080,7 @@ mod tests {
             "remux on → served from the cache copy"
         );
 
-        // Flip back OFF: re-ingest again, back to in place.
+        // Flip back OFF: the scan re-ingests again, back to in place.
         scan_book_as(
             &input,
             "t",
@@ -3997,13 +4138,13 @@ mod tests {
         let data = root.join("data");
         let index = Index::open_in_memory().unwrap();
 
-        // First scan: no sidecar → default title, `full`.
+        // First scan: no sidecar, so the default title and `full` apply.
         scan_library(&root, &data, &index, ScanOptions::default());
         let before = index.list_books().unwrap().remove(0);
         assert_eq!(before.storage_mode, Some(StorageMode::Full));
         let guid_before = index.episodes_for_book(&before.id).unwrap()[0].guid.clone();
 
-        // Edit the sidecar — the AUDIO file is untouched (same mtime). The edit
+        // Edit the sidecar; the AUDIO file is untouched (same mtime). The edit
         // must still take effect on the next scan (Greptile 6.4 P1).
         let side = input
             .canonicalize()
@@ -4019,8 +4160,8 @@ mod tests {
             Some(StorageMode::Saver),
             "sidecar storage_mode applied"
         );
-        // source_mtime is unchanged, so the episode guid is stable — a metadata
-        // edit doesn't make podcast clients re-download.
+        // `source_mtime` is unchanged, so the episode guid is stable: a
+        // metadata edit does not make podcast clients re-download.
         let guid_after = index.episodes_for_book(&before.id).unwrap()[0].guid.clone();
         assert_eq!(
             guid_before, guid_after,
@@ -4059,12 +4200,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A database failure mid-reconcile is survived and logged, never a panic —
-    /// fault-inject by dropping the `book` table out from under a live [`Index`]
-    /// via a second connection. One reconcile then exercises every
-    /// skipped-with-a-warn arm: the duplicate-row collapse, the id-reuse map, the
-    /// disabled-book prune (the disabled path never probes, so no ffmpeg is
-    /// needed), the orphan prune, and the metrics book count.
+    /// The scan survives and logs a database failure mid-reconcile; it never
+    /// panics. The fault injection drops the `book` table out from under a
+    /// live [`Index`] via a second connection. One reconcile then exercises
+    /// every skipped-with-a-warn arm: the duplicate-row collapse, the id-reuse
+    /// map, the disabled-book prune (the disabled path never probes, so no
+    /// ffmpeg is needed), the orphan prune, and the metrics book count.
     #[test]
     fn scan_survives_a_broken_index() {
         let root = scratch("scan-broken-index");
@@ -4088,8 +4229,9 @@ mod tests {
     }
 
     /// The duplicate-row collapse must survive a DELETE that fails while reads
-    /// still work — fault-inject with a second connection holding a write lock
-    /// (WAL keeps reads serving; the delete gets SQLITE_BUSY immediately).
+    /// still work. The fault injection holds a write lock on a second
+    /// connection (WAL keeps reads serving; the delete gets `SQLITE_BUSY`
+    /// immediately).
     #[test]
     fn collapse_survives_a_failing_delete() {
         let root = scratch("collapse-delete-fail");
@@ -4129,8 +4271,8 @@ mod tests {
         );
     }
 
-    /// Symlinks that leave the library root, and dangling symlinks, are skipped
-    /// with a warning — never followed, never fatal.
+    /// The walk skips, with a warning, symlinks that leave the library root
+    /// and dangling symlinks. It never follows them, and they are never fatal.
     #[cfg(unix)]
     #[test]
     fn walk_skips_escaping_and_dangling_symlinks() {
@@ -4148,8 +4290,9 @@ mod tests {
         assert!(index.list_books().unwrap().is_empty());
     }
 
-    /// A DB that can't open must still fire the ready callback — otherwise the
-    /// server wedges on the "Scanning…" page forever (issue 159's failure mode).
+    /// A DB that cannot open must still fire the ready callback. Otherwise the
+    /// server hangs on the "Scanning…" page forever (issue 159's failure
+    /// mode).
     #[test]
     fn watch_loop_fires_ready_even_when_the_db_cannot_open() {
         let root = scratch("watch-bad-db");
@@ -4196,7 +4339,8 @@ mod tests {
         scan_library(&root, &data, &index, ScanOptions::default());
         assert_eq!(index.list_books().unwrap().len(), 1, "indexed first");
 
-        // A disabling sidecar removes it from the index on the next scan.
+        // A disabling sidecar removes the book from the index on the next
+        // scan.
         let side = input
             .canonicalize()
             .unwrap()
@@ -4251,8 +4395,8 @@ mod tests {
     #[test]
     fn sidecar_global_key_is_ignored_and_a_typo_is_non_fatal() {
         skip_unless_ffmpeg!();
-        // A server-global key in a sidecar is ignored (warned); the per-book key
-        // still applies.
+        // The scan ignores a server-global key in a sidecar and warns; the
+        // per-book key still applies.
         let root = scratch("perbook-global");
         let input = synth(&root, false);
         let side = input
@@ -4269,7 +4413,8 @@ mod tests {
         assert_eq!(index.list_books().unwrap().remove(0).title, "Kept");
         let _ = std::fs::remove_dir_all(&root);
 
-        // A typo (unknown key) is a per-book warning, not fatal — still indexes.
+        // A typo (an unknown key, here a stray plural) is a per-book warning,
+        // not fatal. The scan still indexes the book.
         let root2 = scratch("perbook-typo");
         let input2 = synth(&root2, false);
         std::fs::write(
@@ -4277,7 +4422,7 @@ mod tests {
                 .canonicalize()
                 .unwrap()
                 .with_extension("podspine.toml"),
-            b"stroage_mode = \"saver\"",
+            b"storage_modes = \"saver\"",
         )
         .unwrap();
         let data2 = root2.join("data");
@@ -4299,8 +4444,9 @@ mod tests {
         let root = scratch("mp3-unprobeable");
         let book = root.join("Broken");
         std::fs::create_dir_all(&book).unwrap();
-        // Several `.mp3` files that aren't real audio → a folder book whose tracks
-        // all fail to probe → EmptyFolder → skipped, not fatal.
+        // Several `.mp3` files that are not real audio give a folder book
+        // whose tracks all fail to probe. That is `EmptyFolder`: skipped, not
+        // fatal.
         std::fs::write(book.join("01.mp3"), b"not audio at all").unwrap();
         std::fs::write(book.join("02.mp3"), b"also not audio").unwrap();
         let data = root.join("data");
@@ -4315,7 +4461,8 @@ mod tests {
     fn library_watcher_indexes_a_book_added_after_startup() {
         skip_unless_ffmpeg!();
         // `keep()`: the watcher below must outlive this test body (see the
-        // teardown note at the bottom), so the drop-cleanup guard is defused.
+        // teardown note at the bottom), so the test defuses the drop-cleanup
+        // guard.
         let root = scratch("watcher-lib").keep();
         let data = scratch("watcher-data").keep();
         let db_path = data.join("podspine.db");
@@ -4329,13 +4476,15 @@ mod tests {
             ScanOptions::default(),
             || {},
         );
-        // Let the watcher establish its filesystem watch before we add a file.
+        // Let the watcher establish its filesystem watch before the test adds
+        // a file.
         std::thread::sleep(std::time::Duration::from_millis(300));
 
-        // Add a book — the watcher should notice, reconcile, and index it.
+        // Add a book. The watcher should notice it, reconcile, and index it.
         let _input = synth(&root, false);
 
-        // Poll (debounce + reconcile + ffmpeg split take a moment); generous cap.
+        // Poll: debounce, reconcile, and the ffmpeg split take a moment. The
+        // cap is generous.
         let mut indexed = false;
         for _ in 0..100 {
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -4348,27 +4497,29 @@ mod tests {
         }
         assert!(indexed, "the watcher indexed the book added after startup");
 
-        // Deliberately do NOT tear down `root`/`data` here. `spawn_library_watcher`
-        // is a detached, process-lifetime daemon with no shutdown hook (by design),
-        // so deleting its watched dir + WAL db out from under the live thread would
-        // make it churn on removed paths and could race later tests. `scratch()`
-        // already wipes these unique paths at the START of the next run, so nothing
-        // leaks across runs; the parked thread sees no further events and dies with
-        // the process.
+        // Deliberately do NOT tear down `root`/`data` here.
+        // `spawn_library_watcher` is a detached, process-lifetime daemon with
+        // no shutdown hook (by design). A delete of its watched dir and WAL db
+        // out from under the live thread would make it churn on removed paths,
+        // and it could race later tests. `scratch()` already wipes these
+        // unique paths at the START of the next run, so nothing leaks across
+        // runs. The parked thread sees no further events and dies with the
+        // process.
     }
 
     #[test]
     fn watch_filter_ignores_output_and_junk_keeps_real_changes() {
         let lib = Path::new("/lib");
         let data = Path::new("/lib/.podspine"); // a nested --data-dir
-        // Our own split output under the data dir — ignored (else it self-triggers).
+        // Our own split output under the data dir is ignored (otherwise it
+        // self-triggers).
         assert!(!watch_path_is_relevant(
             Path::new("/lib/.podspine/BookX/001.m4a"),
             lib,
             data,
             None
         ));
-        // NAS junk / thumbnail caches — ignored anywhere below the root.
+        // NAS junk and thumbnail caches are ignored anywhere below the root.
         assert!(!watch_path_is_relevant(
             Path::new("/lib/Author/@eaDir/thumb.jpg"),
             lib,
@@ -4387,7 +4538,7 @@ mod tests {
             data,
             None
         ));
-        // A real book file — relevant.
+        // A real book file is relevant.
         assert!(watch_path_is_relevant(
             Path::new("/lib/Author/Title/book.m4b"),
             lib,
@@ -4411,14 +4562,14 @@ mod tests {
         let lib = Path::new("/lib");
         let data = Path::new("/data");
         let paths = || vec![PathBuf::from("/lib/Author/Title/book.m4b")];
-        // A read (another app streaming) — dropped.
+        // A read (another app streams the file) is dropped.
         let read = notify::Event {
             kind: EventKind::Access(AccessKind::Any),
             paths: paths(),
             attrs: Default::default(),
         };
         assert!(!watch_event_is_relevant(&read, lib, data, None));
-        // A write to a real book file — relevant.
+        // A write to a real book file is relevant.
         let write = notify::Event {
             kind: EventKind::Modify(ModifyKind::Any),
             paths: paths(),
@@ -4506,10 +4657,10 @@ mod tests {
         assert!(cover.exists(), "cover on disk");
         let book_out = cover.parent().unwrap().to_path_buf();
 
-        // Block the atomic publish of any *replacement* cover: a directory sitting at
-        // the `.part` target makes ffmpeg's write fail, so `extract_cover` errors while
-        // the previously-published `cover.jpg` stays intact on disk — the exact case
-        // the fallback below must survive.
+        // Block the atomic publish of any *replacement* cover: a directory at
+        // the `.part` target makes ffmpeg's write fail. `extract_cover` then
+        // errors while the previously published `cover.jpg` stays intact on
+        // disk. That is the exact case the fallback below must survive.
         std::fs::create_dir_all(book_out.join("cover.part.jpg")).unwrap();
 
         // Force a re-ingest (a distinct source mtime, not the idempotent early return).
@@ -4522,8 +4673,9 @@ mod tests {
             )
             .unwrap();
 
-        // The re-ingest keeps the still-present cover instead of orphaning it to None —
-        // otherwise both cover routes 404 and the thumbnail backfill can't recover it.
+        // The re-ingest keeps the still-present cover; it does not orphan it
+        // to `None`. Otherwise both cover routes 404, and the thumbnail
+        // backfill cannot recover it.
         let reingested = scan().unwrap();
         assert_eq!(
             reingested.cover_path.as_deref(),
@@ -4537,10 +4689,11 @@ mod tests {
 
     #[test]
     fn watch_filter_ignores_output_under_the_canonical_data_dir() {
-        // The configured data dir can be spelled differently from where it resolves
-        // (a symlinked mount), so the filter also checks the canonical path. A write
-        // under the CANONICAL data dir is still our own split output and must be
-        // ignored even when it doesn't match the raw spelling.
+        // The configured data dir can be spelled differently from where it
+        // resolves (a symlinked mount), so the filter also checks the
+        // canonical path. A write under the CANONICAL data dir is still our
+        // own split output, and the filter must ignore it even when it does
+        // not match the raw spelling.
         let lib = Path::new("/lib");
         let raw = Path::new("/lib/.podspine"); // as configured
         let canon = Path::new("/mnt/real/podspine"); // where it resolves to
@@ -4606,8 +4759,9 @@ mod tests {
         let first = index.episodes_for_book(&id).unwrap();
         assert!(first.iter().all(|e| !e.source_path.is_empty()));
 
-        // Re-scan the unchanged folder: the `source_path` idempotency guard takes
-        // the early return — episodes are unchanged and still served in place.
+        // Re-scan the unchanged folder: the `source_path` idempotency guard
+        // takes the early return. Episodes are unchanged and still served in
+        // place.
         scan_library(&root, &data, &index, ScanOptions::default());
         let second = index.episodes_for_book(&id).unwrap();
         assert_eq!(first.len(), second.len());
@@ -4644,9 +4798,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // Two distinctly-named top-level books in `root`; `data` is kept OUTSIDE the
-    // library so emptying `root` genuinely empties it (for the guard test). `tag`
-    // keeps each test's scratch dirs distinct so parallel runs don't collide.
+    // Two distinctly named top-level books in `root`. `data` is kept OUTSIDE
+    // the library, so that an emptied `root` is genuinely empty (for the guard
+    // test). `tag` keeps each test's scratch dirs distinct, so parallel runs
+    // do not collide.
     fn two_book_library(tag: &str) -> (ScratchDir, ScratchDir, Index) {
         let root = scratch(&format!("{tag}-lib"));
         let data = scratch(&format!("{tag}-data"));
@@ -4661,8 +4816,9 @@ mod tests {
     #[test]
     fn prune_orphans_removes_a_deleted_source_and_its_split_output() {
         skip_unless_ffmpeg!();
-        // Chaptered books (not whole-file) so each materializes a per-chapter
-        // split dir under <data> — that's the "split output" prune must remove.
+        // Chaptered books (not whole-file), so each materializes a per-chapter
+        // split dir under `<data>`. That dir is the "split output" the prune
+        // must remove.
         let root = scratch("prune-removes-lib");
         let data = scratch("prune-removes-data");
         let a = synth(&root, true);
@@ -4723,7 +4879,7 @@ mod tests {
         assert_eq!(index.list_books().unwrap().len(), 2);
         assert_eq!(s.pruned, 0);
 
-        // Remove one source, reconcile again -> it is pruned.
+        // Remove one source and reconcile again: the book is pruned.
         std::fs::remove_file(root.join("beta.m4a")).unwrap();
         let s = reconcile(&root, &data, &index, ScanOptions::default());
         assert_eq!(s.pruned, 1);

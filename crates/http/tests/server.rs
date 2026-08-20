@@ -130,9 +130,10 @@ fn state_with_default_cover(
     .expect("test dirs canonicalize")
 }
 
-/// A root that can't be canonicalized must fail construction loudly. The old
-/// fallback kept the as-given path, and every containment check then failed
-/// closed — a server that silently 404s everything (security audit 2026-08-19).
+/// A root that cannot be canonicalized must fail construction loudly. The
+/// old fallback kept the as-given path, and every containment check then
+/// failed closed: a server that silently 404s everything (security audit
+/// 2026-08-19).
 #[test]
 fn state_construction_fails_when_a_root_is_missing() {
     let dir = scratch("http-missing-root");
@@ -157,8 +158,8 @@ fn state_construction_fails_when_a_root_is_missing() {
 
 /// Final defense-in-depth on the audio route: every resolver check passes (a
 /// chaptered episode, a real file under `data/books/<id>`), but the chapter file
-/// itself is a symlink pointing outside BOTH trusted roots. The last
-/// canonicalize-and-check must catch it and 404 — this is the deliberately
+/// itself is a symlink that points outside BOTH trusted roots. The last
+/// canonicalize-and-check must catch it and 404. This is the deliberately
 /// hand-rolled two-root check, and this is its only test.
 #[cfg(unix)]
 #[tokio::test]
@@ -190,7 +191,7 @@ async fn audio_file_symlinked_outside_both_roots_is_a_404() {
 }
 
 /// Invalid feed-id characters 404 at the allow-list, before any DB or
-/// filesystem work — on the thumb route too (the cover route's sibling).
+/// filesystem work, on the thumb route too (the cover route's sibling).
 #[tokio::test]
 async fn cover_thumb_rejects_an_invalid_feed_id() {
     let resp = router(empty_state())
@@ -204,8 +205,9 @@ async fn cover_thumb_rejects_an_invalid_feed_id() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
-/// Synthesize a two-chapter FLAC (chapters via a `.cue` sidecar — embedded FLAC
-/// chapters carry no titles). `None` when this ffmpeg has no FLAC encoder.
+/// Synthesize a two-chapter FLAC (chapters via a `.cue` sidecar; embedded
+/// FLAC chapters carry no titles). `None` when this ffmpeg has no FLAC
+/// encoder.
 fn synth_flac_with_cue(dir: &Path) -> Option<PathBuf> {
     let input = dir.join("book.flac");
     let ok = Command::new("ffmpeg")
@@ -278,8 +280,8 @@ async fn serves_cover_when_present() {
         resp.headers().get(header::CONTENT_TYPE).unwrap(),
         "image/jpeg"
     );
-    // Cacheable: an ETag + Cache-Control so a refresh revalidates instead of
-    // re-downloading the image every time.
+    // Cacheable: an ETag + Cache-Control, so that a refresh revalidates
+    // instead of a re-download of the image every time.
     let etag = resp
         .headers()
         .get(header::ETAG)
@@ -296,8 +298,8 @@ async fn serves_cover_when_present() {
     );
     assert!(!body_bytes(resp).await.is_empty(), "cover bytes served");
 
-    // A conditional re-request with that ETag gets a bodyless 304, not the image
-    // again — the fix for re-pulling covers on every refresh.
+    // A conditional re-request with that ETag gets a bodyless 304, not the
+    // image again: the fix for covers re-pulled on every refresh.
     let resp = app
         .clone()
         .oneshot(
@@ -315,9 +317,10 @@ async fn serves_cover_when_present() {
     );
     assert!(body_bytes(resp).await.is_empty(), "a 304 carries no body");
 
-    // Content-addressed ETag: if the cover bytes change (a re-extraction), the old
-    // tag no longer matches, so the same conditional request now gets a fresh 200
-    // with a *different* ETag — never a stale 304 for the wrong bytes.
+    // Content-addressed ETag: if the cover bytes change (a re-extraction),
+    // the old tag no longer matches, so the same conditional request now gets
+    // a fresh 200 with a *different* ETag, never a stale 304 for the wrong
+    // bytes.
     std::fs::write(&cover_file, b"different cover bytes").unwrap();
     let resp = app
         .oneshot(
@@ -371,7 +374,7 @@ async fn saver_mode_regenerates_a_chapter_on_demand() {
     let state = saver_state(index, &data, &dir);
     let app = router(state);
 
-    // First request: the file is missing, so it's regenerated and served.
+    // First request: the file is missing, so it is regenerated and served.
     let resp = app
         .clone()
         .oneshot(
@@ -448,8 +451,8 @@ async fn saver_cache_evicts_over_the_size_cap() {
         let _ = body_bytes(resp).await;
     }
 
-    // After serving ch2 with a 1-byte cap, ch1 must have been evicted — leaving
-    // exactly one cached chapter file.
+    // After ch2 is served with a 1-byte cap, ch1 must have been evicted,
+    // which leaves exactly one cached chapter file.
     let cached = std::fs::read_dir(&book_out)
         .unwrap()
         .flatten()
@@ -491,7 +494,7 @@ async fn full_mode_missing_file_is_a_404_not_a_regeneration() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
-/// Synthesize a chapterless AAC single file → served in place (Sprint 6.2).
+/// Synthesize a chapterless AAC single file, served in place (Sprint 6.2).
 fn synth_flat(dir: &Path) -> PathBuf {
     synth_sine(dir, "flat.m4a", 8.0)
 }
@@ -582,9 +585,10 @@ async fn in_place_source_outside_the_library_is_a_404() {
     let book = scan_book(&input, &data, &index).unwrap();
     let feed_id = book.feed_id.clone();
 
-    // Poison the row: point the episode's in-place source at a real file OUTSIDE
-    // the library root. Canonicalize succeeds, but the library-root guard must
-    // still reject it — a poisoned/traversing source path never escapes.
+    // Poison the row: point the episode's in-place source at a real file
+    // OUTSIDE the library root. Canonicalize succeeds, but the library-root
+    // guard must still reject it: a poisoned/traversing source path never
+    // escapes.
     let outside = base.join("outside.m4a");
     std::fs::copy(&input, &outside).unwrap();
     let mut ep = index.episodes_for_book(&book.id).unwrap()[0].clone();
@@ -628,11 +632,11 @@ async fn in_place_source_on_a_chaptered_episode_is_rejected() {
         "a chaptered episode has no source_path"
     );
 
-    // Corrupt the row: mark chapter 1 as an in-place whole-file episode pointing at
-    // the WHOLE container (`file_path == source_path`, under the library so the
-    // library-root check passes). Its recorded byte_length is the chapter's size,
-    // not the container's — so the whole-file size invariant must reject it rather
-    // than serve the full container's bytes.
+    // Corrupt the row: mark chapter 1 as an in-place whole-file episode that
+    // points at the WHOLE container (`file_path == source_path`, under the
+    // library, so the library-root check passes). Its recorded byte_length is
+    // the chapter's size, not the container's. So the whole-file size
+    // invariant must reject it; it must not serve the full container's bytes.
     let container = input.canonicalize().unwrap().to_string_lossy().into_owned();
     ep.source_path = container.clone();
     ep.file_path = container;
@@ -808,7 +812,8 @@ async fn regenerate_rejects_an_invalid_slug() {
     let index = Index::open_in_memory().unwrap();
     let state = test_state(index, &data, &dir);
     let app = router(state);
-    // Same-origin (no cross-site header) but an invalid slug (uppercase) → 404.
+    // Same-origin (no cross-site header) but an invalid slug (uppercase)
+    // gives 404.
     let resp = app
         .oneshot(
             Request::post("/book/BadSlug/regenerate")
@@ -858,7 +863,7 @@ async fn remux_source_outside_the_library_is_a_404() {
     let data = base.join("data");
     std::fs::create_dir_all(&library).unwrap();
     let index = Index::open_in_memory().unwrap();
-    // A non-faststart file, ingested with remux ON → a remux-cache episode
+    // A non-faststart file ingested with remux ON gives a remux-cache episode
     // (file_path != source_path, needs_faststart); the cache file was deleted.
     let input = synth_flat(&library);
     let book = scan_book_as(
@@ -936,7 +941,7 @@ async fn regenerate_rotates_the_capability() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN, "CSRF rejected");
 
-    // Regenerate -> the old capability URL 404s immediately.
+    // After regenerate, the old capability URL 404s immediately.
     let resp = app
         .clone()
         .oneshot(
@@ -1032,11 +1037,11 @@ async fn serves_feed_and_range_audio() {
     assert!(xml.contains(&format!("http://test/audio/{feed_id}/1")));
     // Feeds are always blocked from podcast directories.
     assert!(xml.contains("<itunes:block>Yes</itunes:block>"));
-    // No embedded cover -> feed-level fallback image is emitted.
+    // No embedded cover, so the feed-level fallback image is emitted.
     assert!(xml.contains("<itunes:image"));
     assert!(xml.contains("http://test/default-cover.png"));
 
-    // unknown id + missing .xml -> 404
+    // An unknown id, and a missing .xml, both give 404.
     for uri in ["/feed/nope.xml".to_string(), format!("/feed/{feed_id}")] {
         let resp = app
             .clone()
@@ -1046,7 +1051,7 @@ async fn serves_feed_and_range_audio() {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
     }
 
-    // full audio GET -> 200 + Accept-Ranges
+    // A full audio GET gives 200 + Accept-Ranges.
     let resp = app
         .clone()
         .oneshot(
@@ -1066,7 +1071,7 @@ async fn serves_feed_and_range_audio() {
         "audio/mp4"
     );
 
-    // Range request -> 206 + Content-Range, exactly 100 bytes
+    // A Range request gives 206 + Content-Range, exactly 100 bytes.
     let resp = app
         .clone()
         .oneshot(
@@ -1086,7 +1091,7 @@ async fn serves_feed_and_range_audio() {
     );
     assert_eq!(body_bytes(resp).await.len(), 100);
 
-    // unknown episode number -> 404
+    // An unknown episode number gives 404.
     let resp = app
         .clone()
         .oneshot(
@@ -1158,7 +1163,8 @@ async fn serves_feed_and_range_audio() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-    // Unknown book -> 404; cover with no extracted art (Task 3.4) -> 404.
+    // An unknown book gives 404; a cover with no extracted art (Task 3.4)
+    // gives 404.
     for uri in ["/book/nope".to_string(), format!("/cover/{feed_id}")] {
         let resp = app
             .clone()
@@ -1193,8 +1199,9 @@ async fn serves_feed_and_range_audio() {
     }
 }
 
-/// The chapter dir is `<data_dir>/books/<book.id>`, and `book.id` is an opaque
-/// DB key — but a poisoned row must never resolve outside the data dir. The
+/// The chapter dir is `<data_dir>/books/<book.id>`, and `book.id` is an
+/// opaque DB key. But a poisoned row must never resolve outside the data
+/// dir. The
 /// escape target is a *real* directory holding a *real* file, so a pass here
 /// means the containment check rejected it, not that the path merely failed to
 /// canonicalize.
@@ -1246,8 +1253,9 @@ async fn a_feed_failing_the_self_check_is_a_500_not_a_broken_feed() {
     let feed_id = "capabilityidforselfcheck";
     let book = book_row("selfcheck-book", feed_id);
     index.upsert_book(&book).unwrap();
-    // byte_length 0 => MissingEnclosureLength, the #1 feed bug this check exists
-    // to catch (an enclosure length must be the real file size, never 0).
+    // A byte_length of 0 gives MissingEnclosureLength, the number-one feed
+    // bug this check exists to catch (an enclosure length must be the real
+    // file size, never 0).
     index.upsert_episode(&episode_row(&book.id, 0, 0)).unwrap();
 
     let state = test_state(index, &data, &dir);
@@ -1269,9 +1277,10 @@ async fn a_feed_failing_the_self_check_is_a_500_not_a_broken_feed() {
 }
 
 /// The saver-mode regen arm re-splits from `book.source_path`, an opaque DB
-/// value that reaches ffmpeg. A poisoned row pointing outside the library root
-/// must 404 rather than hand ffmpeg an arbitrary file — the same A01 containment
-/// rule the remux arm already enforced (Sprint 6.4 follow-up).
+/// value that reaches ffmpeg. A poisoned row that points outside the library
+/// root must 404; it must not hand ffmpeg an arbitrary file. This is the same
+/// A01 containment rule that the remux arm already enforced (Sprint 6.4
+/// follow-up).
 ///
 /// The escape target is a real file, so a pass means the containment check
 /// rejected it and not that the path merely failed to canonicalize.
@@ -1372,10 +1381,10 @@ async fn saver_source_inside_the_library_still_serves() {
     assert_eq!(body_bytes(resp).await, b"cached chapter bytes");
 }
 
-/// Task 5.2 end-to-end: with transcoding on, a FLAC book serves as AAC/`audio/mp4`
-/// — and even on a `saver` server its episodes are neither regenerated nor evicted
-/// (a re-encode can't be rebuilt byte-for-byte), so what the feed advertises is
-/// exactly what a client gets.
+/// Task 5.2 end-to-end: with transcoding on, a FLAC book serves as
+/// AAC/`audio/mp4`. Even on a `saver` server, its episodes are neither
+/// regenerated nor evicted (a re-encode cannot be rebuilt byte-for-byte), so
+/// what the feed advertises is exactly what a client gets.
 #[tokio::test]
 async fn transcoded_flac_book_serves_as_aac_and_is_never_evicted() {
     skip_unless_ffmpeg!();
@@ -1457,8 +1466,9 @@ async fn transcoded_flac_book_serves_as_aac_and_is_never_evicted() {
 
 /// A bare state over an empty in-memory index, used to drive the readiness gate
 /// without synthesizing audio. Defaults to `ready`; the tests flip it explicitly.
-/// The roots just need to exist (AppState::new canonicalizes them) — no file
-/// under them is ever touched, so the shared temp dir is fine on every OS.
+/// The roots only need to exist (`AppState::new` canonicalizes them). No
+/// file under them is ever touched, so the shared temp dir is fine on every
+/// OS.
 fn empty_state() -> AppState {
     let tmp = std::env::temp_dir();
     test_state(Index::open_in_memory().unwrap(), &tmp, &tmp)
@@ -1508,7 +1518,8 @@ async fn once_ready_the_browse_ui_serves_normally() {
     state.set_ready(false);
     state.set_ready(true); // scan finished
 
-    // Empty library, but the real grid (not the Scanning page) — a normal 200.
+    // Empty library, but the real grid (not the Scanning page): a normal
+    // 200.
     let resp = router(state.clone())
         .oneshot(Request::get("/").body(Body::empty()).unwrap())
         .await
@@ -1553,7 +1564,8 @@ async fn theme_cookie_renders_data_theme() {
         "{html}"
     );
 
-    // No cookie → no data-theme on <html> (follows the OS via prefers-color-scheme).
+    // No cookie means no data-theme on <html> (the page follows the OS via
+    // prefers-color-scheme).
     let resp = router(state)
         .oneshot(Request::get("/").body(Body::empty()).unwrap())
         .await
@@ -1584,7 +1596,8 @@ async fn set_theme_sets_cookie_then_clears_it() {
     assert!(cookie.contains("theme=dark"), "{cookie}");
     assert!(cookie.contains("Max-Age=31536000"), "{cookie}");
 
-    // Choosing "system" clears the cookie (Max-Age=0) → revert to the OS.
+    // A "system" choice clears the cookie (Max-Age=0), which reverts to the
+    // OS.
     let resp = router(empty_state())
         .oneshot(
             Request::post("/theme/system")
@@ -1607,7 +1620,8 @@ async fn set_theme_sets_cookie_then_clears_it() {
 
 #[tokio::test]
 async fn set_theme_rejects_cross_site() {
-    // A cross-site POST can't flip the theme (CSRF guard), same as regenerate.
+    // A cross-site POST cannot flip the theme (CSRF guard), same as
+    // regenerate.
     let resp = router(empty_state())
         .oneshot(
             Request::post("/theme/dark")
@@ -1694,9 +1708,10 @@ async fn serves_scanner_generated_thumbnail_with_fallback() {
 
 #[tokio::test]
 async fn cover_thumb_falls_back_to_the_full_cover_when_absent() {
-    // A book with a cover but no generated thumbnail (e.g. before a reconcile
-    // backfills it): `/thumb` must serve the full cover file rather than 404.
-    // ffmpeg-free — the handler only serves, it never generates.
+    // A book with a cover but no generated thumbnail (e.g. before a
+    // reconcile backfills it): `/thumb` must serve the full cover file, not
+    // 404. The test is ffmpeg-free: the handler only serves, it never
+    // generates.
     let dir = scratch("http-thumb-fallback");
     let data = dir.join("data");
     let book_dir = data.join("books").join("badcover");

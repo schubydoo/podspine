@@ -1,11 +1,12 @@
 name: Nightly
 
-# Build the two Linux musl binaries from the tip of `main` and push a multi-arch
-# image to GHCR as `:nightly` (plus `:nightly-<shortsha>` for traceability). This
-# is a throwaway TEST image for trying merged-but-unreleased changes on a real
-# deployment before cutting a `v*` release — it NEVER moves `:latest` and publishes
-# no GitHub Release or binary assets. Run it on demand (workflow_dispatch) or let
-# the daily schedule refresh it.
+# Build the two Linux musl binaries from the tip of `main` and push a
+# multi-arch image to GHCR as `:nightly` (plus `:nightly-<shortsha>` for
+# traceability). This is a throwaway TEST image, used to try
+# merged-but-unreleased changes on a real deployment before a `v*` release is
+# cut. It NEVER moves `:latest`, and it publishes no GitHub Release and no
+# binary assets. Run it on demand (workflow_dispatch), or let the daily
+# schedule refresh it.
 #
 # Mirrors release.yml's `binaries` + `image` jobs, trimmed to Linux (the image
 # consumes only the musl binaries). Action refs are pinned to full commit SHAs
@@ -17,7 +18,7 @@ name: Nightly
 on:
   workflow_dispatch:
   schedule:
-    # 07:00 UTC daily — after the day's merges land, before a morning test.
+    # 07:00 UTC daily: after the day's merges land, before a morning test.
     - cron: "0 7 * * *"
 
 # Least privilege by default; the image job elevates explicitly.
@@ -25,25 +26,26 @@ permissions:
   contents: read
 
 concurrency:
-  # Scope by ref, not a bare "nightly": concurrency is evaluated BEFORE the job's
-  # ref guard, so a shared group would let an off-main dispatch cancel a running
-  # main nightly and then skip — killing the image with nothing to replace it.
-  # Per-ref, a newer main build still supersedes an in-flight main build.
+  # Scope by ref, not a bare "nightly": concurrency is evaluated BEFORE the
+  # job's ref guard, so a shared group would let an off-main dispatch cancel a
+  # running main nightly and then skip. That would kill the image with nothing
+  # to replace it. Per-ref, a newer main build still supersedes an in-flight
+  # main build.
   group: nightly-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   binaries:
-    # Canonical repo AND the `main` ref only. `:nightly` is contracted to be the tip
-    # of main, so a dispatch on a feature branch or tag (workflow_dispatch lets you
-    # pick any ref) must not publish its build under that tag; a scheduled run's ref
-    # is already refs/heads/main. This also keeps forks from building nightlies on a
-    # cron they never asked for.
+    # Canonical repo AND the `main` ref only. `:nightly` is contracted to be
+    # the tip of main, so a dispatch on a feature branch or tag
+    # (workflow_dispatch permits any ref) must not publish its build under
+    # that tag. A scheduled run's ref is already refs/heads/main. This also
+    # keeps forks from nightly builds on a cron they never asked for.
     if: ${{ github.repository == 'schubydoo/podspine' && github.ref == 'refs/heads/main' }}
     name: Build ${{ matrix.name }} binary (musl)
     runs-on: ubuntu-latest
     strategy:
-      # One arch failing shouldn't hide the other's result.
+      # A failure on one arch must not hide the other's result.
       fail-fast: false
       matrix:
         include:
@@ -122,7 +124,8 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           # `:nightly` always points at the newest main build; `:nightly-<shortsha>`
-          # pins a specific one. Never `:latest` — that is stable-release only.
+          # pins a specific one. Never `:latest`: that tag is stable-release
+          # only.
           tags: |
             type=raw,value=nightly
             type=sha,prefix=nightly-,format=short

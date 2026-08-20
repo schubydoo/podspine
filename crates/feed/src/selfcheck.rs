@@ -1,10 +1,12 @@
-//! Feed self-check — validate a built [`rss::Channel`] before it is ever served.
+//! Feed self-check: validate a built [`rss::Channel`] before it is ever
+//! served.
 //!
 //! This guards the failure modes that make podcast apps misbehave: episodes out
 //! of order (non-monotonic pubDates), a missing `enclosure length`, or a missing
 //! `itunes:duration`/`itunes:episode`. It operates on the *rendered* channel (not
-//! the domain input) so it catches builder bugs too, and it parses pubDates back
-//! to real timestamps so the ordering check is genuine. (PRD S4, TAD §4.)
+//! the domain input), so it catches builder bugs too. It parses pubDates
+//! back to real timestamps, so the ordering check is genuine. (PRD S4,
+//! TAD §4.)
 
 use rss::Channel;
 use time::OffsetDateTime;
@@ -55,8 +57,8 @@ pub enum SelfCheckError {
         /// The raw pubDate string, if any.
         value: String,
     },
-    /// Ordered by `itunes:episode`, pubDates are not strictly increasing — the
-    /// classic "episodes play out of order" bug.
+    /// Ordered by `itunes:episode`, pubDates are not strictly increasing:
+    /// the classic "episodes play out of order" bug.
     #[error("pubDate for episode {episode} is not later than the previous episode")]
     NonMonotonicPubDates {
         /// The episode whose pubDate breaks the strictly-increasing order.
@@ -80,8 +82,8 @@ pub fn check(channel: &Channel) -> Result<SelfCheckReport, Vec<SelfCheckError>> 
     }
 
     let mut errors = Vec::new();
-    // (episode, pubdate_epoch) for the monotonicity check — only items that have
-    // both a parseable episode and pubDate contribute.
+    // (episode, pubdate_epoch) for the monotonicity check. Only items that
+    // have both a parseable episode and pubDate contribute.
     let mut ordered: Vec<(i64, i64)> = Vec::new();
 
     for (idx, item) in items.iter().enumerate() {
@@ -183,7 +185,8 @@ mod tests {
     fn broken_pubdate_order_is_rejected() {
         let mut channel = build_channel(&sample(3));
         let mut items = channel.items().to_vec();
-        // Make episode 2 (item idx 1) far older than episode 1 -> out of order.
+        // Make episode 2 (item idx 1) far older than episode 1, so the order
+        // breaks.
         items[1].set_pub_date(Some("Thu, 01 Jan 1970 00:00:00 +0000".to_string()));
         channel.set_items(items);
 

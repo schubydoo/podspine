@@ -1,13 +1,14 @@
 name: Release
 
-# On a `v*` tag: build release binaries for Linux (static musl amd64+arm64, via
-# zig), macOS (Intel + Apple Silicon), and Windows (x86_64), generate SBOMs, sign
-# the checksums with keyless cosign, attach a SLSA build-provenance file, publish a
-# GitHub Release, and push a multi-arch (Linux) image to GHCR (with provenance +
-# SBOM, and a cosign signature). TAD §6.4.
+# On a `v*` tag: build release binaries for Linux (static musl amd64+arm64,
+# via zig), macOS (Intel + Apple Silicon), and Windows (x86_64). Generate
+# SBOMs. Sign the checksums with keyless cosign. Attach a SLSA
+# build-provenance file. Publish a GitHub Release. Push a multi-arch (Linux)
+# image to GHCR (with provenance, SBOM, and a cosign signature). TAD §6.4.
 #
-# OpenSSF Scorecard: Signed-Releases — cosign `.sigstore.json` signatures plus a
-# `*.intoto.jsonl` SLSA provenance file; SBOM — CycloneDX SBOMs as release assets.
+# OpenSSF Scorecard: Signed-Releases needs the cosign `.sigstore.json`
+# signatures plus a `*.intoto.jsonl` SLSA provenance file; SBOM needs the
+# CycloneDX SBOMs as release assets.
 #
 # Cut a release: `git tag v1.0.0 && git push origin v1.0.0`.
 #
@@ -23,8 +24,8 @@ permissions:
   contents: read
 
 concurrency:
-  # Releases must not cancel each other — a half-published release is worse than
-  # letting two runs serialize.
+  # Releases must not cancel each other: a half-published release is worse
+  # than two serialized runs.
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
@@ -33,8 +34,8 @@ jobs:
     name: Build ${{ matrix.name }} binary
     runs-on: ${{ matrix.os }}
     strategy:
-      # Don't let one platform's failure cancel the others — we want to see every
-      # target's result on a release run.
+      # Do not let one platform's failure cancel the others: a release run
+      # must show every target's result.
       fail-fast: false
       matrix:
         include:
@@ -47,12 +48,13 @@ jobs:
             os: ubuntu-latest
             name: linux-arm64
             build: zig
-          # macOS + Windows: use the platform's native toolchain (cargo build), not
-          # zig — native is exactly what CI already exercises (green macos + windows
-          # test jobs), and rusqlite's bundled SQLite C compiles with clang / MSVC
-          # cl.exe. Both darwin arches build on one Apple-Silicon runner: the macOS
-          # SDK is universal, so x86_64-apple-darwin cross-compiles cleanly there
-          # (macos-13, the old Intel runner, has been retired by GitHub).
+          # macOS + Windows: use the platform's native toolchain (cargo
+          # build), not zig. Native is exactly what CI already exercises
+          # (green macos + windows test jobs), and rusqlite's bundled SQLite C
+          # compiles with clang / MSVC cl.exe. Both darwin arches build on one
+          # Apple-Silicon runner: the macOS SDK is universal, so
+          # x86_64-apple-darwin cross-compiles cleanly there (macos-13, the
+          # old Intel runner, has been retired by GitHub).
           - target: aarch64-apple-darwin
             os: macos-14
             name: darwin-arm64
@@ -142,15 +144,17 @@ jobs:
             fi
           done
           cd release
-          # One SBOM per binary (skip any SBOM already present so we never SBOM a SBOM).
+          # One SBOM per binary (skip any SBOM already present, so that the
+          # loop never SBOMs a SBOM).
           for f in podspine-${TAG}-*; do
             case "$f" in *.sbom.cdx.json) continue ;; esac
             syft "$f" -o "cyclonedx-json=${f}.sbom.cdx.json"
           done
-          # One checksums file over binaries + SBOMs, each listed exactly once; cosign
-          # signs it, so a verifier trusts every artifact transitively through its hash.
-          # (A single podspine-${TAG}-* glob now covers binaries AND their SBOMs — the
-          # old two-glob form double-counted the SBOMs.)
+          # One checksums file over binaries + SBOMs, each listed exactly
+          # once; cosign signs it, so a verifier trusts every artifact
+          # transitively through its hash. (A single podspine-${TAG}-* glob
+          # now covers binaries AND their SBOMs: the old two-glob form
+          # double-counted the SBOMs.)
           sha256sum podspine-${TAG}-* > checksums.txt
           cosign sign-blob --bundle checksums.txt.sigstore.json checksums.txt --yes
       - name: SLSA build provenance
@@ -183,8 +187,9 @@ jobs:
             release/checksums.txt.sigstore.json
             release/podspine.intoto.jsonl
           )
-          # A tag with a hyphen (v1.0.0-rc.1, -beta …) is a pre-release: mark it so it
-          # doesn't become the repo's "Latest release". SemVer build/pre-release marker.
+          # A tag with a hyphen (v1.0.0-rc.1, -beta …) is a pre-release: mark
+          # it, so that it does not become the repo's "Latest release". This
+          # is the SemVer pre-release marker.
           prerelease=""
           case "$TAG" in *-*) prerelease="--prerelease" ;; esac
           if gh release view "$TAG" >/dev/null 2>&1; then

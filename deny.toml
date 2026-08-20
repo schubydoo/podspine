@@ -8,7 +8,7 @@ yanked = "deny"
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
-# Internal workspace crates are path deps with no version requirement — a
+# Internal workspace crates are path deps with no version requirement: a
 # "wildcard" to cargo-deny, but expected and correct. Only EXTERNAL wildcard
 # deps are the smell this rule is meant to catch.
 allow-wildcard-paths = true
@@ -16,8 +16,9 @@ allow-wildcard-paths = true
 [licenses]
 version = 2
 confidence-threshold = 0.9
-# Silence "license was not encountered" for the forward-looking allow-list below
-# (we list licenses we'll hit once real deps land, before they're in the tree).
+# Silence "license was not encountered" for the forward-looking allow-list
+# below (it names licenses that will arrive once real deps land, before they
+# are in the tree).
 unused-allowed-license = "allow"
 allow = [
     "AGPL-3.0-only",

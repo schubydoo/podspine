@@ -1,20 +1,23 @@
 # syntax=docker/dockerfile:1@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
 #
-# Runtime-only image: it COPYs a prebuilt static (musl) binary — no Rust toolchain
-# in the build, so `docker buildx` stays fast across linux/amd64 + linux/arm64
-# (TAD §6.4). The release pipeline (Task 3.7) builds the per-arch binaries into
-# dist/<arch>/podspine; `docker buildx build --platform ...` selects by TARGETARCH.
+# Runtime-only image: it COPYs a prebuilt static (musl) binary. There is no
+# Rust toolchain in the build, so `docker buildx` stays fast across
+# linux/amd64 + linux/arm64 (TAD §6.4). The release pipeline (Task 3.7)
+# builds the per-arch binaries into dist/<arch>/podspine;
+# `docker buildx build --platform ...` selects by TARGETARCH.
 #
-# Base is Alpine: the binary is static musl, so no glibc is needed, and Alpine's
-# ffmpeg keeps the image ~1/3 the size of debian-slim (TAD sanctions this "if size
-# matters" — it does; the ≤180MB target rules out debian's full ffmpeg).
+# The base is Alpine: the binary is static musl, so no glibc is needed, and
+# Alpine's ffmpeg keeps the image ~1/3 the size of debian-slim (the TAD
+# sanctions this "if size matters", and it does: the ≤180MB target rules out
+# debian's full ffmpeg).
 FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
 
 # ffmpeg is the one runtime dependency; ca-certificates for outbound TLS if needed.
 RUN apk add --no-cache ffmpeg ca-certificates
 
-# Non-root system user; own /data before VOLUME so the anonymous volume Docker
-# creates at runtime inherits podspine ownership (else it can't write the DB).
+# A non-root system user. Own /data before VOLUME, so that the anonymous
+# volume Docker creates at runtime inherits podspine ownership (otherwise it
+# cannot write the DB).
 RUN adduser -D -H -u 10001 -s /sbin/nologin podspine \
  && mkdir -p /app /data \
  && chown podspine:podspine /app /data

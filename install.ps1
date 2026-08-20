@@ -72,8 +72,9 @@ function Install-Podspine {
     New-Item -ItemType Directory -Path $work -Force | Out-Null
 
     try {
-        # checksums.txt is the authoritative list of published binaries - gate on it so
-        # an arch with no binary falls back cleanly instead of 404-ing on download.
+        # checksums.txt is the authoritative list of published binaries. Gate
+        # on it, so that an arch with no binary falls back cleanly; it does
+        # not 404 on download.
         $sumsPath = Join-Path $work 'checksums.txt'
         Invoke-WebRequest -Uri "$base/checksums.txt" -OutFile $sumsPath -UseBasicParsing
         # Exact field-2 (filename) match, mirroring install.sh's awk. sha256sum text
@@ -113,12 +114,13 @@ function Install-Podspine {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
         $dest = Join-Path $dir "$Tool.exe"
         Move-Item -Path $exePath -Destination $dest -Force
-        # The download carries a mark-of-the-web zone tag; clear it now that the
-        # checksum is verified so the user isn't blocked on first run.
+        # The download carries a mark-of-the-web zone tag. Clear it now that
+        # the checksum is verified, so that the user is not blocked on first
+        # run.
         Unblock-File -Path $dest -ErrorAction SilentlyContinue
         Write-Ok "Installed $dest"
 
-        # Add the install dir to the user PATH if it isn't already there.
+        # Add the install dir to the user PATH when it is not already there.
         $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
         if ($null -eq $userPath) { $userPath = '' }
         if (($userPath -split ';') -notcontains $dir) {
@@ -147,9 +149,10 @@ function Install-Podspine {
         Write-Info "Run it with:  $Tool --library C:\path\to\audiobooks"
         Write-Info 'The binary is Sigstore-signed but not authenticode-signed, so SmartScreen may warn on first run.'
         Write-Ok 'Installation complete!'
-        # Only reached on success. The `--version` probe above can leave $LASTEXITCODE
-        # non-zero without throwing; normalize so a successful install reports 0 to a
-        # piped `iex` caller / CI. (Failure paths return/throw before here with 1.)
+        # Only reached on success. The `--version` probe above can leave
+        # $LASTEXITCODE non-zero without a throw; normalize it, so that a
+        # successful install reports 0 to a piped `iex` caller / CI. (Failure
+        # paths return/throw before here with 1.)
         $global:LASTEXITCODE = 0
     }
     finally {

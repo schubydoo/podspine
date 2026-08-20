@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
-# Podspine performance harness (Task 5.3 — measurement half).
+# Podspine performance harness (Task 5.3, the measurement half).
 #
-# Measures the four v2 NFR targets (PRD §5.1, tad.md §5) against a synthetic
-# book on THIS machine, so you can decide whether the v2 efficiency work
-# (on-the-fly split 5.1, transcode 5.2) is actually warranted before building it:
+# This measures the four v2 NFR targets (PRD §5.1, tad.md §5) against a
+# synthetic book on THIS machine, so you can decide whether the v2 efficiency
+# work (on-the-fly split 5.1, transcode 5.2) is warranted before you build it:
 #
 #   NFR-P1  ingest/pre-split   <=2 min per 10h book
 #   NFR-P2  feed render p95    <200 ms
 #   NFR-P3  audio TTFB (LAN)   <300 ms
 #   NFR-P4  idle RSS           <50 MB
 #
-# It is deliberately dependency-light — bash, ffmpeg, ffprobe, curl, awk, sort —
-# and touches nothing the server ships: it builds the release binary, synthesizes
-# a chapterised .m4a with ffmpeg, boots podspine against a throwaway library +
-# data dir on the loopback, drives it with curl, then tears everything down.
+# It is deliberately dependency-light (bash, ffmpeg, ffprobe, curl, awk,
+# sort), and it touches nothing the server ships. It builds the release
+# binary, synthesizes a chapterised .m4a with ffmpeg, boots podspine against
+# a throwaway library + data dir on the loopback, drives it with curl, and
+# then tears everything down.
 #
 # Numbers reflect the host it runs on (CPU, disk, filesystem). Run it on the box
 # you actually deploy to; a CI runner or dev laptop is only a rough proxy. The
@@ -47,11 +48,12 @@ for tool in ffmpeg ffprobe curl awk sort; do
   command -v "$tool" >/dev/null 2>&1 || { echo "bench: missing required tool: $tool" >&2; exit 1; }
 done
 
-# Fractional epoch seconds, portably. `date +%s.%N` is GNU-only: BSD/macOS `date`
-# has no %N and prints it literally, which would poison the ingest timing. Prefer
-# bash 5's EPOCHREALTIME builtin (handles a comma decimal separator under some
-# locales); fall back to `date +%N` when it yields real digits; else degrade to
-# whole-second resolution (old macOS bash + BSD date) rather than lie.
+# Fractional epoch seconds, portably. `date +%s.%N` is GNU-only: BSD/macOS
+# `date` has no %N and prints it literally, and that would poison the ingest
+# timing. Prefer bash 5's EPOCHREALTIME builtin (it handles a comma decimal
+# separator under some locales). Fall back to `date +%N` when it yields real
+# digits. Otherwise degrade to whole-second resolution (old macOS bash + BSD
+# date); do not lie.
 now() {
   if [ -n "${EPOCHREALTIME:-}" ]; then
     printf '%s' "${EPOCHREALTIME/,/.}"
@@ -118,8 +120,9 @@ t_start=$(now)
   --bind "127.0.0.1:${PORT}" --base-url "$BASE" >"$WORK/server.log" 2>&1 &
 SERVER_PID=$!
 
-# Poll the home grid until the book is indexed + split (a /book/ link appears).
-# Elapsed from launch to that point is the ingest (pre-split) cost.
+# Poll the home grid until the book is indexed and split (a /book/ link
+# appears). The time from launch to that point is the ingest (pre-split)
+# cost.
 SLUG=""
 for _ in $(seq 1 600); do
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -141,7 +144,8 @@ FEED_URL="$BASE/feed/${FEED_ID}.xml"
 AUDIO_URL="$BASE/audio/${FEED_ID}/1"
 
 ingest_s="$(awk -v a="$t_start" -v b="$t_ready" 'BEGIN{printf "%.2f", b-a}')"
-# Extrapolate to a 10h (36000s) book — split time is ~linear in source duration.
+# Extrapolate to a 10h (36000s) book; split time is ~linear in source
+# duration.
 ingest_10h="$(awk -v s="$ingest_s" -v d="$DURATION_SEC" 'BEGIN{printf "%.1f", s*36000/d}')"
 
 # --- feed render latency (p95) --------------------------------------------

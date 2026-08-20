@@ -13,3 +13,6 @@ publish = false
 maud = { workspace = true }
 qrcode = { workspace = true }
 tracing = { workspace = true }
+
+[lints]
+workspace = true

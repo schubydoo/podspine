@@ -4,9 +4,10 @@
 #   1. Every file needs YAML front matter (opens with `---`, closes with `---`).
 #      knope parses EVERY .md in .changeset/, so a stray README.md fails the whole
 #      release with "missing front matter".
-#   2. The body (after the front matter) must be a SINGLE non-empty line. knope
-#      renders any 2nd line / paragraph as a `#### heading` block instead of a clean
-#      changelog bullet, which corrupts the release notes.
+#   2. The body (after the front matter) must be a SINGLE non-empty line.
+#      knope renders any second line or paragraph as a `#### heading` block
+#      instead of a clean changelog bullet, and that corrupts the release
+#      notes.
 # Mirrors clauster's scripts/lint_changesets.py. POSIX sh; no runtime deps.
 set -eu
 

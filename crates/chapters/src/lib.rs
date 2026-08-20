@@ -3,17 +3,18 @@
 //! A companion **sidecar** beside the audio file takes precedence over embedded
 //! chapters (PRD §3.0, Task 3.8). v1 supports two sidecar formats, in priority
 //! order:
-//! 1. **`.cue`** — `INDEX 01 mm:ss:ff` timestamps at **75 frames/sec** (the
+//! 1. **`.cue`**: `INDEX 01 mm:ss:ff` timestamps at **75 frames/sec** (the
 //!    default when present).
-//! 2. **`.ffmeta` / `.ffmetadata`** — ffmpeg's metadata format (`[CHAPTER]`
+//! 2. **`.ffmeta` / `.ffmetadata`**: ffmpeg's metadata format (`[CHAPTER]`
 //!    blocks with `TIMEBASE`/`START`/`END`/`title`).
-//! 3. **Embedded** chapters (from `ffprobe`) — the fallback.
+//! 3. **Embedded** chapters (from `ffprobe`): the fallback.
 //!
 //! `.opf` / `.nfo` / OverDrive `.odm` are metadata/manifest files and are
 //! **never** treated as chapter sources. A config override can force embedded
 //! chapters even when a sidecar exists.
 //!
-//! Parsing is pure (string in, chapters out) so it is unit-tested without files.
+//! Parsing is pure (string in, chapters out), so it is unit-tested without
+//! files.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -93,8 +94,9 @@ fn sidecar(audio: &Path, exts: &[&str]) -> Option<String> {
     None
 }
 
-/// Renumber chapters' `idx` to 0-based file order (parsers build order; embedded
-/// already is, but this keeps the contract uniform).
+/// Renumber chapters' `idx` to 0-based file order (parsers build in order,
+/// and embedded chapters already are ordered, but this keeps the contract
+/// uniform).
 fn renumber(mut chapters: Vec<Chapter>) -> Vec<Chapter> {
     for (i, c) in chapters.iter_mut().enumerate() {
         c.idx = i;
@@ -330,11 +332,11 @@ FILE "book.m4b" WAVE
         let audio = dir.join("book.m4b");
         std::fs::write(&audio, b"not real audio").unwrap();
 
-        // No sidecar -> embedded.
+        // No sidecar gives embedded.
         let r = resolve(&audio, &embedded(), 100.0, false);
         assert_eq!(r.source, ChapterSource::Embedded);
 
-        // .ffmeta present -> ffmeta.
+        // A present .ffmeta gives ffmeta.
         std::fs::write(
             dir.join("book.ffmeta"),
             ";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=5000\ntitle=A\n",
@@ -343,7 +345,7 @@ FILE "book.m4b" WAVE
         let r = resolve(&audio, &embedded(), 100.0, false);
         assert_eq!(r.source, ChapterSource::Ffmeta);
 
-        // .cue present -> cue wins over ffmeta (higher priority).
+        // A present .cue wins over ffmeta (higher priority).
         std::fs::write(
             dir.join("book.cue"),
             "TRACK 01 AUDIO\n  TITLE \"C\"\n  INDEX 01 00:00:00\n",
@@ -367,7 +369,8 @@ FILE "book.m4b" WAVE
         for ext in ["opf", "nfo", "odm"] {
             std::fs::write(dir.join(format!("book.{ext}")), b"<metadata/>").unwrap();
         }
-        // Only metadata/manifest siblings exist -> falls back to embedded.
+        // Only metadata/manifest siblings exist, so resolve falls back to
+        // embedded.
         let r = resolve(&audio, &embedded(), 100.0, false);
         assert_eq!(r.source, ChapterSource::Embedded);
     }
@@ -385,7 +388,7 @@ FILE "book.m4b" WAVE
         let ch = parse_ffmeta(meta);
         assert_eq!(ch.len(), 2, "the END-less chapter is dropped");
         assert_eq!(ch[0].end_sec, 2.0);
-        assert_eq!(ch[1].start_sec, 2.0); // TIMEBASE 0/0 rejected -> 1/1000 default
+        assert_eq!(ch[1].start_sec, 2.0); // TIMEBASE 0/0 is rejected; 1/1000 stays.
         assert_eq!(ch[1].end_sec, 6.0);
     }
 
@@ -394,7 +397,8 @@ FILE "book.m4b" WAVE
         let dir = scratch("chapters-fallthrough");
         let audio = dir.join("book.m4b");
         std::fs::write(&audio, b"x").unwrap();
-        // A .cue with no INDEX parses to zero chapters -> fall through to .ffmeta.
+        // A .cue with no INDEX parses to zero chapters, so resolve falls
+        // through to .ffmeta.
         std::fs::write(dir.join("book.cue"), "REM nothing usable here\n").unwrap();
         std::fs::write(
             dir.join("book.ffmeta"),

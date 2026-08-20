@@ -6,21 +6,21 @@ description: >-
   informational Windows job fall back to their package managers. ffmpeg stays
   real, so the split/probe/scan correctness tests are unaffected.
 
-# Why a local composite action rather than a published one (e.g.
-# AnimMouse/setup-ffmpeg): the repo ruleset requires every action — including
-# ones nested inside a composite action — to be pinned to a full commit SHA.
+# Why a local composite action, not a published one (e.g.
+# AnimMouse/setup-ffmpeg): the repo ruleset requires every action, including
+# ones nested inside a composite action, to be pinned to a full commit SHA.
 # Published setup-ffmpeg actions call actions/cache and tool-cache by version
-# tag internally, which we can't pin, so they're rejected. Vendoring the logic
-# here keeps every ref under our control.
+# tag internally, which this repo cannot pin, so they are rejected. The
+# vendored logic here keeps every ref under the repo's control.
 #
-# Why ffmpeg 6.0.1 (not the newest 8.x): it's a deliberate *minimum-version
-# floor*. John Van Sickle's old-releases archive is the only source that is both
-# permanent AND immutable (BtbN's dated builds get pruned; its `latest` tag is
-# mutable, so a pinned hash would drift). Every ffmpeg flag Podspine uses is
-# stable across 4→8, and distro users (Debian/Ubuntu LTS) often run older
-# ffmpeg — proving it works on 6.0.1 covers them, and newer ffmpeg is
-# backward-compatible for this flag surface. Bump the version + FFMPEG_SHA256 +
-# cache key together to move the floor.
+# Why ffmpeg 6.0.1 (not the newest 8.x): it is a deliberate *minimum-version
+# floor*. John Van Sickle's old-releases archive is the only source that is
+# both permanent AND immutable (BtbN's dated builds get pruned, and its
+# `latest` tag is mutable, so a pinned hash would drift). Every ffmpeg flag
+# Podspine uses is stable across 4→8, and distro users (Debian/Ubuntu LTS)
+# often run older ffmpeg. Proof that it works on 6.0.1 covers them, and newer
+# ffmpeg is backward-compatible for this flag surface. Bump the version,
+# FFMPEG_SHA256, and cache key together to move the floor.
 
 runs:
   using: composite
@@ -54,8 +54,8 @@ runs:
     - name: Add ffmpeg to PATH (Linux)
       if: runner.os == 'Linux'
       shell: bash
-      # $dest is a hardcoded constant (no untrusted input), so this GITHUB_PATH
-      # write can't be influenced by an attacker. Podspine runs `ffmpeg` via a
+      # $dest is a hardcoded constant (no untrusted input), so an attacker
+      # cannot influence this GITHUB_PATH write. Podspine runs `ffmpeg` via a
       # PATH lookup, and GITHUB_PATH is the sanctioned way to extend PATH.
       run: | # zizmor: ignore[github-env]
         set -euo pipefail

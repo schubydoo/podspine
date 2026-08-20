@@ -1,9 +1,9 @@
 name: CI
 
-# fmt + clippy, the full test suite across platforms, coverage (with a line
-# floor), and supply-chain audit. A single aggregator job — `ci required checks
-# passed` — is what branch protection should require; extend it by adding jobs to
-# its `needs`.
+# fmt + clippy + rustdoc + typos, the full test suite across platforms, coverage
+# (with a line floor), and supply-chain audit. A single aggregator job — `ci
+# required checks passed` — is what branch protection should require; extend it
+# by adding jobs to its `needs`.
 
 on:
   push:
@@ -24,12 +24,16 @@ env:
 
 jobs:
   lint:
-    name: fmt · clippy
+    name: fmt · clippy · docs · typos
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Spell-check all text in the repository (code comments included).
+      # False positives go in `typos.toml` at the repository root.
+      - name: Typos
+        uses: crate-ci/typos@8a48f81b6c64dcfea44b3633223084c4be58ac5f # v1.49.0
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           components: rustfmt, clippy
@@ -38,6 +42,13 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      # The only step that fires `rustdoc::` lints (broken intra-doc links, bad
+      # code-block attributes). `--document-private-items` because this workspace
+      # is a binary: almost all doc comments sit on private or internal items.
+      - name: Docs (deny warnings)
+        run: cargo doc --workspace --no-deps --all-features --document-private-items
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   test:
     name: test (${{ matrix.os }})
@@ -54,14 +65,16 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # Real ffmpeg, cached static build on Linux (seconds vs. apt pulling the
-      # whole libav* tree); see .github/actions/setup-ffmpeg for the why.
+      # Real ffmpeg, from a cached static build on Linux (seconds, vs. apt
+      # that pulls the whole libav* tree); see .github/actions/setup-ffmpeg
+      # for the why.
       - name: Set up ffmpeg
         uses: ./.github/actions/setup-ffmpeg
-      # nextest instead of `cargo test`: same tests, same gate (non-zero exit on
-      # failure), but a junit.xml falls out (.config/nextest.toml `ci` profile) —
-      # the only format Codecov's Test Analytics ingests. Prebuilt binary via
-      # install-action, matching the coverage/supply-chain jobs.
+      # nextest instead of `cargo test`: same tests, same gate (non-zero exit
+      # on failure), but a junit.xml falls out (.config/nextest.toml `ci`
+      # profile): the only format Codecov's Test Analytics ingests. Prebuilt
+      # binary via install-action, which matches the coverage/supply-chain
+      # jobs.
       - uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
         with:
           tool: cargo-nextest
@@ -71,18 +84,19 @@ jobs:
       # the day one appears, and reuses the build cache so it costs seconds.
       - name: Doctests
         run: cargo test --workspace --all-features --doc
-      # Upload from every leg, tagged with its OS as a Codecov flag, so Test
-      # Analytics (flaky/slow tests) breaks out per platform. Tokenless (public
-      # repo), non-blocking, and `!cancelled()` so a FAILED run still uploads —
-      # nextest writes junit.xml before exiting non-zero, and a failing suite is
-      # exactly when the analytics matter. (Pattern lifted from claustrum's CI.)
+      # Upload from every leg, tagged with its OS as a Codecov flag, so that
+      # Test Analytics (flaky/slow tests) breaks out per platform. Tokenless
+      # (public repo), non-blocking, and `!cancelled()`, so a FAILED run still
+      # uploads: nextest writes junit.xml before it exits non-zero, and a
+      # failing suite is exactly when the analytics matter. (The pattern is
+      # lifted from claustrum's CI.)
       - name: Upload test results to Codecov
         if: ${{ !cancelled() }}
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
         with:
           files: target/nextest/ci/junit.xml
-          # `files` is additive, not exclusive — without this the CLI still walks
-          # the checkout looking for more report-shaped files.
+          # `files` is additive, not exclusive. Without this, the CLI still
+          # walks the checkout in search of more report-shaped files.
           disable_search: true
           flags: ${{ runner.os }}
           report_type: test_results
@@ -98,10 +112,11 @@ jobs:
           retention-days: 7
 
   test-windows:
-    # Informational: Podspine has no Windows release target and its tests have
-    # never run there. This surfaces the status honestly (green/red) but is
-    # deliberately NOT in the required-checks aggregator, so it can't block
-    # merges. Promote it into the `test` matrix once it's reliably green.
+    # Informational: Podspine has no Windows release target, and its tests
+    # have never run there. This surfaces the status honestly (green/red) but
+    # is deliberately NOT in the required-checks aggregator, so it cannot
+    # block merges. Promote it into the `test` matrix once it is reliably
+    # green.
     name: test (windows, informational)
     runs-on: windows-latest
     steps:
@@ -154,9 +169,10 @@ jobs:
           tool: cargo-llvm-cov
       - name: Set up ffmpeg
         uses: ./.github/actions/setup-ffmpeg
-      # Enforce the line floor (the real gate; baseline ~94%) and emit lcov.
-      # cargo-llvm-cov writes lcov.info before the threshold check, so the upload
-      # below still runs on a floor failure — surfacing a drop when it matters.
+      # Enforce the line floor (the real gate; the baseline is ~94%) and emit
+      # lcov. cargo-llvm-cov writes lcov.info before the threshold check, so
+      # the upload below still runs on a floor failure, and a drop surfaces
+      # when it matters.
       - name: Coverage (lcov + line floor)
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info --fail-under-lines 90
       # Codecov is informational (see codecov.yml); tokenless for public repos,
@@ -175,10 +191,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Prebuilt binaries (seconds) instead of `cargo install`, which compiled both
-      # tools from source — by far the slowest step in CI. cargo-audit/deny only read
-      # Cargo.toml/lock, so no project toolchain is needed (the runner's cargo
-      # dispatches the subcommands).
+      # Prebuilt binaries (seconds) instead of `cargo install`, which
+      # compiled both tools from source: by far the slowest step in CI.
+      # cargo-audit/deny only read Cargo.toml/lock, so no project toolchain is
+      # needed (the runner's cargo dispatches the subcommands).
       - uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
         with:
           tool: cargo-audit,cargo-deny

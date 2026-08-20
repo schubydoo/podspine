@@ -10,6 +10,24 @@ license = "AGPL-3.0-only"
 repository = "https://github.com/schubydoo/podspine"
 authors = ["schubydoo"]
 
+# Comment and doc lints. Each member crate opts in with `[lints] workspace = true`.
+# CI runs clippy with `-D warnings`, so "warn" here blocks CI but not local builds.
+[workspace.lints.clippy]
+# Identifiers in doc comments must have backticks.
+doc_markdown = "warn"
+# Each `unsafe` block must have a `// SAFETY:` comment. The workspace has no
+# `unsafe` today; this lint guards the first one.
+undocumented_unsafe_blocks = "warn"
+
+[workspace.lints.rustdoc]
+# Each [`item`] link in doc comments must resolve. Fires only under `cargo doc`
+# (the "Docs (deny warnings)" CI step), not under clippy.
+broken_intra_doc_links = "deny"
+# The CI doc step passes `--document-private-items` because this workspace is a
+# binary, not a library. Links from public items to private items are therefore
+# valid and stay clickable.
+private_intra_doc_links = "allow"
+
 # Pinned per TAD §3 (verified 2026-07-03). Member crates opt in as each pipeline
 # stage lands (`axum.workspace = true`, etc.); unreferenced entries stay inert.
 [workspace.dependencies]
@@ -44,13 +62,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Metrics facade; a no-op unless a recorder is installed (`--metrics-bind`).
 metrics = "0.24.6"
 # `default-features = false` drops the crate's own hyper listener and the
-# rustls/aws-lc-rs push-gateway stack: we render from the handle and serve it
-# on our own axum listener, so none of that is reachable.
+# rustls/aws-lc-rs push-gateway stack: Podspine renders from the handle and
+# serves it on its own axum listener, so none of that is reachable.
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 # errors
 thiserror = "2"
 anyhow = "1"
-# process control (sync per-child timeout+kill for ffmpeg — the splitter is sync)
+# process control (sync per-child timeout+kill for ffmpeg; the splitter is sync)
 wait-timeout = "0.2"
 
 [package]
@@ -103,3 +121,6 @@ tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

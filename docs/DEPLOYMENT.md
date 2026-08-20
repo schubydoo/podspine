@@ -228,7 +228,7 @@ title = "The Correct Title"
 Server-wide keys (`bind`, `base_url`, `library`, `data_dir`, `cache_size`,
 `cache_ttl`, `transcode`, …) are **ignored with a log warning** if they appear in a
 per-book file — they only make sense server-wide. (`transcode` is server-wide for
-now: it is decided from the source codec, so a per-book key would buy little.) An unparseable sidecar is logged and
+now: it is decided from the source codec, so a per-book key would buy little.) An unparsable sidecar is logged and
 skipped for that book; it never aborts the scan.
 
 ## Exposing Podspine safely

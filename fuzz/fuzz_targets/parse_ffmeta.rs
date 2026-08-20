@@ -1,7 +1,8 @@
 #![no_main]
-//! Fuzz the `.ffmeta` sidecar parser — the ffmpeg-metadata `[CHAPTER]` format
-//! parsed from an attacker-influenceable file. Must never panic on arbitrary
-//! bytes (TIMEBASE arithmetic, malformed sections, huge numbers, …).
+//! Fuzz the `.ffmeta` sidecar parser: the ffmpeg-metadata `[CHAPTER]` format
+//! parsed from an attacker-influenceable file. It must never panic on
+//! arbitrary bytes (TIMEBASE arithmetic, malformed sections, huge
+//! numbers, …).
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

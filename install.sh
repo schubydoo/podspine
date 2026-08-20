@@ -10,9 +10,9 @@ set -euo pipefail
 # from the latest GitHub release, verifies its SHA-256 against the release's
 # signed checksums.txt, and installs it onto your PATH.
 #
-# Podspine shells out to `ffmpeg`/`ffprobe` at runtime but does not vendor them —
-# install them separately and keep them on PATH (this script warns if they're
-# missing).
+# Podspine shells out to `ffmpeg`/`ffprobe` at runtime but does not vendor
+# them. Install them separately and keep them on PATH (this script warns when
+# they are missing).
 #
 # Environment overrides:
 #   PODSPINE_VERSION       pin a specific release tag (e.g. X.Y.Z); default: latest release
@@ -23,8 +23,9 @@ REPO_OWNER="schubydoo"
 REPO_NAME="podspine"
 TOOL_NAME="podspine"
 
-# Scratch dir, cleaned up on exit. Global so the EXIT trap can see it even after
-# main() returns (a `local` would be out of scope and trip `set -u`).
+# A scratch dir, cleaned up on exit. It is global, so that the EXIT trap can
+# see it even after main() returns (a `local` would be out of scope and trip
+# `set -u`).
 WORKDIR=""
 cleanup() { [ -n "$WORKDIR" ] && rm -rf "$WORKDIR"; }
 trap cleanup EXIT
@@ -75,9 +76,10 @@ detect_arch() {
     esac
 }
 
-# Map (os, arch, ver) -> release asset basename, or empty for an unknown arch.
-# Whether the named asset actually exists in a given release is decided later,
-# against that release's checksums.txt (the authoritative list of built binaries).
+# Map (os, arch, ver) to the release asset basename, or to empty for an
+# unknown arch. Whether the named asset actually exists in a given release is
+# decided later, against that release's checksums.txt (the authoritative list
+# of built binaries).
 asset_for() {
     local os="$1" arch="$2" ver="$3"
     case "${os}-${arch}" in
@@ -107,8 +109,9 @@ resolve_latest() {  # echo the latest version (tag minus leading v)
         url="$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
             "https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/latest")"
     elif have wget; then
-        # HTTP headers are CRLF-terminated, so strip the trailing CR — otherwise the
-        # version carries a \r into the asset URL and 404s on wget-only hosts.
+        # HTTP headers are CRLF-terminated, so strip the trailing CR.
+        # Otherwise the version carries a \r into the asset URL and 404s on
+        # wget-only hosts.
         url="$(wget -q -S -O /dev/null \
             "https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/latest" 2>&1 \
             | awk '/^[[:space:]]*Location:/ {print $2}' | tail -n1 | tr -d '\r')"
@@ -182,13 +185,15 @@ main() {
     local base="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/v${ver}"
     WORKDIR="$(mktemp -d)" || die "Could not create a temporary directory."
 
-    # The release's checksums.txt is the authoritative list of published binaries.
-    # If our target isn't listed, no binary was built for this arch in this
-    # release — fail cleanly with alternatives rather than 404 on download.
+    # The release's checksums.txt is the authoritative list of published
+    # binaries. If the target is not listed, no binary was built for this arch
+    # in this release: fail cleanly with alternatives, not with a 404 on
+    # download.
     http_to "${base}/checksums.txt" "${WORKDIR}/checksums.txt"
     local expected actual
-    # Exact field-2 (filename) match; TrimStart('*') tolerates a binary-mode marker
-    # ("<hash> *<name>"). Our releases use text mode ("<hash>  <name>").
+    # An exact field-2 (filename) match; TrimStart('*') tolerates a
+    # binary-mode marker ("<hash> *<name>"). These releases use text mode
+    # ("<hash>  <name>").
     expected="$(awk -v a="$asset" '{n=$2; sub(/^\*/,"",n); if (n==a) print $1}' "${WORKDIR}/checksums.txt")"
     if [ -z "$expected" ]; then
         err "Release v${ver} has no ${os}-${arch} binary (${asset} not in checksums.txt)."
@@ -210,7 +215,7 @@ main() {
     mkdir -p "$dir" || die "Cannot create install directory: $dir"
     local dest="${dir}/${TOOL_NAME}"
 
-    # Write atomically; use sudo only if the directory is not writable.
+    # Write atomically; use sudo only when the directory is not writable.
     chmod +x "${WORKDIR}/${asset}"
     if [ -w "$dir" ]; then
         mv -f "${WORKDIR}/${asset}" "$dest"
@@ -229,8 +234,9 @@ main() {
            warn "  echo 'export PATH=\"${dir}:\$PATH\"' >> ~/.bashrc && source ~/.bashrc" ;;
     esac
 
-    # Verify: require a zero exit AND a 'podspine' identity banner — not merely
-    # non-empty output (a failing binary could still print something to stdout).
+    # Verify: require a zero exit AND a 'podspine' identity banner, not
+    # merely non-empty output (a failing binary could still print something
+    # to stdout).
     local got_ver=""
     if got_ver="$("$dest" --version 2>/dev/null)" && printf '%s' "$got_ver" | grep -qi '^podspine'; then
         ok "${got_ver} installed"

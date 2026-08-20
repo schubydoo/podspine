@@ -1,11 +1,12 @@
 # Release automation for Podspine — knope (CHANGESETS model).
 #
-# Model: every user-facing change ships a `.changeset/*.md` fragment; those
-# fragments — not commit messages — drive BOTH the version bump and the changelog
-# (full section control, no commit/fragment duplication). `knope document-change`
-# scaffolds one; see the changeset section in CONTRIBUTING.md. Conventional-commit
-# titles are still enforced (pr-title.yml) for a clean history, but are ignored
-# for release purposes.
+# Model: every user-facing change ships a `.changeset/*.md` fragment. Those
+# fragments (not commit messages) drive BOTH the version bump and the
+# changelog (full section control, no commit/fragment duplication).
+# `knope document-change` scaffolds one; see the changeset section in
+# CONTRIBUTING.md. Conventional-commit titles are still enforced
+# (pr-title.yml) for a clean history, but they are ignored for release
+# purposes.
 #
 # The two halves live in .github/workflows/knope-{prepare,release}.yml and are
 # gated OFF behind the `KNOPE_ENABLED` repo variable until the flow is proven.

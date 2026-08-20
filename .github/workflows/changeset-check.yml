@@ -1,11 +1,11 @@
 name: Changeset check
 
-# Advisory, NON-BLOCKING nudge for the changesets-only release model. A PR that
-# changes product code (crates/ or src/) but adds no `.changeset/*.md` fragment
-# gets a sticky comment + a warning annotation — it never fails the job, so it
-# can't block a merge. Opt out per-PR with the `no-changelog` label (CI /
-# refactor / tests / non-user-facing docs). Gated on KNOPE_ENABLED with the rest
-# of the release flow.
+# An advisory, NON-BLOCKING nudge for the changesets-only release model. A
+# PR that changes product code (crates/ or src/) but adds no
+# `.changeset/*.md` fragment gets a sticky comment and a warning annotation.
+# It never fails the job, so it cannot block a merge. Opt out per-PR with the
+# `no-changelog` label (CI / refactor / tests / non-user-facing docs). Gated
+# on KNOPE_ENABLED with the rest of the release flow.
 
 on:
   pull_request:
@@ -21,9 +21,9 @@ concurrency:
 
 jobs:
   changeset:
-    # Same-repo PRs only (fork PRs get a read-only token and can't comment), never
-    # on knope's own release PR (it deletes changesets as it prepares), and only
-    # once the changesets flow is enabled.
+    # Same-repo PRs only (fork PRs get a read-only token and cannot
+    # comment); never on knope's own release PR (it deletes changesets as it
+    # prepares); and only once the changesets flow is enabled.
     if: >-
       ${{ vars.KNOPE_ENABLED == 'true'
           && github.event.pull_request.head.repo.full_name == github.repository
@@ -31,9 +31,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      # Optional podspine-ci App token for a larger API budget; soft-fail so a
-      # missing/rotated App degrades to GITHUB_TOKEN rather than redding an
-      # advisory check.
+      # An optional podspine-ci App token for a larger API budget. Soft-fail,
+      # so that a missing or rotated App degrades to GITHUB_TOKEN and does not
+      # red an advisory check.
       - name: Mint podspine-ci App token
         id: app-token
         continue-on-error: true

@@ -1,6 +1,7 @@
 #![no_main]
-//! Fuzz the `.cue` sidecar parser — an attacker-influenceable file parsed into
-//! chapter cut points (75 fps `INDEX 01`). Must never panic on arbitrary bytes.
+//! Fuzz the `.cue` sidecar parser: an attacker-influenceable file parsed
+//! into chapter cut points (75 fps `INDEX 01`). It must never panic on
+//! arbitrary bytes.
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

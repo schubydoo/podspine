@@ -1,10 +1,10 @@
 //! Integration test that runs the *real* `ffprobe` against a real audiobook.
 //!
 //! Fixtures are large and local-only, so this is existence-gated: it points at
-//! `$PODSPINE_TEST_M4B` if set, else a generic local fixture, and quietly skips
-//! when neither the file nor ffprobe is available (keeps CI green, runs
-//! automatically on a dev box that has the fixture). Assertions are structural
-//! so any DRM-free multi-chapter M4B works as the fixture.
+//! `$PODSPINE_TEST_M4B` if set, else a generic local fixture, and it quietly
+//! skips when neither the file nor ffprobe is available (this keeps CI green,
+//! and it runs automatically on a dev box that has the fixture). Assertions
+//! are structural, so any DRM-free multi-chapter M4B works as the fixture.
 
 use std::path::PathBuf;
 

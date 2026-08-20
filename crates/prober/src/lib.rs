@@ -7,15 +7,15 @@
 //! present. See TAD §4.
 //!
 //! ## Design notes
-//! - The subprocess call passes every argument as a separate argv element (no
-//!   shell string) — a habit kept consistent with the splitter, where chapter
-//!   titles are untrusted (command-injection surface).
+//! - The subprocess call passes every argument as a separate argv element
+//!   (no shell string). This habit is kept consistent with the splitter,
+//!   where chapter titles are untrusted (a command-injection surface).
 //! - Parsing is split out into [`parse_probe_json`] so the parser can be
 //!   unit-tested hermetically, without ffprobe or a real audiobook on disk.
 //! - **Chapter-less is not an error.** A readable file with zero chapter markers
 //!   returns `Ok` with an empty [`ProbedBook::chapters`]; the single-episode
 //!   fallback is decided downstream (Task 1.7). Only an unreadable/corrupt file,
-//!   a non-zero ffprobe exit, unparseable JSON, or a file with no audio stream
+//!   a non-zero ffprobe exit, unparsable JSON, or a file with no audio stream
 //!   yields a typed [`ProbeError`].
 
 use std::path::Path;
@@ -67,8 +67,8 @@ pub struct ProbedBook {
     pub chapters: Vec<Chapter>,
 }
 
-/// Everything that can go wrong probing a file. Chapter-less input is *not* here
-/// — it is a valid [`ProbedBook`] with no chapters.
+/// Everything that can go wrong in a probe of a file. Chapter-less input is
+/// *not* here: it is a valid [`ProbedBook`] with no chapters.
 #[derive(Debug, thiserror::Error)]
 pub enum ProbeError {
     /// `ffprobe` could not be launched (not on PATH, permissions, …).
@@ -84,7 +84,7 @@ pub enum ProbeError {
     #[error("could not parse ffprobe JSON output: {0}")]
     Json(#[source] serde_json::Error),
     /// A chapter carried a `start_time`/`end_time` that was not a decimal number.
-    #[error("chapter {idx} has an unparseable {field} ({value:?})")]
+    #[error("chapter {idx} has an unparsable {field} ({value:?})")]
     InvalidChapterTime {
         /// Zero-based chapter position.
         idx: usize,
@@ -93,7 +93,7 @@ pub enum ProbeError {
         /// The raw string ffprobe reported.
         value: String,
     },
-    /// The file has no audio stream — it is not a playable audiobook.
+    /// The file has no audio stream: it is not a playable audiobook.
     #[error("no audio stream found in file")]
     NoAudioStream,
     /// Duration could not be determined from format, chapters, or streams.
@@ -103,7 +103,7 @@ pub enum ProbeError {
 
 /// Probe `path` with `ffprobe` and return its chapters, duration, and cover flag.
 pub fn probe(path: &Path) -> Result<ProbedBook, ProbeError> {
-    // argv vector — never a shell string.
+    // An argv vector, never a shell string.
     let output = Command::new("ffprobe")
         .args([
             "-v",
@@ -311,7 +311,7 @@ mod tests {
         assert!((c0.end_sec - 31.312).abs() < 1e-9);
         assert_eq!(c0.title.as_deref(), Some("Introduction"));
 
-        // Short middle chapter — exercises small segments.
+        // The short middle chapter exercises small segments.
         assert!((book.chapters[1].duration_sec() - 2.288).abs() < 1e-9);
     }
 
@@ -385,7 +385,7 @@ mod tests {
 
     #[test]
     fn duration_falls_back_to_stream_then_chapters() {
-        // No format.duration -> use the audio stream's duration.
+        // There is no format.duration, so use the audio stream's duration.
         let json = r#"{
             "streams": [{"codec_type": "audio", "duration": "123.5",
                          "disposition": {"attached_pic": 0}}],
@@ -396,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn unparseable_chapter_time_is_a_typed_error() {
+    fn unparsable_chapter_time_is_a_typed_error() {
         let json = r#"{
             "streams": [{"codec_type": "audio", "disposition": {"attached_pic": 0}}],
             "chapters": [{"start_time": "not-a-number", "end_time": "10.0", "tags": {}}],

@@ -1,18 +1,21 @@
 name: tap-sync-trigger
 
-# When a packaging-bump PR merges (the Homebrew formula + Scoop manifest sources on
-# `main` have just changed), trigger the tap's and bucket's syncs IMMEDIATELY instead
-# of waiting for their daily cron. Best-effort: a dispatch failure just leaves the cron
-# as the safety net, so this never blocks or fails the release path.
+# When a packaging-bump PR merges (the Homebrew formula + Scoop manifest
+# sources on `main` have just changed), trigger the tap's and bucket's syncs
+# IMMEDIATELY; do not wait for their daily cron. Best-effort: a dispatch
+# failure only leaves the cron as the safety net, so this never blocks or
+# fails the release path.
 #
-# WHY this trigger point (not `release: published`): at publish time the bumped manifests
-# are NOT yet on `main` — packaging-bump opens a PR; it doesn't push main. So we fire on
-# the packaging-bump PR MERGE, detected by the head-branch prefix.
+# WHY this trigger point (not `release: published`): at publish time the
+# bumped manifests are NOT yet on `main`. packaging-bump opens a PR; it does
+# not push main. So this fires on the packaging-bump PR MERGE, detected by
+# the head-branch prefix.
 #
-# SECURITY: same-repo, merged `packaging-bump/*` PR only (a fork can't reach this even by
-# naming its head that; `pull_request`, not _target). Mints a tap/bucket-scoped
-# podspine-ci App token with `actions:write` ONLY (never contents:write) — the minimal
-# cross-repo surface `workflow run` needs. Workflow-level permissions stay read-only.
+# SECURITY: same-repo, merged `packaging-bump/*` PR only (a fork cannot reach
+# this even with that head name; `pull_request`, not _target). It mints a
+# tap/bucket-scoped podspine-ci App token with `actions:write` ONLY (never
+# contents:write): the minimal cross-repo surface that `workflow run` needs.
+# Workflow-level permissions stay read-only.
 on:
   pull_request:
     types: [closed]
@@ -48,8 +51,9 @@ jobs:
           echo "::error::podspine-ci App token was empty; refusing to dispatch. Confirm the \
           App is installed on schubydoo/homebrew-podspine and scoop-podspine with Actions: write."
           exit 1
-      # Best-effort per repo: each downstream sync no-ops when the manifest is unchanged,
-      # and its daily cron stays the fallback, so a dispatch failure must not fail the job.
+      # Best-effort per repo: each downstream sync no-ops when the manifest
+      # is unchanged, and its daily cron stays the fallback, so a dispatch
+      # failure must not fail the job.
       - name: Trigger the Homebrew tap + Scoop bucket syncs
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
