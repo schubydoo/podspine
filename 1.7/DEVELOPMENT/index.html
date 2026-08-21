@@ -834,13 +834,14 @@ for what each does):</p>
 <a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>├── feed              # RSS 2.0 + itunes/podcast + self-check
 <a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>├── http              # Axum router + middleware
 <a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a>├── ui                # maud pages
-<a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a>└── cli               # podspine-cli POC
+<a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a>├── metrics           # optional Prometheus instrumentation (--metrics-bind)
+<a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a>└── test-support      # dev-only test fixtures (skip! macros, ffmpeg synthesis)
 </code></pre></div>
 <h2 id="common-commands">Common commands<a class="headerlink" href="#common-commands" title="Permanent link">&para;</a></h2>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>cargo<span class="w"> </span>build<span class="w">                                   </span><span class="c1"># build the workspace</span>
 <a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>cargo<span class="w"> </span>run<span class="w"> </span>--<span class="w"> </span>--library<span class="w"> </span>./sample-books<span class="w">         </span><span class="c1"># run the server → http://localhost:8080</span>
 <a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>cargo<span class="w"> </span><span class="nb">test</span><span class="w"> </span>--workspace<span class="w">                        </span><span class="c1"># run all tests</span>
-<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>cargo<span class="w"> </span>clippy<span class="w"> </span>--all-targets<span class="w"> </span>--<span class="w"> </span>-D<span class="w"> </span>warnings<span class="w">     </span><span class="c1"># lint (warnings are errors)</span>
+<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>cargo<span class="w"> </span>clippy<span class="w"> </span>--workspace<span class="w"> </span>--all-targets<span class="w"> </span>--all-features<span class="w"> </span>--<span class="w"> </span>-D<span class="w"> </span>warnings<span class="w">  </span><span class="c1"># lint (matches CI's gate)</span>
 <a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>cargo<span class="w"> </span>fmt<span class="w">                                      </span><span class="c1"># format</span>
 </code></pre></div>
 <p>(<code>./sample-books</code> is just an example path — point <code>--library</code> at any folder of
@@ -854,7 +855,11 @@ audiobooks.)</p>
   tone, embedded chapters, an attached cover, real MP3/FLAC/Opus files) and then run
   the pipeline. These are gated on tool availability: if <code>ffmpeg</code>/<code>ffprobe</code> — or a
   specific encoder — isn't present, the test prints a skip notice and returns rather
-  than failing. Encoders used include <code>aac</code>, <code>libmp3lame</code>, <code>flac</code>, and <code>libopus</code>.</li>
+  than failing. Encoders used include <code>aac</code>, <code>libmp3lame</code>, <code>flac</code>, and <code>libopus</code>.
+  The shared machinery (the <code>skip!</code>/<code>skip_unless_ffmpeg!</code> macros, fixture synthesis,
+  scratch-dir guards) lives in the dev-only <code>crates/test-support</code> crate. CI runs the
+  suite through <code>cargo nextest run</code>; plain <code>cargo test</code> and local <code>cargo nextest run</code>
+  both work.</li>
 </ul>
 <p>Run with logs to see scan/serve behavior:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="nv">RUST_LOG</span><span class="o">=</span>debug<span class="w"> </span>cargo<span class="w"> </span>run<span class="w"> </span>--<span class="w"> </span>--library<span class="w"> </span>./sample-books
@@ -890,15 +895,20 @@ produces the per-arch binaries and lays them out under <code>dist/</code> — se
 <h2 id="hooks-ci">Hooks &amp; CI<a class="headerlink" href="#hooks-ci" title="Permanent link">&para;</a></h2>
 <ul>
 <li><strong>Pre-commit</strong> (<code>.pre-commit-config.yaml</code>) runs <code>cargo fmt --check</code>, <code>clippy -D
-  warnings</code>, and the lib unit tests before a commit lands, plus hygiene checks
-  (trailing whitespace, large files, secret/private-key detection). Install with
-  <code>pre-commit install</code>.</li>
-<li><strong>CI</strong> (<code>.github/workflows/ci.yml</code>): a <code>quality</code> job (fmt · clippy · test with
-  ffmpeg installed) and a <code>supply-chain</code> job (<code>cargo audit</code> + <code>cargo deny</code>) on every
-  push/PR. Releases run separately on <code>v*</code> tags.</li>
+  warnings</code>, the lib unit tests, and the changeset lint before a commit lands, plus
+  hygiene checks (trailing whitespace, large files, secret/private-key detection).
+  A <strong>pre-push</strong> stage additionally runs the full workspace suite plus <code>cargo audit</code>
+  and <code>cargo deny</code> — both binaries must be on <code>PATH</code> or the push hook fails. Install
+  with <code>pre-commit install --install-hooks -t pre-commit -t pre-push</code>.</li>
+<li><strong>CI</strong> (<code>.github/workflows/ci.yml</code>), on PRs and pushes to <code>main</code>: <code>lint</code>
+  (fmt · clippy), a <code>test</code> matrix (ubuntu + macos, <code>cargo nextest</code> emitting JUnit
+  that uploads to Codecov Test Analytics), an informational non-blocking Windows
+  leg, <code>coverage</code> (cargo-llvm-cov with a <strong>90% line floor</strong> + Codecov upload),
+  <code>supply-chain</code> (<code>cargo audit</code> + <code>cargo deny</code>), and a required-checks aggregator.
+  Releases run separately on <code>v*</code> tags.</li>
 </ul>
-<p>Please make sure <code>fmt</code>, <code>clippy -D warnings</code>, and <code>test --workspace</code> all pass before
-opening a PR — CI enforces the same gates.</p>
+<p>Please make sure <code>fmt</code>, <code>clippy</code> (with <code>--workspace --all-features</code>), and
+<code>test --workspace</code> all pass before opening a PR — CI enforces the same gates.</p>
 
 
 
