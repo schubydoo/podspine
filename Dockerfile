@@ -12,8 +12,13 @@
 # debian's full ffmpeg).
 FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
 
+# Upgrade the base packages first. openssl (libcrypto3/libssl3) ships inside the
+# base image, so `apk add` alone keeps the digest-pinned version and never picks
+# up a patched release from the branch. `apk upgrade` floats the base to the
+# current v3.24 packages, which closes base CVEs (openssl and others) on rebuild.
 # ffmpeg is the one runtime dependency; ca-certificates for outbound TLS if needed.
-RUN apk add --no-cache ffmpeg ca-certificates
+RUN apk upgrade --no-cache \
+ && apk add --no-cache ffmpeg ca-certificates
 
 # A non-root system user. Own /data before VOLUME, so that the anonymous
 # volume Docker creates at runtime inherits podspine ownership (otherwise it
