@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.7.2 (2026-08-27)
+
+### Fixes
+
+- The Docker image now runs `apk upgrade` before installing runtime dependencies, so openssl (libcrypto3/libssl3) and other base packages get the patched release from the Alpine branch instead of the older version frozen in the pinned base image ([#196](https://github.com/schubydoo/podspine/pull/196))
+
 ## 1.7.1 (2026-08-20)
 
 ### Fixes

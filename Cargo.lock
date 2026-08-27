@@ -1197,7 +1197,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "podspine"
-version = "1.7.1"
+version = "1.7.2"
 dependencies = [
  "anyhow",
  "podspine-config",
@@ -1212,7 +1212,7 @@ dependencies = [
 
 [[package]]
 name = "podspine-chapters"
-version = "1.7.1"
+version = "1.7.2"
 dependencies = [
  "podspine-prober",
  "podspine-test-support",
@@ -1220,7 +1220,7 @@ dependencies = [
 
 [[package]]
 name = "podspine-config"
-version = "1.7.1"
+version = "1.7.2"
 dependencies = [
  "clap",
  "podspine-test-support",
@@ -1231,7 +1231,7 @@ dependencies = [
 
 [[package]]
 name = "podspine-feed"
-version = "1.7.1"
+version = "1.7.2"
 dependencies = [
  "blake3",
  "rss",
@@ -1241,7 +1241,7 @@ dependencies = [
 
 [[package]]
 name = "podspine-http"
-version = "1.7.1"
+version = "1.7.2"
 dependencies = [
  "axum",
  "axum-extra 0.12.6",
@@ -1264,7 +1264,7 @@ dependencies = [
 
 [[package]]
 name = "podspine-index"
-version = "1.7.1"
+version = "1.7.2"
 dependencies = [
  "base64 0.23.1",
  "getrandom 0.4.3",
@@ -1276,7 +1276,7 @@ dependencies = [
 
 [[package]]
 name = "podspine-metrics"
-version = "1.7.1"
+version = "1.7.2"
 dependencies = [
  "axum",
  "http-body-util",
@@ -1288,7 +1288,7 @@ dependencies = [
 
 [[package]]
 name = "podspine-prober"
-version = "1.7.1"
+version = "1.7.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -1297,7 +1297,7 @@ dependencies = [
 
 [[package]]
 name = "podspine-scanner"
-version = "1.7.1"
+version = "1.7.2"
 dependencies = [
  "notify",
  "podspine-chapters",
@@ -1315,7 +1315,7 @@ dependencies = [
 
 [[package]]
 name = "podspine-splitter"
-version = "1.7.1"
+version = "1.7.2"
 dependencies = [
  "podspine-metrics",
  "podspine-prober",
@@ -1326,11 +1326,11 @@ dependencies = [
 
 [[package]]
 name = "podspine-test-support"
-version = "1.7.1"
+version = "1.7.2"
 
 [[package]]
 name = "podspine-ui"
-version = "1.7.1"
+version = "1.7.2"
 dependencies = [
  "maud",
  "qrcode",
