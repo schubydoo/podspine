@@ -544,6 +544,34 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
+  <a href="#172-2026-08-27" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1.7.2 (2026-08-27)
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="1.7.2 (2026-08-27)">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#fixes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Fixes
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#171-2026-08-20" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -556,7 +584,7 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#fixes" class="md-nav__link">
+  <a href="#fixes_1" class="md-nav__link">
     <span class="md-ellipsis">
       
         Fixes
@@ -606,7 +634,7 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#fixes_1" class="md-nav__link">
+  <a href="#fixes_2" class="md-nav__link">
     <span class="md-ellipsis">
       
         Fixes
@@ -690,7 +718,7 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#fixes_2" class="md-nav__link">
+  <a href="#fixes_3" class="md-nav__link">
     <span class="md-ellipsis">
       
         Fixes
@@ -830,7 +858,7 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#fixes_3" class="md-nav__link">
+  <a href="#fixes_4" class="md-nav__link">
     <span class="md-ellipsis">
       
         Fixes
@@ -973,6 +1001,34 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
+  <a href="#172-2026-08-27" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1.7.2 (2026-08-27)
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="1.7.2 (2026-08-27)">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#fixes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Fixes
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#171-2026-08-20" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -985,7 +1041,7 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#fixes" class="md-nav__link">
+  <a href="#fixes_1" class="md-nav__link">
     <span class="md-ellipsis">
       
         Fixes
@@ -1035,7 +1091,7 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#fixes_1" class="md-nav__link">
+  <a href="#fixes_2" class="md-nav__link">
     <span class="md-ellipsis">
       
         Fixes
@@ -1119,7 +1175,7 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#fixes_2" class="md-nav__link">
+  <a href="#fixes_3" class="md-nav__link">
     <span class="md-ellipsis">
       
         Fixes
@@ -1259,7 +1315,7 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#fixes_3" class="md-nav__link">
+  <a href="#fixes_4" class="md-nav__link">
     <span class="md-ellipsis">
       
         Fixes
@@ -1335,8 +1391,13 @@
 
 <!-- Rendered from the canonical CHANGELOG.md at the repo root (knope-managed). -->
 <h1 id="changelog">Changelog<a class="headerlink" href="#changelog" title="Permanent link">&para;</a></h1>
-<h2 id="171-2026-08-20">1.7.1 (2026-08-20)<a class="headerlink" href="#171-2026-08-20" title="Permanent link">&para;</a></h2>
+<h2 id="172-2026-08-27">1.7.2 (2026-08-27)<a class="headerlink" href="#172-2026-08-27" title="Permanent link">&para;</a></h2>
 <h3 id="fixes">Fixes<a class="headerlink" href="#fixes" title="Permanent link">&para;</a></h3>
+<ul>
+<li>The Docker image now runs <code>apk upgrade</code> before installing runtime dependencies, so openssl (libcrypto3/libssl3) and other base packages get the patched release from the Alpine branch instead of the older version frozen in the pinned base image (<a href="https://github.com/schubydoo/podspine/pull/196">#196</a>)</li>
+</ul>
+<h2 id="171-2026-08-20">1.7.1 (2026-08-20)<a class="headerlink" href="#171-2026-08-20" title="Permanent link">&para;</a></h2>
+<h3 id="fixes_1">Fixes<a class="headerlink" href="#fixes_1" title="Permanent link">&para;</a></h3>
 <ul>
 <li>Remux-to-faststart now publishes atomically like every other producer, so a failed remux can no longer clobber a cached copy that is being served (<a href="https://github.com/schubydoo/podspine/pull/183">#183</a>)</li>
 <li>The stale-copy sweep now recognizes episode files beyond chapter 999, so books with 1000+ chapters no longer leave orphaned copies on disk after a container change (<a href="https://github.com/schubydoo/podspine/pull/183">#183</a>)</li>
@@ -1356,7 +1417,7 @@
 <li>Follow the operating system's light/dark preference automatically: a <code>prefers-color-scheme: dark</code> override of the existing CSS variables (plus <code>color-scheme: light dark</code> so native controls adapt) gives the whole UI an AA-contrast dark palette with no JavaScript, while the QR codes keep their scannable white background (<a href="https://github.com/schubydoo/podspine/pull/172">#172</a>)</li>
 <li>Add a light/dark theme picker to the header: it still defaults to following the operating system, but a visitor can now choose Auto, Light, or Dark and the choice persists in a first-party <code>theme</code> cookie the server reads to render the right theme — no JavaScript, no flash of the wrong theme (<a href="https://github.com/schubydoo/podspine/pull/176">#176</a>)</li>
 </ul>
-<h3 id="fixes_1">Fixes<a class="headerlink" href="#fixes_1" title="Permanent link">&para;</a></h3>
+<h3 id="fixes_2">Fixes<a class="headerlink" href="#fixes_2" title="Permanent link">&para;</a></h3>
 <ul>
 <li>Cache cover images: <code>/cover</code> now sends an <code>ETag</code> (a hash of the image bytes) and <code>Cache-Control</code>, and honours <code>If-None-Match</code> with a bodyless <code>304</code>, so a browser stops re-downloading every cover on each page refresh — a real speed-up over slow links like Tailscale where the grid was pulling several MB of images every time (<a href="https://github.com/schubydoo/podspine/pull/174">#174</a>)</li>
 <li>Document that the first scan can take a while: the README and docs quick-start now explain that the initial run splits chaptered books into per-chapter episodes (whole-file books stream in place), so a large chaptered library takes minutes, shows a self-refreshing "Scanning…" page meanwhile, and answers 503 + Retry-After on feed/audio until it finishes — while a warm restart stays fast (<a href="https://github.com/schubydoo/podspine/pull/175">#175</a>)</li>
@@ -1373,7 +1434,7 @@
 <li>Add opt-in transcoding for sources podcatchers can't play: <code>PODSPINE_TRANSCODE=aac|mp3</code> re-encodes FLAC/Vorbis/Opus/ALAC books to AAC 128k (or MP3 128k) at ingest, while MP3/AAC sources stay stream-copied. Default stays <code>off</code> (copy-first); a transcoded book is always stored <code>full</code> and never evicted, because a re-encode can't be regenerated byte-for-byte (<a href="https://github.com/schubydoo/podspine/pull/152">#152</a>)</li>
 </ul>
 <h2 id="141-2026-07-25">1.4.1 (2026-07-25)<a class="headerlink" href="#141-2026-07-25" title="Permanent link">&para;</a></h2>
-<h3 id="fixes_2">Fixes<a class="headerlink" href="#fixes_2" title="Permanent link">&para;</a></h3>
+<h3 id="fixes_3">Fixes<a class="headerlink" href="#fixes_3" title="Permanent link">&para;</a></h3>
 <ul>
 <li>Harden the saver-mode chapter-regeneration path: the book source is now canonicalized and asserted to live under the library root before it can reach ffmpeg, matching the checks the serve-in-place and faststart-remux paths already had (<a href="https://github.com/schubydoo/podspine/pull/108">#108</a>)</li>
 </ul>
@@ -1401,7 +1462,7 @@
 <li>Add an "Add to a podcast app" subscribe page: the book-page QR now opens <code>/subscribe/{feed_id}</code> with one-tap "Open in…" deep links for Apple Podcasts, Overcast, Pocket Casts, Castro, AntennaPod, and Podcast Addict (per-app QRs behind an expander) instead of raw feed XML the iOS Camera couldn't open. (<a href="https://github.com/schubydoo/podspine/pull/22">#22</a>)</li>
 </ul>
 <h2 id="101-2026-07-05">1.0.1 (2026-07-05)<a class="headerlink" href="#101-2026-07-05" title="Permanent link">&para;</a></h2>
-<h3 id="fixes_3">Fixes<a class="headerlink" href="#fixes_3" title="Permanent link">&para;</a></h3>
+<h3 id="fixes_4">Fixes<a class="headerlink" href="#fixes_4" title="Permanent link">&para;</a></h3>
 <ul>
 <li>Set the audio <code>Content-Type</code> on <code>/audio</code> responses so Apple Podcasts and other iOS clients can play episodes (axum-range sets none, which made playback fail with "this episode can't be played on this device"). (<a href="https://github.com/schubydoo/podspine/pull/20">#20</a>)</li>
 </ul>
