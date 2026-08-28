@@ -15,8 +15,7 @@
 /tad.md
 /tasks.md
 
-# Agent config (normally committed; kept local while planning skills run)
-/CLAUDE.md
+# Local agent tooling + host notes (not part of the public repo)
 /.claude/
 /.worktreeinclude
 /CLAUDE.local.md
