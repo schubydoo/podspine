@@ -18,6 +18,8 @@
 # Agent config (normally committed; kept local while planning skills run)
 /CLAUDE.md
 /.claude/
+/.worktreeinclude
+/CLAUDE.local.md
 
 # Local MCP server config and Serena project state (machine-specific)
 /.mcp.json
