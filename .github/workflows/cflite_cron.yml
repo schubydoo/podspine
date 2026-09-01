@@ -3,8 +3,11 @@
 # inputs that add no coverage). Coverage replays the whole corpus and pushes
 # an HTML line-coverage report to the corpus repo's gh-pages branch, which
 # shows exactly which parser code the fuzzers reach (0% means a harness is
-# owed). Both reuse the storage-repo + FUZZ_STORAGE_TOKEN. NOT required
-# checks. Docs: https://google.github.io/clusterfuzzlite/
+# owed). Both reuse the storage-repo + FUZZ_STORAGE_TOKEN. Neither has work
+# to do without the corpus, so a shared `probe` job tests the storage repo
+# first and both jobs skip (green, with a warning) when it does not answer —
+# see cflite_batch.yml for why the probe exists. NOT required checks.
+# Docs: https://google.github.io/clusterfuzzlite/
 name: ClusterFuzzLite cron (prune + coverage)
 
 on:
@@ -15,8 +18,45 @@ on:
 permissions: {}
 
 jobs:
+  # One probe for both jobs below. It runs as its own job so that a corpus
+  # that does not answer shows as two skipped jobs, not as a red run: an
+  # unauthenticated clone raises inside ClusterFuzzLite and reds the job.
+  # git's own error stays in the log for diagnosis; Actions masks the token.
+  probe:
+    name: probe the corpus repo
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: ${{ github.workflow }}-probe
+      cancel-in-progress: true
+    outputs:
+      reachable: ${{ steps.corpus.outputs.reachable }}
+    steps:
+      - name: Probe the corpus storage repo
+        id: corpus
+        env:
+          FUZZ_STORAGE_TOKEN: ${{ secrets.FUZZ_STORAGE_TOKEN }}
+        run: |
+          set -uo pipefail
+          reachable=false
+          if [ -z "${FUZZ_STORAGE_TOKEN}" ]; then
+            cause="FUZZ_STORAGE_TOKEN is not set"
+          elif GIT_TERMINAL_PROMPT=0 git ls-remote \
+            "https://x-access-token:${FUZZ_STORAGE_TOKEN}@github.com/schubydoo/podspine-fuzz-corpus.git" \
+            HEAD >/dev/null; then
+            reachable=true
+          else
+            cause="the corpus repo refused the token (git's error is above)"
+          fi
+          if [ "${reachable}" = false ]; then
+            echo "::warning::Prune and coverage are skipped: ${cause}. There is no corpus to work on."
+          fi
+          echo "reachable=${reachable}" >> "${GITHUB_OUTPUT}"
+
   prune:
     name: prune corpus
+    needs: probe
+    if: needs.probe.outputs.reachable == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 55
     permissions:
@@ -40,11 +80,13 @@ jobs:
           mode: prune
           sanitizer: address
           output-sarif: true
-          storage-repo: https://${{ secrets.FUZZ_STORAGE_TOKEN }}@github.com/schubydoo/podspine-fuzz-corpus.git
+          storage-repo: https://x-access-token:${{ secrets.FUZZ_STORAGE_TOKEN }}@github.com/schubydoo/podspine-fuzz-corpus.git
           storage-repo-branch: main
 
   coverage:
     name: coverage report
+    needs: probe
+    if: needs.probe.outputs.reachable == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -66,6 +108,6 @@ jobs:
           fuzz-seconds: 300
           mode: coverage
           sanitizer: coverage
-          storage-repo: https://${{ secrets.FUZZ_STORAGE_TOKEN }}@github.com/schubydoo/podspine-fuzz-corpus.git
+          storage-repo: https://x-access-token:${{ secrets.FUZZ_STORAGE_TOKEN }}@github.com/schubydoo/podspine-fuzz-corpus.git
           storage-repo-branch: main
           storage-repo-branch-coverage: gh-pages

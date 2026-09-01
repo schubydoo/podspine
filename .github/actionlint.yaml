@@ -1,0 +1,20 @@
+# actionlint configuration.
+#
+# The ignore below exists because actionlint (≤ v1.7.12, the latest as of
+# 2026-09-01) does not yet understand GitHub's `$/` self-repository `uses:`
+# syntax (July 2026) and reports it as an invalid action reference. The syntax
+# is deliberate — it is immune to runtime filesystem substitution and GitHub
+# treats it as pinned — so this one message shape is suppressed rather than the
+# migration reverted. zizmor's `self-repository` audit asks for it.
+#
+# ⚠️ Suppressing the format error also silences actionlint's local-action call
+# checks for the `$/` sites (input-name typos, missing required inputs) — those
+# are gated on the `./` prefix internally. `setup-ffmpeg`, the only local action
+# here, is called with no inputs at all three sites, so nothing is forfeited
+# today; give the action inputs and this loses real coverage.
+#
+# ⚠️ Remove this file once rhysd/actionlint issue 711 ships `$/` support.
+paths:
+  .github/workflows/**/*.{yaml,yml}:
+    ignore:
+      - 'specifying action "\$/.+" in invalid format because ref is missing'

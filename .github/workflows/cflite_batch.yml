@@ -8,9 +8,11 @@
 # fuzzes, and pushes the grown corpus back, so coverage compounds across
 # runs. This needs a `schubydoo/podspine-fuzz-corpus` repo and a
 # `FUZZ_STORAGE_TOKEN` PAT (write); see the publish checklist. The PR job
-# deliberately carries no such secret. If the secret is unset, the job still
-# runs (it fuzzes from seed); it only does not accumulate. `fuzz-seconds` is
-# PER target, so wall-clock ≈ fuzz-seconds × harness count + build.
+# deliberately carries no such secret. A probe step tests the corpus repo
+# first: if the secret is unset, or the token no longer authenticates, the job
+# fuzzes from seed and does not accumulate, but it still runs and still finds
+# crashes. `fuzz-seconds` is PER target, so wall-clock ≈ fuzz-seconds ×
+# harness count + build.
 # Docs: https://google.github.io/clusterfuzzlite/
 name: ClusterFuzzLite batch fuzzing
 
@@ -37,6 +39,34 @@ jobs:
       matrix:
         sanitizer: [address]
     steps:
+      # ClusterFuzzLite clones storage-repo BEFORE it fuzzes, and a clone that
+      # it cannot authenticate raises and reds the whole job — on 2026-09-01
+      # this lost 300s × 3 harnesses of crash detection to a corpus-only
+      # problem. Probe the repo first and give an empty storage-repo when the
+      # probe fails: CIFuzz then keeps the GitHub Actions filestore
+      # (filestore_utils.get_filestore returns early on a falsy
+      # git_store_repo) and fuzzes from seed. git's own error stays in the log
+      # for diagnosis; Actions masks the token in it.
+      - name: Probe the corpus storage repo
+        id: corpus
+        env:
+          FUZZ_STORAGE_TOKEN: ${{ secrets.FUZZ_STORAGE_TOKEN }}
+        run: |
+          set -uo pipefail
+          reachable=false
+          if [ -z "${FUZZ_STORAGE_TOKEN}" ]; then
+            cause="FUZZ_STORAGE_TOKEN is not set"
+          elif GIT_TERMINAL_PROMPT=0 git ls-remote \
+            "https://x-access-token:${FUZZ_STORAGE_TOKEN}@github.com/schubydoo/podspine-fuzz-corpus.git" \
+            HEAD >/dev/null; then
+            reachable=true
+          else
+            cause="the corpus repo refused the token (git's error is above)"
+          fi
+          if [ "${reachable}" = false ]; then
+            echo "::warning::Corpus persistence is off: ${cause}. This run fuzzes from seed and does not keep the corpus."
+          fi
+          echo "reachable=${reachable}" >> "${GITHUB_OUTPUT}"
       - name: Build fuzzers (${{ matrix.sanitizer }})
         uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
         with:
@@ -51,5 +81,9 @@ jobs:
           mode: batch
           sanitizer: ${{ matrix.sanitizer }}
           output-sarif: true
-          storage-repo: https://${{ secrets.FUZZ_STORAGE_TOKEN }}@github.com/schubydoo/podspine-fuzz-corpus.git
+          # Empty when the probe failed. The `x-access-token:` user is the
+          # supported credential shape; a bare `https://TOKEN@github.com` puts
+          # the token in the user field with no password, which git can only
+          # complete by a prompt it does not have in CI.
+          storage-repo: ${{ steps.corpus.outputs.reachable == 'true' && format('https://x-access-token:{0}@github.com/schubydoo/podspine-fuzz-corpus.git', secrets.FUZZ_STORAGE_TOKEN) || '' }}
           storage-repo-branch: main
