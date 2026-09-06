@@ -78,9 +78,13 @@ jobs:
       # build the amd64 static musl binary first. This is single-arch on an
       # amd64 runner, so plain musl-gcc (it links rusqlite's bundled SQLite C)
       # is enough; no cross toolchain is needed.
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
-          targets: x86_64-unknown-linux-musl
+          target: x86_64-unknown-linux-musl
+          # No Actions cache here (matches the prior setup, which had none) and
+          # rustflags: "" keeps the action from forcing `-D warnings` on the build.
+          cache: false
+          rustflags: ""
       - name: Install musl toolchain
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build static amd64 binary

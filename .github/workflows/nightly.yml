@@ -57,9 +57,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
-          targets: ${{ matrix.target }}
+          target: ${{ matrix.target }}
+          # No Actions cache: caching in an artifact-publishing workflow is a
+          # cache-poisoning vector (matching the prior setup and release.yml).
+          # rustflags: "" avoids forcing `-D warnings` on the build.
+          cache: false
+          rustflags: ""
       # zig is the cross linker for the musl targets (incl. rusqlite's bundled
       # SQLite C). No Actions cache: caching in an artifact-publishing workflow is a
       # cache-poisoning vector (zizmor cache-poisoning), matching release.yml.
