@@ -27,8 +27,13 @@ async fn main() -> Result<()> {
     let (filter, log_warnings) =
         resolve_log_filter(std::env::var("RUST_LOG").ok().as_deref(), &config.log_level);
     tracing_subscriber::fmt().with_env_filter(filter).init();
+    // Print these to stderr, not through tracing. Each one reports that a log
+    // filter was rejected, and the installed filter is the one just built from
+    // that same input. A restrictive filter (`error`, `off`, or a target-only
+    // directive) would suppress a `tracing::warn!` here and hide the diagnostic
+    // the fallback exists to give. stderr always shows it.
     for message in log_warnings {
-        tracing::warn!("{message}");
+        eprintln!("podspine: {message}");
     }
 
     // Install the recorder (and bind its listener) before the first
