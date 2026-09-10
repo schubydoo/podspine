@@ -77,9 +77,15 @@ jobs:
           target: ${{ matrix.target }}
           # No Actions cache in this signed-release build (cache-poisoning vector
           # in an artifact-publishing workflow, matching the prior setup and the
-          # setup-zig step below). rustflags: "" avoids forcing `-D warnings`.
+          # setup-zig step below). This is an artifact build, not the warnings gate
+          # (ci.yml is). Both knobs are needed to not fail it on a warning:
+          # rustflags: "" clears the action's default RUSTFLAGS=-D warnings, and
+          # build-warnings: warn clears its default CARGO_BUILD_WARNINGS=deny — which
+          # otherwise turns the new `linker_messages` lint (zig LLD's -O1 deprecation
+          # notice) into an error.
           cache: false
           rustflags: ""
+          build-warnings: warn
       # zig is the cross linker for the musl targets only (incl. rusqlite's bundled
       # SQLite C). Installed from a pinned, checksum-verified tarball by the local
       # ./.github/actions/setup-zig composite action, not mlugg/setup-zig (which
