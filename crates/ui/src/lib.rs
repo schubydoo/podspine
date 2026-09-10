@@ -80,7 +80,10 @@ const STYLE: &str = r#"
         --danger:#f87171; }
 }
 * { box-sizing:border-box; }
-body { margin:0; font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+/* A column that fills the viewport so the footer sits at the bottom on a short
+   page instead of floating up under the content. `main` grows to take the slack. */
+body { margin:0; min-height:100dvh; display:flex; flex-direction:column;
+       font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
        color:var(--text); background:var(--bg); }
 a { color:var(--accent); }
 :focus-visible { outline:3px solid var(--accent); outline-offset:2px; border-radius:4px; }
@@ -88,6 +91,8 @@ header.site { padding:1rem 1.25rem; border-bottom:1px solid var(--border);
         display:flex; align-items:center; justify-content:space-between; gap:1rem; }
 header.site h1 { margin:0; font-size:1.25rem; }
 header.site a { text-decoration:none; color:var(--text); }
+footer.site { padding:1rem 1.25rem; border-top:1px solid var(--border);
+        color:var(--muted); font-size:.85rem; text-align:center; }
 /* Theme picker: a no-JS segmented control (a form of submit buttons). The active
    theme is marked with aria-pressed, which also styles it. */
 .themepicker { display:inline-flex; margin:0; border:1px solid var(--border);
@@ -97,7 +102,7 @@ header.site a { text-decoration:none; color:var(--text); }
         cursor:pointer; }
 .themepicker button:first-child { border-left:0; }
 .themepicker button[aria-pressed="true"] { background:var(--accent); color:var(--accent-text); }
-main { max-width:960px; margin:0 auto; padding:1.5rem 1.25rem; }
+main { flex:1 0 auto; width:100%; max-width:960px; margin:0 auto; padding:1.5rem 1.25rem; }
 .grid { list-style:none; margin:0; padding:0; display:grid; gap:1.25rem;
         grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); }
 .card a { display:block; text-decoration:none; color:var(--text); }
@@ -243,6 +248,21 @@ fn theme_picker(current: Theme) -> Markup {
     }
 }
 
+/// The running Podspine version, resolved at compile time. `CARGO_PKG_VERSION`
+/// is the `[workspace.package]` version that every crate inherits, so this is
+/// the deployed build's version. Nightly images carry the same value as the
+/// release they branch from: distinguishing them needs a build-time git sha,
+/// which is out of scope here.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The site footer: the running Podspine version, shown on every page so an
+/// operator can tell what is deployed without inspecting the container tag.
+fn footer() -> Markup {
+    html! {
+        footer.site { "Podspine v" (VERSION) }
+    }
+}
+
 /// Wrap page `body` content in the full HTML document shell for the given `theme`.
 fn page(title: &str, theme: Theme, body: Markup) -> Markup {
     html! {
@@ -260,6 +280,7 @@ fn page(title: &str, theme: Theme, body: Markup) -> Markup {
                     (theme_picker(theme))
                 }
                 (body)
+                (footer())
             }
         }
     }
@@ -342,6 +363,7 @@ pub fn scanning_page(theme: Theme) -> Markup {
                         "This page refreshes on its own — your books will appear here when it's done."
                     }
                 }
+                (footer())
             }
         }
     }
@@ -647,6 +669,21 @@ mod tests {
         let html = index_page(&[], Theme::System).into_string();
         assert!(html.contains("No audiobooks found"));
         assert!(!html.contains("<ul"));
+    }
+
+    #[test]
+    fn footer_shows_the_running_version() {
+        let expected = format!("Podspine v{}", env!("CARGO_PKG_VERSION"));
+        let home = index_page(&[], Theme::System).into_string();
+        assert!(
+            home.contains(&expected),
+            "home page footer names the version"
+        );
+        let scanning = scanning_page(Theme::System).into_string();
+        assert!(
+            scanning.contains(&expected),
+            "scanning page footer names the version"
+        );
     }
 
     #[test]
