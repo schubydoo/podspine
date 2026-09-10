@@ -87,7 +87,7 @@ jobs:
       # build: the manual install fetches fresh, so there is no cache-poisoning vector.
       - if: matrix.build == 'zig'
         name: Set up Zig
-        uses: ./.github/actions/setup-zig
+        uses: $/.github/actions/setup-zig
       - if: matrix.build == 'zig'
         name: Install cargo-zigbuild
         run: cargo install cargo-zigbuild --locked

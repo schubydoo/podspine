@@ -71,7 +71,7 @@ jobs:
       # still declares runs.using node20). The manual install fetches fresh, so there
       # is no Actions cache and no cache-poisoning vector, matching release.yml.
       - name: Set up Zig
-        uses: ./.github/actions/setup-zig
+        uses: $/.github/actions/setup-zig
       - name: Install cargo-zigbuild
         run: cargo install cargo-zigbuild --locked
       - name: Build (musl via zig)

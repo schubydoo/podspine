@@ -21,7 +21,11 @@ runs:
         ZIG_VERSION: "0.13.0"
         ZIG_URL: "https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz"
         ZIG_SHA256: "d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea"
-      run: |
+      # $dest is built from RUNNER_TEMP and the pinned ZIG_VERSION (no untrusted
+      # input), so an attacker cannot influence this GITHUB_PATH write. cargo-zigbuild
+      # runs `zig` via a PATH lookup, and GITHUB_PATH is the sanctioned way to extend
+      # PATH across steps.
+      run: | # zizmor: ignore[github-env]
         set -euo pipefail
         tarball="${RUNNER_TEMP}/zig-${ZIG_VERSION}.tar.xz"
         curl --fail --show-error --silent --location --retry 3 --output "${tarball}" "${ZIG_URL}"
