@@ -1,0 +1,39 @@
+name: Set up Zig (pinned)
+description: >-
+  Download a pinned Zig toolchain for x86_64 Linux, verify it by SHA-256, and put
+  it on PATH. Replaces mlugg/setup-zig (which still declares runs.using node20)
+  with a self-managed install under our own version control.
+
+runs:
+  using: composite
+  steps:
+    - name: Download and verify Zig
+      shell: bash
+      env:
+        # ZIG_VERSION is bumped by Renovate (custom manager, github-releases
+        # ziglang/zig). ZIG_URL and ZIG_SHA256 are derived from it and refreshed
+        # together in-branch by the postUpgradeTask `scripts/update_zig_pin.py --fix`,
+        # so version, URL, and digest land in one commit. The URL is pinned rather
+        # than templated because Zig changed its tarball filename convention at 0.14
+        # (`zig-linux-x86_64-…` to `zig-x86_64-linux-…`). The `sha256sum --check`
+        # below is the fail-closed backstop if the task cannot run.
+        # renovate: datasource=github-releases depName=ziglang/zig versioning=semver
+        ZIG_VERSION: "0.13.0"
+        ZIG_URL: "https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz"
+        ZIG_SHA256: "d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea"
+      # $dest is built from RUNNER_TEMP and the pinned ZIG_VERSION (no untrusted
+      # input), so an attacker cannot influence this GITHUB_PATH write. cargo-zigbuild
+      # runs `zig` via a PATH lookup, and GITHUB_PATH is the sanctioned way to extend
+      # PATH across steps.
+      run: | # zizmor: ignore[github-env]
+        set -euo pipefail
+        tarball="${RUNNER_TEMP}/zig-${ZIG_VERSION}.tar.xz"
+        curl --fail --show-error --silent --location --retry 3 --output "${tarball}" "${ZIG_URL}"
+        # Fail before extracting if the download does not match the pinned digest.
+        echo "${ZIG_SHA256}  ${tarball}" | sha256sum --check --strict -
+        dest="${RUNNER_TEMP}/zig-${ZIG_VERSION}"
+        mkdir -p "${dest}"
+        tar -xJf "${tarball}" -C "${dest}" --strip-components=1
+        # GITHUB_PATH applies to later steps; call the binary directly to prove it runs.
+        echo "${dest}" >> "${GITHUB_PATH}"
+        "${dest}/zig" version

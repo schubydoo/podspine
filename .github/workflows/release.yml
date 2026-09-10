@@ -81,16 +81,13 @@ jobs:
           cache: false
           rustflags: ""
       # zig is the cross linker for the musl targets only (incl. rusqlite's bundled
-      # SQLite C). mlugg/setup-zig is the maintained successor to the abandoned
-      # goto-bus-stop/setup-zig.
+      # SQLite C). Installed from a pinned, checksum-verified tarball by the local
+      # ./.github/actions/setup-zig composite action, not mlugg/setup-zig (which
+      # still declares runs.using node20). No Actions cache in this signed-release
+      # build: the manual install fetches fresh, so there is no cache-poisoning vector.
       - if: matrix.build == 'zig'
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-        with:
-          version: 0.13.0
-          # No Actions cache in this signed-release build: it's tag-triggered (rare),
-          # and caching in an artifact-publishing workflow is a cache-poisoning vector
-          # (zizmor cache-poisoning).
-          use-cache: false
+        name: Set up Zig
+        uses: $/.github/actions/setup-zig
       - if: matrix.build == 'zig'
         name: Install cargo-zigbuild
         run: cargo install cargo-zigbuild --locked
