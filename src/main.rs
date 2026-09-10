@@ -11,16 +11,22 @@ use podspine_config::Config;
 use podspine_http::{AppState, serve};
 use podspine_index::Index;
 use podspine_scanner::{ScanOptions, spawn_library_watcher};
+use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
-
+    // Resolve configuration first, then build the log subscriber from it. The
+    // config crate emits no tracing during load, and a fatal config error
+    // prints through `anyhow` on exit, so nothing is lost by initializing the
+    // subscriber here rather than before the load.
     let config = Config::load().context("resolving configuration")?;
+
+    let (filter, level_warning) =
+        resolve_log_filter(std::env::var("RUST_LOG").ok().as_deref(), &config.log_level);
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+    if let Some(message) = level_warning {
+        tracing::warn!("{message}");
+    }
 
     // Install the recorder (and bind its listener) before the first
     // reconcile, so that the startup ingest is measured, not silently
@@ -98,4 +104,51 @@ async fn main() -> Result<()> {
 
     serve(config.bind, state).await.context("serving")?;
     Ok(())
+}
+
+/// Choose the tracing filter: `RUST_LOG` when it is set and valid, otherwise
+/// the configured level, otherwise `info`.
+///
+/// `RUST_LOG` stays the standard per-module escape hatch and wins whenever it
+/// parses. When it is unset (or itself invalid), the configured `log_level`
+/// applies. An unparsable configured level falls back to `info` and returns a
+/// warning message, so a typo degrades logging instead of aborting startup.
+fn resolve_log_filter(rust_log: Option<&str>, configured: &str) -> (EnvFilter, Option<String>) {
+    if let Some(directives) = rust_log
+        && let Ok(filter) = EnvFilter::try_new(directives)
+    {
+        return (filter, None);
+    }
+    match EnvFilter::try_new(configured) {
+        Ok(filter) => (filter, None),
+        Err(err) => (
+            EnvFilter::new("info"),
+            Some(format!(
+                "invalid log level {configured:?}: {err}; falling back to \"info\""
+            )),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_level_applies_when_rust_log_unset() {
+        let (_filter, warning) = resolve_log_filter(None, "debug");
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn rust_log_wins_over_the_configured_level() {
+        let (_filter, warning) = resolve_log_filter(Some("trace"), "info");
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn invalid_configured_level_warns_and_falls_back() {
+        let (_filter, warning) = resolve_log_filter(None, "podspine=chatty");
+        assert!(warning.is_some());
+    }
 }

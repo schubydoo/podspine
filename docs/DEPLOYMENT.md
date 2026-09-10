@@ -30,6 +30,7 @@ that precedence. The library path is the only required input.
 | `--remux-non-faststart` | `PODSPINE_REMUX_NON_FASTSTART` | off | Remux a non-faststart whole-file mp4 to faststart on demand (cache-managed). See below. |
 | `--transcode` | `PODSPINE_TRANSCODE` | `off` | Re-encode sources podcatchers can't play (FLAC/Ogg/Opus/ALAC) to `aac` or `mp3`. MP3/AAC sources are never re-encoded. See below. |
 | `--metrics-bind` | `PODSPINE_METRICS_BIND` | off | Serve Prometheus metrics on this *separate* address (`127.0.0.1:9090`). See below. |
+| `--log-level` | `PODSPINE_LOG_LEVEL` | `info` | Log verbosity (`error`, `warn`, `info`, `debug`, `trace`). `RUST_LOG` overrides it and also takes per-module directives (`podspine_scanner=debug`). |
 | `--config` | `PODSPINE_CONFIG` | none | Path to a TOML config file. |
 
 > **`PODSPINE_BASE_URL` is the one that bites people.** Feed and enclosure (audio)
