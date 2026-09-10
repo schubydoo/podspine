@@ -1149,6 +1149,12 @@ that precedence. The library path is the only required input.</p>
 <td>Serve Prometheus metrics on this <em>separate</em> address (<code>127.0.0.1:9090</code>). See below.</td>
 </tr>
 <tr>
+<td><code>--log-level</code></td>
+<td><code>PODSPINE_LOG_LEVEL</code></td>
+<td><code>info</code></td>
+<td>Log verbosity: a level (<code>error</code>, <code>warn</code>, <code>info</code>, <code>debug</code>, <code>trace</code>) or a per-module directive (<code>podspine_scanner=debug</code>). <code>RUST_LOG</code> overrides it when set. An unrecognized value falls back to <code>info</code> with a warning.</td>
+</tr>
+<tr>
 <td><code>--config</code></td>
 <td><code>PODSPINE_CONFIG</code></td>
 <td>none</td>
