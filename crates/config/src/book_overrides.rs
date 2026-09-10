@@ -54,6 +54,7 @@ pub struct BookOverrides {
     config: Option<toml::Value>,
     cache_size: Option<toml::Value>,
     cache_ttl: Option<toml::Value>,
+    metrics_bind: Option<toml::Value>,
     // Server-global: the transcode decision comes from the source codec, so a
     // per-book value would buy nothing — accept it and warn (Task 5.2).
     transcode: Option<toml::Value>,
@@ -73,6 +74,7 @@ impl BookOverrides {
             ("config", self.config.is_some()),
             ("cache_size", self.cache_size.is_some()),
             ("cache_ttl", self.cache_ttl.is_some()),
+            ("metrics_bind", self.metrics_bind.is_some()),
             ("transcode", self.transcode.is_some()),
             ("log_level", self.log_level.is_some()),
         ]
@@ -182,7 +184,7 @@ mod tests {
         std::fs::write(&audio, b"x").unwrap();
         std::fs::write(
             lib.join("Book.podspine.toml"),
-            b"storage_mode = \"saver\"\nforce_embedded_chapters = true\ntitle = \"Fixed Title\"\ndisabled = false\nbind = \"0.0.0.0:9\"\ncache_size = \"1GB\"\ntranscode = \"aac\"\nlog_level = \"debug\"\n",
+            b"storage_mode = \"saver\"\nforce_embedded_chapters = true\ntitle = \"Fixed Title\"\ndisabled = false\nbind = \"0.0.0.0:9\"\ncache_size = \"1GB\"\ntranscode = \"aac\"\nlog_level = \"debug\"\nmetrics_bind = \"127.0.0.1:9\"\n",
         )
         .unwrap();
 
@@ -198,7 +200,13 @@ mod tests {
         // dropped, and — crucially — doesn't invalidate the whole sidecar.
         assert_eq!(
             ignored,
-            vec!["bind", "cache_size", "log_level", "transcode"]
+            vec![
+                "bind",
+                "cache_size",
+                "log_level",
+                "metrics_bind",
+                "transcode"
+            ]
         );
         let _ = std::fs::remove_dir_all(&lib);
     }
