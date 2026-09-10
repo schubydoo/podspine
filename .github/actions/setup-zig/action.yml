@@ -1,0 +1,30 @@
+name: Set up Zig (pinned)
+description: >-
+  Download a pinned Zig toolchain for x86_64 Linux, verify it by SHA-256, and put
+  it on PATH. Replaces mlugg/setup-zig (which still declares runs.using node20)
+  with a self-managed install under our own version control.
+
+runs:
+  using: composite
+  steps:
+    - name: Download and verify Zig
+      shell: bash
+      env:
+        # Bump both values together. Get the SHA-256 for a version from
+        # https://ziglang.org/download/index.json (the "x86_64-linux".shasum field).
+        # Renovate does not track a step env var, so bump this by hand.
+        ZIG_VERSION: "0.13.0"
+        ZIG_SHA256: "d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea"
+      run: |
+        set -euo pipefail
+        url="https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz"
+        tarball="${RUNNER_TEMP}/zig-${ZIG_VERSION}.tar.xz"
+        curl --fail --show-error --silent --location --retry 3 --output "${tarball}" "${url}"
+        # Fail before extracting if the download does not match the pinned digest.
+        echo "${ZIG_SHA256}  ${tarball}" | sha256sum --check --strict -
+        dest="${RUNNER_TEMP}/zig-${ZIG_VERSION}"
+        mkdir -p "${dest}"
+        tar -xJf "${tarball}" -C "${dest}" --strip-components=1
+        # GITHUB_PATH applies to later steps; call the binary directly to prove it runs.
+        echo "${dest}" >> "${GITHUB_PATH}"
+        "${dest}/zig" version

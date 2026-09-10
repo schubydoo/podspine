@@ -66,12 +66,12 @@ jobs:
           cache: false
           rustflags: ""
       # zig is the cross linker for the musl targets (incl. rusqlite's bundled
-      # SQLite C). No Actions cache: caching in an artifact-publishing workflow is a
-      # cache-poisoning vector (zizmor cache-poisoning), matching release.yml.
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-        with:
-          version: 0.13.0
-          use-cache: false
+      # SQLite C). Installed from a pinned, checksum-verified tarball by the local
+      # ./.github/actions/setup-zig composite action, not mlugg/setup-zig (which
+      # still declares runs.using node20). The manual install fetches fresh, so there
+      # is no Actions cache and no cache-poisoning vector, matching release.yml.
+      - name: Set up Zig
+        uses: ./.github/actions/setup-zig
       - name: Install cargo-zigbuild
         run: cargo install cargo-zigbuild --locked
       - name: Build (musl via zig)
