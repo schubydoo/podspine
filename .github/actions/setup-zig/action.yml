@@ -10,16 +10,21 @@ runs:
     - name: Download and verify Zig
       shell: bash
       env:
-        # Bump both values together. Get the SHA-256 for a version from
-        # https://ziglang.org/download/index.json (the "x86_64-linux".shasum field).
-        # Renovate does not track a step env var, so bump this by hand.
+        # ZIG_VERSION is bumped by Renovate (custom manager, github-releases
+        # ziglang/zig). ZIG_URL and ZIG_SHA256 are derived from it and refreshed
+        # together in-branch by the postUpgradeTask `scripts/update_zig_pin.py --fix`,
+        # so version, URL, and digest land in one commit. The URL is pinned rather
+        # than templated because Zig changed its tarball filename convention at 0.14
+        # (`zig-linux-x86_64-…` to `zig-x86_64-linux-…`). The `sha256sum --check`
+        # below is the fail-closed backstop if the task cannot run.
+        # renovate: datasource=github-releases depName=ziglang/zig versioning=semver
         ZIG_VERSION: "0.13.0"
+        ZIG_URL: "https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz"
         ZIG_SHA256: "d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea"
       run: |
         set -euo pipefail
-        url="https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz"
         tarball="${RUNNER_TEMP}/zig-${ZIG_VERSION}.tar.xz"
-        curl --fail --show-error --silent --location --retry 3 --output "${tarball}" "${url}"
+        curl --fail --show-error --silent --location --retry 3 --output "${tarball}" "${ZIG_URL}"
         # Fail before extracting if the download does not match the pinned digest.
         echo "${ZIG_SHA256}  ${tarball}" | sha256sum --check --strict -
         dest="${RUNNER_TEMP}/zig-${ZIG_VERSION}"
