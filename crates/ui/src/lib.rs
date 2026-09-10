@@ -80,7 +80,10 @@ const STYLE: &str = r#"
         --danger:#f87171; }
 }
 * { box-sizing:border-box; }
-body { margin:0; font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+/* A column that fills the viewport so the footer sits at the bottom on a short
+   page instead of floating up under the content. `main` grows to take the slack. */
+body { margin:0; min-height:100dvh; display:flex; flex-direction:column;
+       font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
        color:var(--text); background:var(--bg); }
 a { color:var(--accent); }
 :focus-visible { outline:3px solid var(--accent); outline-offset:2px; border-radius:4px; }
@@ -99,7 +102,7 @@ footer.site { padding:1rem 1.25rem; border-top:1px solid var(--border);
         cursor:pointer; }
 .themepicker button:first-child { border-left:0; }
 .themepicker button[aria-pressed="true"] { background:var(--accent); color:var(--accent-text); }
-main { max-width:960px; margin:0 auto; padding:1.5rem 1.25rem; }
+main { flex:1 0 auto; width:100%; max-width:960px; margin:0 auto; padding:1.5rem 1.25rem; }
 .grid { list-style:none; margin:0; padding:0; display:grid; gap:1.25rem;
         grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); }
 .card a { display:block; text-decoration:none; color:var(--text); }

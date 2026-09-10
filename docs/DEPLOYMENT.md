@@ -37,6 +37,12 @@ that precedence. The library path is the only required input.
 > can't fetch anything. Set it to the LAN IP / hostname (and scheme + port, or the
 > public URL if behind a proxy) that clients actually reach.
 
+### Which version is running?
+
+The running version shows in the footer of every web page, for example `Podspine v1.7.2`.
+Read it to see which build a deployment serves. This matters most with the `:nightly`
+image, whose tag does not change between releases.
+
 ### Storage mode: `full` vs `saver`
 
 > **Disk use — only *chaptered* books materialize under `--data-dir`.** A
