@@ -21,6 +21,8 @@ const DEFAULT_BIND: &str = "0.0.0.0:8080";
 const DEFAULT_DATA_DIR: &str = "./data";
 /// Default `saver`-mode cache cap when unset: 2 GiB.
 const DEFAULT_CACHE_SIZE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Default log verbosity when neither `RUST_LOG` nor a configured level is set.
+const DEFAULT_LOG_LEVEL: &str = "info";
 
 /// How a **chaptered** book's per-chapter episodes are produced and stored.
 /// Whole-file episodes (MP3-folder tracks, chapterless single files) ignore
@@ -181,6 +183,12 @@ pub struct Cli {
     /// loopback or the LAN.
     #[arg(long, env = "PODSPINE_METRICS_BIND")]
     pub metrics_bind: Option<String>,
+    /// Log verbosity used when `RUST_LOG` is unset: `error`, `warn`, `info`,
+    /// `debug`, or `trace` (or any `RUST_LOG`-style directive such as
+    /// `podspine_scanner=debug`). `RUST_LOG` always wins when set. An
+    /// unrecognized value falls back to `info` with a warning.
+    #[arg(long, env = "PODSPINE_LOG_LEVEL")]
+    pub log_level: Option<String>,
     /// Optional TOML config file.
     #[arg(long, env = "PODSPINE_CONFIG")]
     pub config: Option<PathBuf>,
@@ -214,6 +222,8 @@ pub struct FileConfig {
     pub cache_ttl: Option<String>,
     /// Address for the separate Prometheus metrics listener (unset = disabled).
     pub metrics_bind: Option<String>,
+    /// Log verbosity used when `RUST_LOG` is unset (`info` by default).
+    pub log_level: Option<String>,
 }
 
 /// Fully resolved, validated configuration.
@@ -261,6 +271,10 @@ pub struct Config {
     /// no recorder installed). Always a second listener, never `bind`; see the
     /// `Cli::metrics_bind` note on why this surface is kept separate.
     pub metrics_bind: Option<SocketAddr>,
+    /// Log verbosity directive applied when `RUST_LOG` is unset (default
+    /// `info`). `RUST_LOG` always wins; an unrecognized value falls back to
+    /// `info` with a warning when the subscriber is built in `main`.
+    pub log_level: String,
 }
 
 /// Configuration failures: all fatal, all reported at startup.
@@ -433,6 +447,12 @@ impl Config {
             None => None,
         };
 
+        let log_level = cli
+            .log_level
+            .clone()
+            .or_else(|| file.log_level.clone())
+            .unwrap_or_else(|| DEFAULT_LOG_LEVEL.to_string());
+
         Ok(Self {
             library,
             data_dir,
@@ -446,6 +466,7 @@ impl Config {
             cache_size_bytes,
             cache_ttl,
             metrics_bind,
+            log_level,
         })
     }
 
@@ -695,6 +716,27 @@ mod tests {
     }
 
     #[test]
+    fn log_level_resolves_from_cli_over_file_and_defaults_info() {
+        // Unset everywhere gives the default.
+        let c = Config::resolve(&cli(Some("/books")), &FileConfig::default()).unwrap();
+        assert_eq!(c.log_level, "info");
+
+        // The TOML layer supplies it when the CLI does not.
+        let file = FileConfig {
+            log_level: Some("debug".to_string()),
+            ..Default::default()
+        };
+        let c = Config::resolve(&cli(Some("/books")), &file).unwrap();
+        assert_eq!(c.log_level, "debug");
+
+        // CLI wins over the TOML layer.
+        let mut cl = cli(Some("/books"));
+        cl.log_level = Some("warn".to_string());
+        let resolved = Config::resolve(&cl, &file).unwrap();
+        assert_eq!(resolved.log_level, "warn");
+    }
+
+    #[test]
     fn bad_bind_address_is_rejected() {
         let mut c = cli(Some("/books"));
         c.bind = Some("not-an-address".to_string());
@@ -878,6 +920,7 @@ mod tests {
             cache_size_bytes: Some(DEFAULT_CACHE_SIZE_BYTES),
             cache_ttl: None,
             metrics_bind: None,
+            log_level: DEFAULT_LOG_LEVEL.to_string(),
         };
         assert!(matches!(c.validate(), Err(ConfigError::LibraryNotFound(_))));
     }
@@ -899,6 +942,7 @@ mod tests {
             cache_size_bytes: Some(DEFAULT_CACHE_SIZE_BYTES),
             cache_ttl: None,
             metrics_bind: None,
+            log_level: DEFAULT_LOG_LEVEL.to_string(),
         };
         c.validate().unwrap();
         assert!(data.is_dir(), "data dir created");
