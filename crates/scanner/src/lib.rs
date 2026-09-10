@@ -1388,9 +1388,16 @@ fn watch_loop(
     // Block for an event. Then drain the burst until it is quiet for the
     // debounce window. Then reconcile once. `_watcher` stays alive in scope,
     // so `rx` never disconnects and the loop runs for the process lifetime.
-    while rx.recv().is_ok() {
-        while rx.recv_timeout(WATCH_DEBOUNCE).is_ok() {}
-        tracing::info!("library changed — reconciling");
+    while let Ok(first) = rx.recv() {
+        // Name the event that woke the loop, at debug, so a surprise rescan is
+        // explainable. Turn debug on with `--log-level debug` to see it.
+        tracing::debug!(event = %describe_watch_event(&first), "watch event woke the reconcile loop");
+        let mut events = 1usize;
+        while let Ok(next) = rx.recv_timeout(WATCH_DEBOUNCE) {
+            tracing::debug!(event = %describe_watch_event(&next), "coalesced watch event");
+            events += 1;
+        }
+        tracing::info!(events, "library changed — reconciling");
         let s = reconcile(library, data_dir, &index, opts);
         tracing::info!(
             indexed = s.indexed,
@@ -1425,6 +1432,17 @@ fn watch_event_is_relevant(
         .paths
         .iter()
         .any(|p| watch_path_is_relevant(p, library_root, data_dir, data_canon))
+}
+
+/// A short, log-friendly description of a watch event (or watch error): its
+/// kind and the paths it names. Logged at debug when an event triggers a
+/// reconcile, so an operator can answer "why did it scan?". This matters most
+/// when another app shares the library directory and keeps touching files.
+fn describe_watch_event(res: &notify::Result<notify::Event>) -> String {
+    match res {
+        Ok(event) => format!("{:?} {:?}", event.kind, event.paths),
+        Err(err) => format!("watch error: {err}"),
+    }
 }
 
 /// Whether a changed path is a real library source, not something the walk
@@ -4583,6 +4601,27 @@ mod tests {
             attrs: Default::default(),
         };
         assert!(watch_event_is_relevant(&hint, lib, data, None));
+    }
+
+    #[test]
+    fn describe_watch_event_names_kind_and_paths() {
+        use notify::EventKind;
+        use notify::event::ModifyKind;
+        let event = notify::Event {
+            kind: EventKind::Modify(ModifyKind::Any),
+            paths: vec![PathBuf::from("/lib/Author/Title/book.m4b")],
+            attrs: Default::default(),
+        };
+        let d = describe_watch_event(&Ok(event));
+        assert!(d.contains("Modify"), "names the event kind: {d}");
+        assert!(d.contains("book.m4b"), "names the path: {d}");
+    }
+
+    #[test]
+    fn describe_watch_event_reports_a_watch_error() {
+        let d = describe_watch_event(&Err(notify::Error::generic("inotify limit")));
+        assert!(d.contains("watch error"), "flags an error: {d}");
+        assert!(d.contains("inotify limit"), "includes the cause: {d}");
     }
 
     #[test]
