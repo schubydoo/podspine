@@ -40,7 +40,7 @@ jobs:
         continue-on-error: true
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ secrets.PODSPINE_CI_APP_ID }}
+          client-id: ${{ secrets.PODSPINE_CI_APP_CLIENT_ID }}
           private-key: ${{ secrets.PODSPINE_CI_APP_PRIVATE_KEY }}
           permission-pull-requests: read
       - uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1

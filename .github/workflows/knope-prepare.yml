@@ -7,7 +7,7 @@ name: Prepare Release
 # gate; the merge triggers knope-release.yml.
 #
 # Gated on the `KNOPE_ENABLED` repo variable (now 'true'). This needs the
-# `podspine-ci` GitHub App INSTALLED on the repo (PODSPINE_CI_APP_ID /
+# `podspine-ci` GitHub App INSTALLED on the repo (PODSPINE_CI_APP_CLIENT_ID /
 # PODSPINE_CI_APP_PRIVATE_KEY secrets). The App is needed only for
 # release-driving pushes; see the changeset-first ordering below.
 
@@ -59,14 +59,14 @@ jobs:
         if: ${{ steps.changesets.outputs.has == 'true' }}
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ secrets.PODSPINE_CI_APP_ID }}
+          client-id: ${{ secrets.PODSPINE_CI_APP_CLIENT_ID }}
           private-key: ${{ secrets.PODSPINE_CI_APP_PRIVATE_KEY }}
           permission-contents: write
           permission-pull-requests: write
       - name: Verify App token was minted
         if: ${{ steps.changesets.outputs.has == 'true' && steps.app-token.outputs.token == '' }}
         run: |
-          echo "::error::podspine-ci App token mint produced an empty token; check the PODSPINE_CI_APP_ID / PODSPINE_CI_APP_PRIVATE_KEY secrets and the App installation."
+          echo "::error::podspine-ci App token mint produced an empty token; check the PODSPINE_CI_APP_CLIENT_ID / PODSPINE_CI_APP_PRIVATE_KEY secrets and the App installation."
           exit 1
       # Re-checkout with the App token persisted, so that knope's `git push`
       # of the release branch, and the PR it opens, run as the App identity.
