@@ -466,24 +466,22 @@ pub fn scan_book_as(
                 ep.path = book_out.join(name);
             }
         }
-        std::fs::remove_dir_all(&tmp).map_err(|source| ScanError::Io {
-            path: tmp.clone(),
-            source,
-        })?;
+        // Cleanup is best-effort, like the file sweeps below: a failed unlink
+        // logs and continues rather than aborting the ingest (the sizes are
+        // already recorded). A leftover temp dir is cleared by the next scan's
+        // remove_dir_all above.
+        if let Err(err) = std::fs::remove_dir_all(&tmp) {
+            tracing::warn!(error = %err, path = %tmp.display(), "failed to remove the saver temp split dir");
+        }
         // Saver keeps no chapter files. Remove any left at the live paths by a
         // prior full-mode ingest (the post-index sweep keeps them, since their
-        // names match this ingest). Tolerate NotFound: a concurrent cache
-        // eviction may have already removed one, and that is fine.
+        // names match this ingest). NotFound is fine — a concurrent cache
+        // eviction may have already removed one.
         for ep in &eps {
-            match std::fs::remove_file(&ep.path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(source) => {
-                    return Err(ScanError::Io {
-                        path: ep.path.clone(),
-                        source,
-                    });
-                }
+            if let Err(err) = std::fs::remove_file(&ep.path)
+                && err.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(error = %err, path = %ep.path.display(), "failed to remove a stale saver chapter file");
             }
         }
         eps
