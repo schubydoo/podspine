@@ -466,22 +466,30 @@ pub fn scan_book_as(
                 ep.path = book_out.join(name);
             }
         }
-        // Cleanup is best-effort, like the file sweeps below: a failed unlink
-        // logs and continues rather than aborting the ingest (the sizes are
-        // already recorded). A leftover temp dir is cleared by the next scan's
-        // remove_dir_all above.
+        // The temp dir is never served, so its cleanup is best-effort: a failed
+        // unlink logs and continues (a leftover is cleared by the next scan's
+        // remove_dir_all above).
         if let Err(err) = std::fs::remove_dir_all(&tmp) {
             tracing::warn!(error = %err, path = %tmp.display(), "failed to remove the saver temp split dir");
         }
-        // Saver keeps no chapter files. Remove any left at the live paths by a
+        // Saver keeps no chapter files. Remove any left at the LIVE paths by a
         // prior full-mode ingest (the post-index sweep keeps them, since their
-        // names match this ingest). NotFound is fine — a concurrent cache
-        // eviction may have already removed one.
+        // names match this ingest). This MUST succeed before the new metadata is
+        // committed: a stale file left at the serve path would be served with the
+        // newly measured `enclosure length` — a length-vs-bytes mismatch. So a
+        // non-NotFound error ABORTS the ingest, leaving the old row and old file
+        // in sync. NotFound is fine: a concurrent cache eviction may have removed
+        // it already.
         for ep in &eps {
-            if let Err(err) = std::fs::remove_file(&ep.path)
-                && err.kind() != std::io::ErrorKind::NotFound
-            {
-                tracing::warn!(error = %err, path = %ep.path.display(), "failed to remove a stale saver chapter file");
+            match std::fs::remove_file(&ep.path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(ScanError::Io {
+                        path: ep.path.clone(),
+                        source,
+                    });
+                }
             }
         }
         eps
@@ -2448,6 +2456,66 @@ mod tests {
         assert!(
             eps2.iter().all(|e| !Path::new(&e.file_path).exists()),
             "saver re-split leaves no files on disk"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stale live chapter file that cannot be removed must ABORT the saver
+    /// re-ingest, not log-and-commit: committing the freshly measured
+    /// `enclosure length` while an old file stays at the serve path would serve
+    /// mismatched bytes. A `NotFound` error is tolerated; any other is fatal.
+    #[test]
+    fn saver_reingest_aborts_when_a_stale_live_chapter_cannot_be_removed() {
+        skip_unless_ffmpeg!();
+        let dir = scratch("saver-stale-abort");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = synth(&dir, true);
+        let data = dir.join("data");
+        let index = Index::open_in_memory().unwrap();
+
+        // Full-mode ingest first: chapter files land on disk under books/<id>.
+        let book = scan_book_as(
+            &input,
+            "stale",
+            &data,
+            &index,
+            ScanOptions::default(),
+            &podspine_config::BookOverrides::default(),
+        )
+        .unwrap();
+
+        // Turn the first live chapter file into a DIRECTORY, so a saver
+        // re-ingest's `remove_file` at that path fails with a non-NotFound error.
+        let first = index.episodes_for_book(&book.id).unwrap()[0]
+            .file_path
+            .clone();
+        std::fs::remove_file(&first).unwrap();
+        std::fs::create_dir_all(&first).unwrap();
+
+        // Bump the source mtime so the saver re-scan re-ingests instead of taking
+        // the idempotent early return.
+        let f = std::fs::File::options().write(true).open(&input).unwrap();
+        f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+            .unwrap();
+        drop(f);
+
+        // The unremovable stale live file must abort the saver re-ingest.
+        let res = scan_book_as(
+            &input,
+            "stale",
+            &data,
+            &index,
+            ScanOptions {
+                storage: StorageMode::Saver,
+                ..Default::default()
+            },
+            &podspine_config::BookOverrides::default(),
+        );
+        assert!(
+            matches!(res, Err(ScanError::Io { .. })),
+            "an unremovable stale live chapter aborts the ingest: {res:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
