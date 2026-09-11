@@ -579,6 +579,17 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#first-scan-profile-large-library" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        First-scan profile (large library)
+      
+    </span>
+  </a>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -752,6 +763,17 @@
         
       </ul>
     </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#first-scan-profile-large-library" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        First-scan profile (large library)
+      
+    </span>
+  </a>
   
 </li>
       
@@ -956,6 +978,83 @@ startup cost it is pessimistic, but if a real 10h chaptered book on your disk
 still lands near the 2-minute ceiling, that is the signal that on-the-fly
 byte-range chapter serving (no split files at all) is worth the complexity —
 otherwise premature.</p>
+<h2 id="first-scan-profile-large-library">First-scan profile (large library)<a class="headerlink" href="#first-scan-profile-large-library" title="Permanent link">&para;</a></h2>
+<p><code>scripts/bench.sh</code> times one book. <code>scripts/bench-scan.sh</code> profiles the first
+scan of a LARGE library and shows how it scales.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>scripts/bench-scan.sh
+</code></pre></div>
+<p>The harness builds one synthetic chaptered <code>.m4a</code>. It copies that file into
+<code>BOOKS</code> book folders. Distinct paths scan as distinct books, so the copies still
+count as separate books. The harness then boots <code>podspine</code> with per-stage timing
+on, waits for every book to appear on the grid, and prints a breakdown.</p>
+<p>The per-stage numbers come from the scanner debug logs (target
+<code>podspine::scan_timing</code>). The harness turns them on through <code>RUST_LOG</code>. These
+logs are silent at the default level, so the run measures the real scan with no
+behavior change.</p>
+<p>Knobs (all optional env vars):</p>
+<table>
+<thead>
+<tr>
+<th>Var</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>BOOKS</code></td>
+<td><code>200</code></td>
+<td>Number of books in the library</td>
+</tr>
+<tr>
+<td><code>CHAPTERS</code></td>
+<td><code>8</code></td>
+<td>Chapters per book</td>
+</tr>
+<tr>
+<td><code>DURATION_SEC</code></td>
+<td><code>300</code></td>
+<td>Per-book length in seconds</td>
+</tr>
+<tr>
+<td><code>STORAGE_MODE</code></td>
+<td><code>full</code></td>
+<td><code>full</code> or <code>saver</code></td>
+</tr>
+<tr>
+<td><code>TIMEOUT_SEC</code></td>
+<td><code>1800</code></td>
+<td>Seconds to wait for every book to index</td>
+</tr>
+<tr>
+<td><code>PORT</code></td>
+<td><code>18081</code></td>
+<td>Loopback port to bind</td>
+</tr>
+<tr>
+<td><code>KEEP</code></td>
+<td>unset</td>
+<td>Keep the temp work dir for inspection</td>
+</tr>
+</tbody>
+</table>
+<p>Raise <code>TIMEOUT_SEC</code> for a large <code>BOOKS</code> run whose scan runs longer than the
+default 30 minutes.</p>
+<p>For each stage (probe, resolve, split, cover, index) the report prints the total
+seconds across all books, the call count, and the mean per book. It also prints
+three summary lines:</p>
+<ul>
+<li><code>scan_total</code>: the scanner's own wall-clock for the whole scan.</li>
+<li><code>book_total</code>: the sum of every book's ingest time.</li>
+<li>The ratio <code>book_total / scan_total</code>: the effective parallelism during the scan.</li>
+</ul>
+<p>Read the ratio against the core count. A ratio near <code>1.0</code> means the scan ran one
+book at a time and the other cores sat idle. That idle time is the headroom for
+cross-book parallelism. A large per-stage total, for example split or probe,
+names the stage to target first.</p>
+<p>The harness reuses <code>target/release/podspine</code>. To measure a code change, rebuild
+first with <code>cargo build --release</code>, or delete the binary so the harness rebuilds
+it.</p>
 <p>The optional <code>/metrics</code> endpoint (Prometheus counters/histograms, enabled with
 <code>--metrics-bind</code> on its own listener) is intentionally not part of this harness —
 the harness measures the serving path, not the exporter.</p>
