@@ -552,6 +552,15 @@ pub fn scan_book_as(
             pubdate_epoch: pubdate_epoch(source_mtime, ep.idx, n),
         })?;
     }
+    // Drop any episode rows this ingest did not write: a re-ingest whose chapter
+    // list shrank, or whose mtime change reassigned every guid. Done AFTER the
+    // upserts, so the feed never sees an empty set (same order rule as the file
+    // sweep below).
+    let keep: Vec<String> = episodes
+        .iter()
+        .map(|ep| episode_guid(&id, ep.idx, source_mtime))
+        .collect();
+    index.retain_episodes(&id, &keep)?;
 
     // Sweep leftovers only now, AFTER the index points at this ingest's
     // episodes. Until that upsert lands, the server still serves the old files,
@@ -583,45 +592,57 @@ pub fn scan_book_as(
         // therefore dead weight.
         remove_stale_episode_copies(&book_out);
     } else {
-        remove_episode_files_in_other_containers(&book_out, out_ext);
+        // Keep only the files this ingest wrote; drop old-container leftovers
+        // and files for chapters a shrunk re-ingest dropped.
+        let keep_files: std::collections::HashSet<String> = episodes
+            .iter()
+            .filter_map(|ep| {
+                ep.path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        remove_unreferenced_episode_files(&book_out, &keep_files);
     }
 
     Ok(book)
 }
 
-/// Remove episode files under `book_out` that this ingest will **not**
-/// overwrite: leftovers in a container that the book no longer uses.
+/// Remove numbered episode files under `book_out` that this ingest did **not**
+/// produce. `keep` is the set of file names the current ingest wrote; any other
+/// numbered episode file is unreferenced from the moment the index points at
+/// the new set.
 ///
-/// A switch between stream copy and a transcode target (Task 5.2), or between
-/// the AAC and MP3 targets, changes the episode extension: `001.flac` becomes
-/// `001.m4a`. The index points at the new path, so the old files are
-/// unreferenced from that moment on. Nothing else reclaims them: the cache
-/// eviction only touches regenerable (`saver`, stream-copied) books, and a
-/// transcoded book is never regenerable. Left in place, the old files cost a
-/// full extra copy of the audiobook per mode change.
+/// This reclaims two kinds of leftover. A switch between stream copy and a
+/// transcode target (Task 5.2), or between the AAC and MP3 targets, changes the
+/// episode extension (`001.flac` becomes `001.m4a`), so the old-container files
+/// fall out of `keep`. And a re-ingest whose chapter list shrank leaves the
+/// higher-numbered files (`006.m4a` and up) out of `keep`. Nothing else
+/// reclaims either: the cache eviction only touches regenerable (`saver`,
+/// stream-copied) books, and in `full` mode the files persist. Left in place,
+/// they cost a full extra copy of the dropped audio.
 ///
 /// This sweep only considers numbered episode files (`NNN.<ext>`) and their
-/// `NNN.part.<ext>` temporaries, so it never touches an extracted `cover.*`.
-/// It leaves files already in `keep_ext` for the ingest to overwrite. It is
-/// best-effort: it logs a missing directory or a failed unlink, and neither is
-/// fatal.
-fn remove_episode_files_in_other_containers(book_out: &Path, keep_ext: &str) {
+/// `NNN.part.<ext>` temporaries, so it never touches an extracted `cover.*`. It
+/// is best-effort: it logs a missing directory or a failed unlink, and neither
+/// is fatal.
+fn remove_unreferenced_episode_files(book_out: &Path, keep: &std::collections::HashSet<String>) {
     let Ok(entries) = std::fs::read_dir(book_out) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
-            continue;
-        };
-        if ext.eq_ignore_ascii_case(keep_ext) {
-            continue;
-        }
-        if is_episode_stem(&path)
+        let kept = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| keep.contains(n));
+        if !kept
+            && is_episode_stem(&path)
             && path.is_file()
             && let Err(err) = std::fs::remove_file(&path)
         {
-            tracing::warn!(error = %err, path = %path.display(), "failed to remove an episode file from a previous container");
+            tracing::warn!(error = %err, path = %path.display(), "failed to remove an unreferenced episode file");
         }
     }
 }
@@ -814,6 +835,13 @@ fn scan_mp3_folder(
             pubdate_epoch: pubdate_epoch(source_mtime, idx, n),
         })?;
     }
+    // Prune episode rows this ingest did not write (a folder that lost tracks, or
+    // an mtime change that reassigned guids). AFTER the upserts, so the feed
+    // never sees an empty set.
+    let keep: Vec<String> = (0..n)
+        .map(|idx| episode_guid(id, idx, source_mtime))
+        .collect();
+    index.retain_episodes(id, &keep)?;
 
     Ok(book)
 }
@@ -1264,6 +1292,19 @@ pub fn reconcile(library: &Path, data_dir: &Path, index: &Index, opts: ScanOptio
 /// stop.
 const WATCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// A wake-up for the reconcile loop. The watcher is the single reconciler (the
+/// only index writer), so a manual re-ingest cannot run its own reconcile; it
+/// invalidates the book in the index, then sends [`WatchSignal::Reconcile`] here
+/// so the one loop picks it up. Filesystem changes arrive as
+/// [`WatchSignal::Event`].
+pub enum WatchSignal {
+    /// A filesystem watch event (or a watch error), forwarded from `notify`.
+    Event(notify::Result<notify::Event>),
+    /// A manual reconcile request, e.g. the per-book Refresh button after it
+    /// invalidates a book's stored source mtime.
+    Reconcile,
+}
+
 /// Spawn a background thread that establishes the library watch, runs the
 /// **initial** reconcile, and then runs [`reconcile`] again whenever the
 /// library changes (debounced). The thread opens its **own** index connection
@@ -1287,10 +1328,20 @@ pub fn spawn_library_watcher(
     data_dir: PathBuf,
     db_path: PathBuf,
     opts: ScanOptions,
+    watch_tx: std::sync::mpsc::Sender<WatchSignal>,
+    watch_rx: std::sync::mpsc::Receiver<WatchSignal>,
     on_initial_scan: impl FnOnce() + Send + 'static,
 ) {
     std::thread::spawn(move || {
-        if let Err(err) = watch_loop(&library, &data_dir, &db_path, opts, on_initial_scan) {
+        if let Err(err) = watch_loop(
+            &library,
+            &data_dir,
+            &db_path,
+            opts,
+            watch_tx,
+            watch_rx,
+            on_initial_scan,
+        ) {
             tracing::error!(error = %err, "library watcher stopped — auto-refresh disabled");
         }
     });
@@ -1301,6 +1352,8 @@ fn watch_loop(
     data_dir: &Path,
     db_path: &Path,
     opts: ScanOptions,
+    watch_tx: std::sync::mpsc::Sender<WatchSignal>,
+    watch_rx: std::sync::mpsc::Receiver<WatchSignal>,
     on_initial_scan: impl FnOnce(),
 ) -> Result<(), Box<dyn std::error::Error>> {
     use notify::{RecursiveMode, Watcher};
@@ -1316,7 +1369,6 @@ fn watch_loop(
         }
     };
 
-    let (tx, rx) = std::sync::mpsc::channel();
     // Filter events at the source, so that an unrelated write cannot spin the
     // watcher into a rescan-every-few-seconds loop. Ignore three groups:
     // - reads (another app that streams the files bumps atime but changes
@@ -1347,7 +1399,7 @@ fn watch_loop(
         {
             return;
         }
-        let _ = tx.send(res);
+        let _ = watch_tx.send(WatchSignal::Event(res));
     })
     .and_then(|mut watcher| {
         watcher.watch(library, RecursiveMode::Recursive)?;
@@ -1380,24 +1432,24 @@ fn watch_loop(
     // The first scan is done: the server leaves its "Scanning…" holding state.
     on_initial_scan();
 
-    // If the watch never came up, there is nothing to loop on.
-    let Some(_watcher) = watcher else {
-        return Ok(());
-    };
+    // Keep the watcher alive for the process lifetime if it came up. Loop on
+    // `watch_rx` regardless: a manual reconcile (the Refresh button) still works
+    // even when the fs watch could not start, and the `watch_tx` clone the HTTP
+    // layer holds keeps `watch_rx` connected so the loop never ends.
+    let _watcher = watcher;
 
-    // Block for an event. Then drain the burst until it is quiet for the
-    // debounce window. Then reconcile once. `_watcher` stays alive in scope,
-    // so `rx` never disconnects and the loop runs for the process lifetime.
-    while let Ok(first) = rx.recv() {
-        // Name the event that woke the loop, at debug, so a surprise rescan is
+    // Block for a signal. Then drain the burst until it is quiet for the
+    // debounce window. Then reconcile once.
+    while let Ok(first) = watch_rx.recv() {
+        // Name what woke the loop, at debug, so a surprise rescan is
         // explainable. Turn debug on with `--log-level debug` to see it.
-        tracing::debug!(event = %describe_watch_event(&first), "watch event woke the reconcile loop");
-        let mut events = 1usize;
-        while let Ok(next) = rx.recv_timeout(WATCH_DEBOUNCE) {
-            tracing::debug!(event = %describe_watch_event(&next), "coalesced watch event");
-            events += 1;
+        tracing::debug!(signal = %describe_watch_signal(&first), "reconcile loop woke");
+        let mut signals = 1usize;
+        while let Ok(next) = watch_rx.recv_timeout(WATCH_DEBOUNCE) {
+            tracing::debug!(signal = %describe_watch_signal(&next), "coalesced signal");
+            signals += 1;
         }
-        tracing::info!(events, "library changed — reconciling");
+        tracing::info!(signals, "reconciling the library");
         let s = reconcile(library, data_dir, &index, opts);
         tracing::info!(
             indexed = s.indexed,
@@ -1442,6 +1494,15 @@ fn describe_watch_event(res: &notify::Result<notify::Event>) -> String {
     match res {
         Ok(event) => format!("{:?} {:?}", event.kind, event.paths),
         Err(err) => format!("watch error: {err}"),
+    }
+}
+
+/// A short, log-friendly description of a reconcile-loop wake-up: a filesystem
+/// event (via [`describe_watch_event`]) or a manual reconcile request.
+fn describe_watch_signal(signal: &WatchSignal) -> String {
+    match signal {
+        WatchSignal::Event(res) => describe_watch_event(res),
+        WatchSignal::Reconcile => "manual reconcile request".to_string(),
     }
 }
 
@@ -2606,36 +2667,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A target change rewrites every episode into a new container. The files
-    /// in the old one are unreferenced from that moment, and nothing else
-    /// reclaims them (the cache eviction only touches regenerable books, and a
-    /// transcoded book is never regenerable). So the ingest must sweep them.
+    /// The ingest keeps only the files it wrote. It sweeps a previous
+    /// container's episodes (a transcode-target flip) and files for chapters a
+    /// re-ingest dropped (a shrunk chapter list); nothing else reclaims either.
     #[test]
     fn only_episode_files_and_their_temporaries_are_swept() {
         let dir = scratch("sweep-predicate");
         std::fs::create_dir_all(&dir).unwrap();
         for name in [
-            "001.flac",
-            "002.flac",
-            "003.part.flac",
-            "001.m4a",
+            "001.flac",      // previous container
+            "002.flac",      // previous container
+            "003.part.flac", // previous container temporary
+            "001.m4a",       // current ingest wrote it
+            "002.m4a",       // dropped chapter (a shrunk re-ingest)
             "cover.jpg",
             "notes.txt",
             "NOTES", // no extension at all
         ] {
             std::fs::write(dir.join(name), b"x").unwrap();
         }
-        remove_episode_files_in_other_containers(&dir, "m4a");
+        // This ingest produced only one chapter.
+        let keep: std::collections::HashSet<String> = ["001.m4a".to_string()].into_iter().collect();
+        remove_unreferenced_episode_files(&dir, &keep);
 
         let left = |name: &str| dir.join(name).exists();
-        // The sweep removes the previous container's episodes and temporaries.
+        // The previous container's episodes and temporaries go.
         assert!(!left("001.flac"));
         assert!(!left("002.flac"));
         assert!(!left("003.part.flac"));
-        // The sweep leaves the new container's files for the ingest to
-        // overwrite.
+        // A dropped chapter's file in the CURRENT container also goes.
+        assert!(
+            !left("002.m4a"),
+            "a chapter dropped by a re-ingest is swept"
+        );
+        // The file this ingest wrote stays.
         assert!(left("001.m4a"));
-        // An extracted cover is not an episode file and must survive.
+        // Non-episode files always survive.
         assert!(left("cover.jpg"));
         assert!(left("notes.txt"));
         assert!(left("NOTES"), "a file with no extension is not an episode");
@@ -4317,11 +4384,14 @@ mod tests {
         let db_as_dir = root.join("db-as-dir");
         std::fs::create_dir_all(&db_as_dir).unwrap(); // a directory can't open as SQLite
         let fired = std::cell::Cell::new(false);
+        let (tx, rx) = std::sync::mpsc::channel();
         let res = watch_loop(
             &root,
             &root.join("data"),
             &db_as_dir,
             ScanOptions::default(),
+            tx,
+            rx,
             || fired.set(true),
         );
         assert!(res.is_err(), "the DB failure is surfaced");
@@ -4335,11 +4405,17 @@ mod tests {
         let root = scratch("watch-no-library");
         let missing = root.join("no-such-library");
         let fired = std::cell::Cell::new(false);
+        // Drop our own sender end: when the watch fails, the only other sender
+        // (moved into the watcher's callback) is dropped too, so `watch_rx`
+        // disconnects and the loop exits instead of blocking for a manual signal.
+        let (tx, rx) = std::sync::mpsc::channel();
         let res = watch_loop(
             &missing,
             &root.join("data"),
             &root.join("test.db"),
             ScanOptions::default(),
+            tx,
+            rx,
             || fired.set(true),
         );
         assert!(res.is_ok(), "watch failure is degradation, not an error");
@@ -4487,11 +4563,14 @@ mod tests {
         // Create the schema so the watcher and this test share the WAL db.
         drop(Index::open(&db_path).unwrap());
 
+        let (tx, rx) = std::sync::mpsc::channel();
         spawn_library_watcher(
             root.clone(),
             data.clone(),
             db_path.clone(),
             ScanOptions::default(),
+            tx,
+            rx,
             || {},
         );
         // Let the watcher establish its filesystem watch before the test adds
@@ -4622,6 +4701,12 @@ mod tests {
         let d = describe_watch_event(&Err(notify::Error::generic("inotify limit")));
         assert!(d.contains("watch error"), "flags an error: {d}");
         assert!(d.contains("inotify limit"), "includes the cause: {d}");
+    }
+
+    #[test]
+    fn describe_watch_signal_labels_a_manual_reconcile() {
+        let d = describe_watch_signal(&WatchSignal::Reconcile);
+        assert!(d.contains("manual"), "names the manual request: {d}");
     }
 
     #[test]

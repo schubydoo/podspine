@@ -424,6 +424,47 @@ impl Index {
         let n = self.conn.execute("DELETE FROM book WHERE id = ?1", [id])?;
         Ok(n > 0)
     }
+
+    /// Force the next reconcile to re-ingest this book by setting its stored
+    /// `source_mtime` to a sentinel that no real file mtime can match. The
+    /// re-ingest recomputes the real mtime, so episode `guid`s stay stable and
+    /// the `feed_id` is untouched (unlike a delete + re-add). Returns whether a
+    /// row was updated. Used by the per-book Refresh button.
+    pub fn mark_book_for_reingest(&self, id: &str) -> Result<bool, IndexError> {
+        let n = self
+            .conn
+            .execute("UPDATE book SET source_mtime = -1 WHERE id = ?1", [id])?;
+        Ok(n > 0)
+    }
+
+    /// Delete this book's episode rows whose guid is not in `keep_guids` — the
+    /// set the latest ingest just wrote. This prunes episodes that a re-ingest
+    /// dropped: a shrunk chapter list, or an mtime change that reassigns every
+    /// guid (which would otherwise leave the old rows as duplicates). Returns the
+    /// number of rows removed. Call it AFTER upserting the new episodes, so the
+    /// feed never sees an empty set. An empty `keep_guids` removes every episode
+    /// for the book. Used by the scanner on re-ingest.
+    pub fn retain_episodes(
+        &self,
+        book_id: &str,
+        keep_guids: &[String],
+    ) -> Result<usize, IndexError> {
+        if keep_guids.is_empty() {
+            let n = self
+                .conn
+                .execute("DELETE FROM episode WHERE book_id = ?1", [book_id])?;
+            return Ok(n);
+        }
+        let placeholders = vec!["?"; keep_guids.len()].join(",");
+        let sql = format!("DELETE FROM episode WHERE book_id = ? AND guid NOT IN ({placeholders})");
+        let mut sql_params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(keep_guids.len() + 1);
+        sql_params.push(&book_id);
+        for guid in keep_guids {
+            sql_params.push(guid);
+        }
+        let n = self.conn.execute(&sql, sql_params.as_slice())?;
+        Ok(n)
+    }
 }
 
 /// Add `column` to `table` if it is missing; `ddl` is the type + constraints
@@ -633,6 +674,47 @@ mod tests {
         idx.conn
             .execute("DELETE FROM book WHERE id = 'b1'", [])
             .unwrap();
+        assert!(idx.episodes_for_book("b1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn mark_book_for_reingest_invalidates_the_source_mtime() {
+        let idx = Index::open_in_memory().unwrap();
+        idx.upsert_book(&book("b1", "a-book", "A Book")).unwrap();
+        let feed_id = idx.get_book("b1").unwrap().unwrap().feed_id;
+
+        assert!(
+            idx.mark_book_for_reingest("b1").unwrap(),
+            "a row was updated"
+        );
+        let after = idx.get_book("b1").unwrap().unwrap();
+        assert_eq!(after.source_mtime, -1, "mtime is invalidated");
+        assert_eq!(after.feed_id, feed_id, "the capability id is preserved");
+
+        assert!(
+            !idx.mark_book_for_reingest("nope").unwrap(),
+            "an unknown id updates nothing"
+        );
+    }
+
+    #[test]
+    fn retain_episodes_prunes_rows_not_in_the_keep_set() {
+        let idx = Index::open_in_memory().unwrap();
+        idx.upsert_book(&book("b1", "a-book", "A Book")).unwrap();
+        for i in 0..4 {
+            idx.upsert_episode(&episode("b1", i)).unwrap();
+        }
+        // A re-ingest that now finds only two chapters keeps two guids.
+        let keep = vec!["b1-0".to_string(), "b1-1".to_string()];
+        assert_eq!(idx.retain_episodes("b1", &keep).unwrap(), 2, "two pruned");
+        let eps = idx.episodes_for_book("b1").unwrap();
+        assert_eq!(eps.len(), 2);
+        assert!(
+            eps.iter().all(|e| e.idx < 2),
+            "the phantom chapters are gone"
+        );
+        // An empty keep set removes the remaining rows.
+        assert_eq!(idx.retain_episodes("b1", &[]).unwrap(), 2);
         assert!(idx.episodes_for_book("b1").unwrap().is_empty());
     }
 

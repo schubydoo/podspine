@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
@@ -76,6 +77,7 @@ fn test_state(index: Index, data: &Path, library: &Path) -> AppState {
         StorageMode::Full,
         None,
         None,
+        Arc::new(|| {}),
     )
     .expect("test dirs canonicalize")
 }
@@ -91,6 +93,7 @@ fn saver_state(index: Index, data: &Path, library: &Path) -> AppState {
         StorageMode::Saver,
         None,
         None,
+        Arc::new(|| {}),
     )
     .expect("test dirs canonicalize")
 }
@@ -106,6 +109,7 @@ fn saver_state_capped(index: Index, data: &Path, library: &Path, cap_bytes: u64)
         StorageMode::Saver,
         Some(cap_bytes),
         None,
+        Arc::new(|| {}),
     )
     .expect("test dirs canonicalize")
 }
@@ -126,6 +130,7 @@ fn state_with_default_cover(
         StorageMode::Full,
         None,
         None,
+        Arc::new(|| {}),
     )
     .expect("test dirs canonicalize")
 }
@@ -151,6 +156,7 @@ fn state_construction_fails_when_a_root_is_missing() {
             StorageMode::Full,
             None,
             None,
+            Arc::new(|| {}),
         );
         assert!(state.is_err(), "{what} must fail AppState construction");
     }
@@ -823,6 +829,59 @@ async fn regenerate_rejects_an_invalid_slug() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn refresh_invalidates_the_book_and_requests_a_reconcile() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    // No ffmpeg: the handler only touches the index and the reconcile callback.
+    let dir = scratch("http-refresh");
+    let data = dir.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let db = data.join("test.db"); // file-backed, so the write is visible on reopen
+    let index = Index::open(&db).unwrap();
+    index.upsert_book(&book_row("b1", "CapRefresh")).unwrap();
+
+    let reconciled = Arc::new(AtomicBool::new(false));
+    let flag = reconciled.clone();
+    let state = AppState::new(
+        index,
+        "http://test".to_string(),
+        &data,
+        &dir,
+        None,
+        StorageMode::Full,
+        None,
+        None,
+        Arc::new(move || flag.store(true, Ordering::SeqCst)),
+    )
+    .expect("test dirs canonicalize");
+    let app = router(state);
+
+    // Same-origin (no cross-site header); the slug is `book_row`'s "a-book".
+    let resp = app
+        .oneshot(
+            Request::post("/book/a-book/refresh")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        resp.headers().get(header::LOCATION).unwrap(),
+        "/book/a-book"
+    );
+
+    assert!(
+        reconciled.load(Ordering::SeqCst),
+        "the handler asked the watcher to reconcile"
+    );
+    let after = Index::open(&db).unwrap().get_book("b1").unwrap().unwrap();
+    assert_eq!(
+        after.source_mtime, -1,
+        "the book was invalidated for re-ingest"
+    );
 }
 
 #[tokio::test]
