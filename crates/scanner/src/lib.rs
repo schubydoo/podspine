@@ -592,45 +592,57 @@ pub fn scan_book_as(
         // therefore dead weight.
         remove_stale_episode_copies(&book_out);
     } else {
-        remove_episode_files_in_other_containers(&book_out, out_ext);
+        // Keep only the files this ingest wrote; drop old-container leftovers
+        // and files for chapters a shrunk re-ingest dropped.
+        let keep_files: std::collections::HashSet<String> = episodes
+            .iter()
+            .filter_map(|ep| {
+                ep.path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        remove_unreferenced_episode_files(&book_out, &keep_files);
     }
 
     Ok(book)
 }
 
-/// Remove episode files under `book_out` that this ingest will **not**
-/// overwrite: leftovers in a container that the book no longer uses.
+/// Remove numbered episode files under `book_out` that this ingest did **not**
+/// produce. `keep` is the set of file names the current ingest wrote; any other
+/// numbered episode file is unreferenced from the moment the index points at
+/// the new set.
 ///
-/// A switch between stream copy and a transcode target (Task 5.2), or between
-/// the AAC and MP3 targets, changes the episode extension: `001.flac` becomes
-/// `001.m4a`. The index points at the new path, so the old files are
-/// unreferenced from that moment on. Nothing else reclaims them: the cache
-/// eviction only touches regenerable (`saver`, stream-copied) books, and a
-/// transcoded book is never regenerable. Left in place, the old files cost a
-/// full extra copy of the audiobook per mode change.
+/// This reclaims two kinds of leftover. A switch between stream copy and a
+/// transcode target (Task 5.2), or between the AAC and MP3 targets, changes the
+/// episode extension (`001.flac` becomes `001.m4a`), so the old-container files
+/// fall out of `keep`. And a re-ingest whose chapter list shrank leaves the
+/// higher-numbered files (`006.m4a` and up) out of `keep`. Nothing else
+/// reclaims either: the cache eviction only touches regenerable (`saver`,
+/// stream-copied) books, and in `full` mode the files persist. Left in place,
+/// they cost a full extra copy of the dropped audio.
 ///
 /// This sweep only considers numbered episode files (`NNN.<ext>`) and their
-/// `NNN.part.<ext>` temporaries, so it never touches an extracted `cover.*`.
-/// It leaves files already in `keep_ext` for the ingest to overwrite. It is
-/// best-effort: it logs a missing directory or a failed unlink, and neither is
-/// fatal.
-fn remove_episode_files_in_other_containers(book_out: &Path, keep_ext: &str) {
+/// `NNN.part.<ext>` temporaries, so it never touches an extracted `cover.*`. It
+/// is best-effort: it logs a missing directory or a failed unlink, and neither
+/// is fatal.
+fn remove_unreferenced_episode_files(book_out: &Path, keep: &std::collections::HashSet<String>) {
     let Ok(entries) = std::fs::read_dir(book_out) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
-            continue;
-        };
-        if ext.eq_ignore_ascii_case(keep_ext) {
-            continue;
-        }
-        if is_episode_stem(&path)
+        let kept = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| keep.contains(n));
+        if !kept
+            && is_episode_stem(&path)
             && path.is_file()
             && let Err(err) = std::fs::remove_file(&path)
         {
-            tracing::warn!(error = %err, path = %path.display(), "failed to remove an episode file from a previous container");
+            tracing::warn!(error = %err, path = %path.display(), "failed to remove an unreferenced episode file");
         }
     }
 }
@@ -2655,36 +2667,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A target change rewrites every episode into a new container. The files
-    /// in the old one are unreferenced from that moment, and nothing else
-    /// reclaims them (the cache eviction only touches regenerable books, and a
-    /// transcoded book is never regenerable). So the ingest must sweep them.
+    /// The ingest keeps only the files it wrote. It sweeps a previous
+    /// container's episodes (a transcode-target flip) and files for chapters a
+    /// re-ingest dropped (a shrunk chapter list); nothing else reclaims either.
     #[test]
     fn only_episode_files_and_their_temporaries_are_swept() {
         let dir = scratch("sweep-predicate");
         std::fs::create_dir_all(&dir).unwrap();
         for name in [
-            "001.flac",
-            "002.flac",
-            "003.part.flac",
-            "001.m4a",
+            "001.flac",      // previous container
+            "002.flac",      // previous container
+            "003.part.flac", // previous container temporary
+            "001.m4a",       // current ingest wrote it
+            "002.m4a",       // dropped chapter (a shrunk re-ingest)
             "cover.jpg",
             "notes.txt",
             "NOTES", // no extension at all
         ] {
             std::fs::write(dir.join(name), b"x").unwrap();
         }
-        remove_episode_files_in_other_containers(&dir, "m4a");
+        // This ingest produced only one chapter.
+        let keep: std::collections::HashSet<String> = ["001.m4a".to_string()].into_iter().collect();
+        remove_unreferenced_episode_files(&dir, &keep);
 
         let left = |name: &str| dir.join(name).exists();
-        // The sweep removes the previous container's episodes and temporaries.
+        // The previous container's episodes and temporaries go.
         assert!(!left("001.flac"));
         assert!(!left("002.flac"));
         assert!(!left("003.part.flac"));
-        // The sweep leaves the new container's files for the ingest to
-        // overwrite.
+        // A dropped chapter's file in the CURRENT container also goes.
+        assert!(
+            !left("002.m4a"),
+            "a chapter dropped by a re-ingest is swept"
+        );
+        // The file this ingest wrote stays.
         assert!(left("001.m4a"));
-        // An extracted cover is not an episode file and must survive.
+        // Non-episode files always survive.
         assert!(left("cover.jpg"));
         assert!(left("notes.txt"));
         assert!(left("NOTES"), "a file with no extension is not an episode");
