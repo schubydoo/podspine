@@ -18,9 +18,9 @@ runs:
         # (`zig-linux-x86_64-…` to `zig-x86_64-linux-…`). The `sha256sum --check`
         # below is the fail-closed backstop if the task cannot run.
         # renovate: datasource=github-releases depName=ziglang/zig versioning=semver
-        ZIG_VERSION: "0.13.0"
-        ZIG_URL: "https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz"
-        ZIG_SHA256: "d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea"
+        ZIG_VERSION: "0.15.1"
+        ZIG_URL: "https://ziglang.org/download/0.15.1/zig-x86_64-linux-0.15.1.tar.xz"
+        ZIG_SHA256: "c61c5da6edeea14ca51ecd5e4520c6f4189ef5250383db33d01848293bfafe05"
       # $dest is built from RUNNER_TEMP and the pinned ZIG_VERSION (no untrusted
       # input), so an attacker cannot influence this GITHUB_PATH write. cargo-zigbuild
       # runs `zig` via a PATH lookup, and GITHUB_PATH is the sanctioned way to extend
