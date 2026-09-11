@@ -98,6 +98,53 @@ still lands near the 2-minute ceiling, that is the signal that on-the-fly
 byte-range chapter serving (no split files at all) is worth the complexity —
 otherwise premature.
 
+## First-scan profile (large library)
+
+`scripts/bench.sh` times one book. `scripts/bench-scan.sh` profiles the first
+scan of a LARGE library and shows how it scales.
+
+```sh
+scripts/bench-scan.sh
+```
+
+The harness builds one synthetic chaptered `.m4a`. It copies that file into
+`BOOKS` book folders. Distinct paths scan as distinct books, so the copies still
+count as separate books. The harness then boots `podspine` with per-stage timing
+on, waits for every book to appear on the grid, and prints a breakdown.
+
+The per-stage numbers come from the scanner debug logs (target
+`podspine::scan_timing`). The harness turns them on through `RUST_LOG`. These
+logs are silent at the default level, so the run measures the real scan with no
+behavior change.
+
+Knobs (all optional env vars):
+
+| Var            | Default | Meaning                                   |
+|----------------|---------|-------------------------------------------|
+| `BOOKS`        | `200`   | Number of books in the library            |
+| `CHAPTERS`     | `8`     | Chapters per book                         |
+| `DURATION_SEC` | `300`   | Per-book length in seconds                |
+| `STORAGE_MODE` | `full`  | `full` or `saver`                         |
+| `PORT`         | `18081` | Loopback port to bind                     |
+| `KEEP`         | unset   | Keep the temp work dir for inspection     |
+
+For each stage (probe, resolve, split, cover, index) the report prints the total
+seconds across all books, the call count, and the mean per book. It also prints
+three summary lines:
+
+- `scan_total`: the scanner's own wall-clock for the whole scan.
+- `book_total`: the sum of every book's ingest time.
+- The ratio `book_total / scan_total`: the effective parallelism during the scan.
+
+Read the ratio against the core count. A ratio near `1.0` means the scan ran one
+book at a time and the other cores sat idle. That idle time is the headroom for
+cross-book parallelism. A large per-stage total, for example split or probe,
+names the stage to target first.
+
+The harness reuses `target/release/podspine`. To measure a code change, rebuild
+first with `cargo build --release`, or delete the binary so the harness rebuilds
+it.
+
 The optional `/metrics` endpoint (Prometheus counters/histograms, enabled with
 `--metrics-bind` on its own listener) is intentionally not part of this harness —
 the harness measures the serving path, not the exporter.
