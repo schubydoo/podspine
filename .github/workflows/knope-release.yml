@@ -62,6 +62,7 @@ jobs:
       - name: Install knope
         uses: knope-dev/action@19617851f9f13ab2f27a05989c55efb18aca3675 # v2.1.2
         with:
+          # renovate: datasource=github-releases depName=knope-dev/knope extractVersion=^knope/v(?<version>.+)$
           version: 0.23.0
       # knope creates the GitHub Release + tag as the App token, which
       # triggers release.yml (the signed build). This is a no-op when the
