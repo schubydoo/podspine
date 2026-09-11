@@ -436,6 +436,35 @@ impl Index {
             .execute("UPDATE book SET source_mtime = -1 WHERE id = ?1", [id])?;
         Ok(n > 0)
     }
+
+    /// Delete this book's episode rows whose guid is not in `keep_guids` — the
+    /// set the latest ingest just wrote. This prunes episodes that a re-ingest
+    /// dropped: a shrunk chapter list, or an mtime change that reassigns every
+    /// guid (which would otherwise leave the old rows as duplicates). Returns the
+    /// number of rows removed. Call it AFTER upserting the new episodes, so the
+    /// feed never sees an empty set. An empty `keep_guids` removes every episode
+    /// for the book. Used by the scanner on re-ingest.
+    pub fn retain_episodes(
+        &self,
+        book_id: &str,
+        keep_guids: &[String],
+    ) -> Result<usize, IndexError> {
+        if keep_guids.is_empty() {
+            let n = self
+                .conn
+                .execute("DELETE FROM episode WHERE book_id = ?1", [book_id])?;
+            return Ok(n);
+        }
+        let placeholders = vec!["?"; keep_guids.len()].join(",");
+        let sql = format!("DELETE FROM episode WHERE book_id = ? AND guid NOT IN ({placeholders})");
+        let mut sql_params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(keep_guids.len() + 1);
+        sql_params.push(&book_id);
+        for guid in keep_guids {
+            sql_params.push(guid);
+        }
+        let n = self.conn.execute(&sql, sql_params.as_slice())?;
+        Ok(n)
+    }
 }
 
 /// Add `column` to `table` if it is missing; `ddl` is the type + constraints
@@ -666,6 +695,27 @@ mod tests {
             !idx.mark_book_for_reingest("nope").unwrap(),
             "an unknown id updates nothing"
         );
+    }
+
+    #[test]
+    fn retain_episodes_prunes_rows_not_in_the_keep_set() {
+        let idx = Index::open_in_memory().unwrap();
+        idx.upsert_book(&book("b1", "a-book", "A Book")).unwrap();
+        for i in 0..4 {
+            idx.upsert_episode(&episode("b1", i)).unwrap();
+        }
+        // A re-ingest that now finds only two chapters keeps two guids.
+        let keep = vec!["b1-0".to_string(), "b1-1".to_string()];
+        assert_eq!(idx.retain_episodes("b1", &keep).unwrap(), 2, "two pruned");
+        let eps = idx.episodes_for_book("b1").unwrap();
+        assert_eq!(eps.len(), 2);
+        assert!(
+            eps.iter().all(|e| e.idx < 2),
+            "the phantom chapters are gone"
+        );
+        // An empty keep set removes the remaining rows.
+        assert_eq!(idx.retain_episodes("b1", &[]).unwrap(), 2);
+        assert!(idx.episodes_for_book("b1").unwrap().is_empty());
     }
 
     #[test]

@@ -552,6 +552,15 @@ pub fn scan_book_as(
             pubdate_epoch: pubdate_epoch(source_mtime, ep.idx, n),
         })?;
     }
+    // Drop any episode rows this ingest did not write: a re-ingest whose chapter
+    // list shrank, or whose mtime change reassigned every guid. Done AFTER the
+    // upserts, so the feed never sees an empty set (same order rule as the file
+    // sweep below).
+    let keep: Vec<String> = episodes
+        .iter()
+        .map(|ep| episode_guid(&id, ep.idx, source_mtime))
+        .collect();
+    index.retain_episodes(&id, &keep)?;
 
     // Sweep leftovers only now, AFTER the index points at this ingest's
     // episodes. Until that upsert lands, the server still serves the old files,
@@ -814,6 +823,13 @@ fn scan_mp3_folder(
             pubdate_epoch: pubdate_epoch(source_mtime, idx, n),
         })?;
     }
+    // Prune episode rows this ingest did not write (a folder that lost tracks, or
+    // an mtime change that reassigned guids). AFTER the upserts, so the feed
+    // never sees an empty set.
+    let keep: Vec<String> = (0..n)
+        .map(|idx| episode_guid(id, idx, source_mtime))
+        .collect();
+    index.retain_episodes(id, &keep)?;
 
     Ok(book)
 }
