@@ -191,6 +191,12 @@ pub struct AppState {
     /// `/cover`) return 503 + `Retry-After` instead of a 502 or a bare 404. A
     /// first boot then reads as "starting up", not "broken".
     ready: Arc<AtomicBool>,
+    /// Ask the watcher (the single index writer) to run a reconcile. The
+    /// per-book Refresh handler invalidates a book in the index, then calls
+    /// this so the one loop re-ingests it — HTTP never reconciles itself. The
+    /// binary wires this to a channel send; a test passes a no-op. Kept as an
+    /// opaque callback so this crate does not depend on the scanner.
+    reconcile: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl AppState {
@@ -215,6 +221,7 @@ impl AppState {
         storage: StorageMode,
         cache_size_bytes: Option<u64>,
         cache_ttl: Option<Duration>,
+        reconcile: Arc<dyn Fn() + Send + Sync>,
     ) -> std::io::Result<Self> {
         let data_dir = data_dir.canonicalize().inspect_err(|err| {
             tracing::error!(path = %data_dir.display(), error = %err, "cannot canonicalize the data dir");
@@ -233,6 +240,7 @@ impl AppState {
             cache_ttl,
             inflight: Arc::new(Mutex::new(HashMap::new())),
             ready: Arc::new(AtomicBool::new(true)),
+            reconcile,
         })
     }
 
@@ -273,6 +281,7 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(index))
         .route("/book/{slug}", get(book))
         .route("/book/{slug}/regenerate", post(regenerate))
+        .route("/book/{slug}/refresh", post(refresh))
         .route("/theme/{mode}", post(set_theme))
         .route("/subscribe/{feed_id}", get(subscribe))
         .route("/cover/{feed_id}", get(cover))
@@ -461,6 +470,38 @@ async fn regenerate(
             .regenerate_feed_id(&book.id)
             .map_err(AppError::internal)?;
     }
+    Ok(Redirect::to(&format!("/book/{slug}")))
+}
+
+/// `POST /book/{slug}/refresh` — force a re-ingest of one book (re-probe,
+/// re-split, re-extract cover) to pick up changed metadata or art without
+/// editing the file or restarting. The handler invalidates the book's stored
+/// source mtime, then asks the watcher (the single index writer) to reconcile;
+/// it never reconciles itself. It redirects back to the book page (PRG); the
+/// re-split runs in the background, so a manual page refresh shows the result.
+async fn refresh(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+    headers: HeaderMap,
+) -> Result<Redirect, AppError> {
+    if !same_origin(&headers, &state.base_url) {
+        return Err(AppError::Forbidden);
+    }
+    if !valid_slug(&slug) {
+        return Err(AppError::NotFound);
+    }
+    {
+        let index = state.index.lock().map_err(AppError::internal)?;
+        let book = index
+            .get_book_by_slug(&slug)
+            .map_err(AppError::internal)?
+            .ok_or(AppError::NotFound)?;
+        index
+            .mark_book_for_reingest(&book.id)
+            .map_err(AppError::internal)?;
+    }
+    // Hand the actual re-ingest to the watcher's reconcile loop (single writer).
+    (state.reconcile)();
     Ok(Redirect::to(&format!("/book/{slug}")))
 }
 
@@ -1363,6 +1404,7 @@ mod tests {
             StorageMode::Saver,
             Some(1), // a cap, so eviction doesn't no-op before the fault
             None,
+            Arc::new(|| {}),
         )
         .expect("test dirs canonicalize");
 

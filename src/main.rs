@@ -10,8 +10,9 @@ use anyhow::{Context, Result};
 use podspine_config::Config;
 use podspine_http::{AppState, serve};
 use podspine_index::Index;
-use podspine_scanner::{ScanOptions, spawn_library_watcher};
+use podspine_scanner::{ScanOptions, WatchSignal, spawn_library_watcher};
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
@@ -63,6 +64,21 @@ async fn main() -> Result<()> {
         transcode: config.transcode,
     };
 
+    // The watcher thread owns the single reconcile loop (the only index writer).
+    // The HTTP layer cannot reconcile itself, so the per-book Refresh handler
+    // sends `WatchSignal::Reconcile` down this channel after it invalidates the
+    // book. The sender is behind a mutex because `mpsc::Sender` is not `Sync` and
+    // `AppState` (axum state) must be.
+    let (watch_tx, watch_rx) = std::sync::mpsc::channel::<WatchSignal>();
+    let reconcile: Arc<dyn Fn() + Send + Sync> = {
+        let tx = Mutex::new(watch_tx.clone());
+        Arc::new(move || {
+            if let Ok(tx) = tx.lock() {
+                let _ = tx.send(WatchSignal::Reconcile);
+            }
+        })
+    };
+
     let state = AppState::new(
         index,
         config.base_url.clone(),
@@ -72,6 +88,7 @@ async fn main() -> Result<()> {
         config.storage_mode,
         config.cache_size_bytes,
         config.cache_ttl,
+        reconcile,
     )
     .context("canonicalizing the data dir / library root")?;
 
@@ -98,6 +115,8 @@ async fn main() -> Result<()> {
             config.data_dir.clone(),
             db_path,
             scan_opts,
+            watch_tx,
+            watch_rx,
             move || state.set_ready(true),
         );
     }

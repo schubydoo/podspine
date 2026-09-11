@@ -424,6 +424,18 @@ impl Index {
         let n = self.conn.execute("DELETE FROM book WHERE id = ?1", [id])?;
         Ok(n > 0)
     }
+
+    /// Force the next reconcile to re-ingest this book by setting its stored
+    /// `source_mtime` to a sentinel that no real file mtime can match. The
+    /// re-ingest recomputes the real mtime, so episode `guid`s stay stable and
+    /// the `feed_id` is untouched (unlike a delete + re-add). Returns whether a
+    /// row was updated. Used by the per-book Refresh button.
+    pub fn mark_book_for_reingest(&self, id: &str) -> Result<bool, IndexError> {
+        let n = self
+            .conn
+            .execute("UPDATE book SET source_mtime = -1 WHERE id = ?1", [id])?;
+        Ok(n > 0)
+    }
 }
 
 /// Add `column` to `table` if it is missing; `ddl` is the type + constraints
@@ -634,6 +646,26 @@ mod tests {
             .execute("DELETE FROM book WHERE id = 'b1'", [])
             .unwrap();
         assert!(idx.episodes_for_book("b1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn mark_book_for_reingest_invalidates_the_source_mtime() {
+        let idx = Index::open_in_memory().unwrap();
+        idx.upsert_book(&book("b1", "a-book", "A Book")).unwrap();
+        let feed_id = idx.get_book("b1").unwrap().unwrap().feed_id;
+
+        assert!(
+            idx.mark_book_for_reingest("b1").unwrap(),
+            "a row was updated"
+        );
+        let after = idx.get_book("b1").unwrap().unwrap();
+        assert_eq!(after.source_mtime, -1, "mtime is invalidated");
+        assert_eq!(after.feed_id, feed_id, "the capability id is preserved");
+
+        assert!(
+            !idx.mark_book_for_reingest("nope").unwrap(),
+            "an unknown id updates nothing"
+        );
     }
 
     #[test]

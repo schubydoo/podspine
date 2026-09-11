@@ -406,12 +406,33 @@ pub fn book_page(book: &BookDetail, theme: Theme) -> Markup {
                         }
 
                         (private_panel(&book.slug))
+                        (refresh_panel(&book.slug))
                     }
                 }
             }
             script { (PreEscaped(COPY_JS)) }
         },
     )
+}
+
+/// A per-book "Refresh" control: force a re-ingest to pick up changed metadata,
+/// chapters, or cover art without editing the file or restarting. A plain `POST`
+/// form (no JS), same-origin guarded server-side like the regenerate form. The
+/// re-split runs in the background, so the operator reloads the page to see it.
+fn refresh_panel(slug: &str) -> Markup {
+    html! {
+        section.manual {
+            h2 { "Refresh this book" }
+            p.note {
+                "Re-read this book from its file to pick up changed metadata, chapters, or "
+                "cover art — without editing the file or restarting. A re-split can take a "
+                "moment; reload the page to see the result."
+            }
+            form method="post" action=(format!("/book/{slug}/refresh")) {
+                button.copy type="submit" { "Refresh" }
+            }
+        }
+    }
 }
 
 /// The "private link" controls: regenerate the capability URL (leak recovery).
@@ -760,6 +781,9 @@ mod tests {
         // the action URL).
         assert!(html.contains("action=\"/book/dracula/regenerate\""));
         assert!(html.contains("Regenerate link"));
+        // The Refresh control posts to its own slug-keyed route.
+        assert!(html.contains("action=\"/book/dracula/refresh\""));
+        assert!(html.contains(">Refresh<"));
     }
 
     #[test]
