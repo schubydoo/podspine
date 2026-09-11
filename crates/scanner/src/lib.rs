@@ -1138,6 +1138,12 @@ pub fn scan_library(
     index: &Index,
     opts: ScanOptions,
 ) -> ScanSummary {
+    // Whole-scan wall-clock (debug only). Started FIRST so it includes discovery
+    // and the reuse-map setup below, not just the per-book loop. Compared against
+    // the summed per-book `book_total` by the profiling harness to expose
+    // cross-book serialization.
+    let scan_start = std::time::Instant::now();
+
     // The canonical library root serves two purposes. It resolves per-book
     // `.podspine.toml` sidecars (Sprint 6.4; the match is against each book's
     // canonical source path). And it names books found below the top level.
@@ -1173,9 +1179,6 @@ pub fn scan_library(
 
     let mut seen = HashSet::new();
     let mut summary = ScanSummary::default();
-    // Whole-scan wall-clock (debug only). Compared against the summed per-book
-    // `book_total` by the profiling harness to expose cross-book serialization.
-    let scan_start = std::time::Instant::now();
     for source in sources {
         let source_path = source.path();
         // If this exact source is already indexed, keep its id. That rule

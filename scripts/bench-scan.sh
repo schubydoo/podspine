@@ -20,7 +20,7 @@
 #
 # Usage:
 #   scripts/bench-scan.sh                        # defaults: 200 books, 8 chapters
-#   BOOKS=500 CHAPTERS=20 scripts/bench-scan.sh
+#   BOOKS=500 CHAPTERS=20 TIMEOUT_SEC=3600 scripts/bench-scan.sh
 #   STORAGE_MODE=saver scripts/bench-scan.sh     # measure saver mode
 #   KEEP=1 scripts/bench-scan.sh                 # keep the temp dir + server log
 #
@@ -29,6 +29,7 @@
 #   CHAPTERS      chapters per book                       (default 8)
 #   DURATION_SEC  per-book length in seconds              (default 300)
 #   STORAGE_MODE  full | saver                            (default full)
+#   TIMEOUT_SEC   seconds to wait for the scan to finish  (default 1800)
 #   PORT          loopback port to bind                   (default 18081)
 #   KEEP          non-empty to keep the temp working dir  (default unset)
 set -euo pipefail
@@ -37,6 +38,9 @@ BOOKS="${BOOKS:-200}"
 CHAPTERS="${CHAPTERS:-8}"
 DURATION_SEC="${DURATION_SEC:-300}"
 STORAGE_MODE="${STORAGE_MODE:-full}"
+# A large library can scan for a while. Raise this for a big BOOKS run; the poll
+# below waits up to TIMEOUT_SEC for every book to be indexed.
+TIMEOUT_SEC="${TIMEOUT_SEC:-1800}"
 PORT="${PORT:-18081}"
 BASE="http://127.0.0.1:${PORT}"
 
@@ -124,9 +128,10 @@ PODSPINE_STORAGE_MODE="$STORAGE_MODE" \
   --bind "127.0.0.1:${PORT}" --base-url "$BASE" >"$LOG" 2>&1 &
 SERVER_PID=$!
 
-# Poll the grid until all BOOKS books are indexed (that many /book/ links).
+# Poll the grid until all BOOKS books are indexed (that many /book/ links), up
+# to TIMEOUT_SEC (the poll sleeps 0.2s per iteration, so 5 iterations/second).
 count=0
-for _ in $(seq 1 3000); do
+for _ in $(seq 1 $(( TIMEOUT_SEC * 5 )) ); do
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then
     echo "bench-scan: server exited early; log:" >&2; cat "$LOG" >&2; exit 1
   fi
@@ -139,7 +144,7 @@ for _ in $(seq 1 3000); do
 done
 t_ready=$(now)
 [ "$count" -ge "$BOOKS" ] || {
-  echo "bench-scan: only ${count}/${BOOKS} books indexed before timeout; log tail:" >&2
+  echo "bench-scan: only ${count}/${BOOKS} books indexed within ${TIMEOUT_SEC}s (raise TIMEOUT_SEC); log tail:" >&2
   tail -20 "$LOG" >&2; exit 1
 }
 

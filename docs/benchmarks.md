@@ -125,8 +125,12 @@ Knobs (all optional env vars):
 | `CHAPTERS`     | `8`     | Chapters per book                         |
 | `DURATION_SEC` | `300`   | Per-book length in seconds                |
 | `STORAGE_MODE` | `full`  | `full` or `saver`                         |
+| `TIMEOUT_SEC`  | `1800`  | Seconds to wait for every book to index   |
 | `PORT`         | `18081` | Loopback port to bind                     |
 | `KEEP`         | unset   | Keep the temp work dir for inspection     |
+
+Raise `TIMEOUT_SEC` for a large `BOOKS` run whose scan runs longer than the
+default 30 minutes.
 
 For each stage (probe, resolve, split, cover, index) the report prints the total
 seconds across all books, the call count, and the mean per book. It also prints
