@@ -13,9 +13,9 @@ name: Docs
 # Scorecard). pip caching is deliberately NOT used (a cache-poisoning vector
 # in a publishing workflow; zizmor). The deploy job pushes via an explicit
 # tokened remote, not persisted checkout credentials (zizmor artipacked).
-# Python deps are hash-pinned: docs/requirements.txt is a pip-compile lockfile
+# Python deps are hash-pinned: docs/requirements.txt is a uv-compiled lockfile
 # installed with --require-hashes, so every transitive package is verified
-# (Scorecard Pinned-Dependencies). Bump via docs/requirements.in + pip-compile
+# (Scorecard Pinned-Dependencies). Bump via docs/requirements.in + uv pip compile
 # (Renovate regenerates it).
 
 on:
