@@ -82,7 +82,7 @@ jobs:
       # profile): the only format Codecov's Test Analytics ingests. Prebuilt
       # binary via install-action, which matches the coverage/supply-chain
       # jobs.
-      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
+      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
         with:
           tool: cargo-nextest
       - name: Test (nextest → JUnit)
@@ -137,7 +137,7 @@ jobs:
           rustflags: ""
       - name: Set up ffmpeg
         uses: $/.github/actions/setup-ffmpeg
-      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
+      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
         with:
           tool: cargo-nextest
       # Same nextest → JUnit → Codecov pipeline as the `test` matrix (see there
@@ -176,7 +176,7 @@ jobs:
           # Built-in caching replaces the Swatinem step; rustflags: "" keeps the
           # action from forcing `-D warnings` on the coverage build.
           rustflags: ""
-      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
+      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
         with:
           tool: cargo-llvm-cov
       - name: Set up ffmpeg
@@ -207,7 +207,7 @@ jobs:
       # compiled both tools from source: by far the slowest step in CI.
       # cargo-audit/deny only read Cargo.toml/lock, so no project toolchain is
       # needed (the runner's cargo dispatches the subcommands).
-      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
+      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
         with:
           tool: cargo-audit,cargo-deny
       - name: Audit
