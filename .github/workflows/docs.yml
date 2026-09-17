@@ -40,7 +40,8 @@ permissions:
 
 concurrency:
   # Serialize deploys (they push to gh-pages); do not cancel a push
-  # mid-deploy.
+  # mid-deploy. Deploys from different refs still overlap, so the deploy
+  # step retries a rejected push.
   group: docs-${{ github.ref }}
   cancel-in-progress: false
 
@@ -98,40 +99,65 @@ jobs:
           PROMOTE: ${{ github.event.inputs.promote_to_latest }}
         run: |
           set -euo pipefail
-          if [ -n "${PROMOTE:-}" ]; then
-            # One-time migration / manual re-point: make an already-deployed
-            # release the site default under the `latest` alias. This was used
-            # once for the switch from "latest tracks main" to the
-            # release-default model. It removes the legacy version literally
-            # named `latest` (the old main snapshot), so that `latest` can
-            # become an alias on the release. `|| true` because on a healthy
-            # tree there is no such version to delete.
-            #
-            # Use `mike alias` (NOT `mike deploy`): this only re-points the
-            # alias at an already-published snapshot. `mike deploy $PROMOTE`
-            # would rebuild the docs from the current checkout (main) into the
-            # $PROMOTE dir, and that would clobber the immutable release
-            # snapshot with main's content.
-            case "$PROMOTE" in
-              [0-9]*.[0-9]*) ;;
-              *) echo "::error::promote_to_latest must be an X.Y version (e.g. 1.2)"; exit 1 ;;
-            esac
-            mike delete --push latest 2>/dev/null || true
-            mike alias --push --update-aliases "$PROMOTE" latest
-            mike set-default --push --template mike/redirect.html latest
-          elif [ "$REF_TYPE" = "tag" ]; then
-            # A release vX.Y.Z publishes an immutable "X.Y" snapshot and
-            # moves `latest` (the site default) onto it: the newest release is
-            # what visitors land on. This assumes linear releases (a backport
-            # to an old line would wrongly claim `latest`; re-point manually
-            # via promote_to_latest in that case).
-            version="${REF_NAME#v}"
-            mike deploy --push --update-aliases "${version%.*}" latest
-            mike set-default --push --template mike/redirect.html latest
-          else
-            # A push to main updates the rolling `dev` snapshot. It
-            # deliberately never touches `latest`/default, so unreleased
-            # changes are not what users see by default. Material's
-            # version-warning banner flags `dev` as ahead of the release.
-            mike deploy --push --update-aliases dev
-          fi
+          deploy() {
+            if [ -n "${PROMOTE:-}" ]; then
+              # One-time migration / manual re-point: make an already-deployed
+              # release the site default under the `latest` alias. This was used
+              # once for the switch from "latest tracks main" to the
+              # release-default model. It removes the legacy version literally
+              # named `latest` (the old main snapshot), so that `latest` can
+              # become an alias on the release. `|| true` because on a healthy
+              # tree there is no such version to delete.
+              #
+              # Use `mike alias` (NOT `mike deploy`): this only re-points the
+              # alias at an already-published snapshot. `mike deploy $PROMOTE`
+              # would rebuild the docs from the current checkout (main) into the
+              # $PROMOTE dir, and that would clobber the immutable release
+              # snapshot with main's content.
+              case "$PROMOTE" in
+                [0-9]*.[0-9]*) ;;
+                *) echo "::error::promote_to_latest must be an X.Y version (e.g. 1.2)"; exit 1 ;;
+              esac
+              mike delete --push latest 2>/dev/null || true
+              mike alias --push --update-aliases "$PROMOTE" latest || return 1
+              mike set-default --push --template mike/redirect.html latest || return 1
+            elif [ "$REF_TYPE" = "tag" ]; then
+              # A release vX.Y.Z publishes an immutable "X.Y" snapshot and
+              # moves `latest` (the site default) onto it: the newest release is
+              # what visitors land on. This assumes linear releases (a backport
+              # to an old line would wrongly claim `latest`; re-point manually
+              # via promote_to_latest in that case).
+              version="${REF_NAME#v}"
+              mike deploy --push --update-aliases "${version%.*}" latest || return 1
+              mike set-default --push --template mike/redirect.html latest || return 1
+            else
+              # A push to main updates the rolling `dev` snapshot. It
+              # deliberately never touches `latest`/default, so unreleased
+              # changes are not what users see by default. Material's
+              # version-warning banner flags `dev` as ahead of the release.
+              mike deploy --push --update-aliases dev || return 1
+            fi
+          }
+
+          # A release tag and the push to main deploy at the same time (the
+          # concurrency group is per ref), and both push gh-pages, so the
+          # loser gets `! [rejected] gh-pages -> gh-pages (fetch first)`.
+          # Retry on top of the winner: point the local gh-pages branch back
+          # at the remote, then deploy again. mike rebuilds its own version
+          # directory and merges its entry into the fetched versions.json, so
+          # a repeat is safe and the winner's version survives. Without the
+          # ref reset the retry fails instead with "gh-pages has diverged
+          # from origin/gh-pages", because mike refuses to deploy onto a
+          # diverged local branch. The PROMOTE argument check calls `exit`,
+          # not `return`, so a bad input still fails at once.
+          for attempt in 1 2 3; do
+            if deploy; then
+              exit 0
+            fi
+            echo "::warning::docs deploy attempt ${attempt} was rejected; refreshing gh-pages and retrying"
+            sleep "$(( attempt * 15 ))"
+            git fetch origin gh-pages --depth=1 || true
+            git update-ref refs/heads/gh-pages refs/remotes/origin/gh-pages || true
+          done
+          echo "::error::docs deploy failed after 3 attempts"
+          exit 1
