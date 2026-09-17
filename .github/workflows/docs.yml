@@ -39,8 +39,8 @@ permissions:
   contents: read
 
 concurrency:
-  # Serialize deploys (they push to gh-pages); do not cancel a push
-  # mid-deploy.
+  # One run per ref; do not cancel a push mid-deploy. Deploys need more
+  # than this, so the deploy job below adds a group that spans all refs.
   group: docs-${{ github.ref }}
   cancel-in-progress: false
 
@@ -72,6 +72,12 @@ jobs:
       && (github.ref == 'refs/heads/main' || github.ref_type == 'tag')
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    concurrency:
+      # Every deploy pushes gh-pages, so deploys must serialize across refs
+      # as well: a release tag run and a main push run start at the same
+      # time, and the second push is rejected (fetch first).
+      group: docs-deploy
+      cancel-in-progress: false
     permissions:
       contents: write # mike commits/pushes the built site to gh-pages
     steps:
