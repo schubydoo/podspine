@@ -995,17 +995,15 @@ struct AudioTarget {
 /// The cooldown is server-wide rather than per book, because one reconcile
 /// walks the whole library. A single signal repairs every book that is waiting.
 fn invalidate_for_reingest(state: &AppState, book_id: &str) {
-    match state.index.lock() {
-        Ok(index) => {
-            if let Err(err) = index.mark_book_for_reingest(book_id) {
-                tracing::warn!(book_id, error = %err, "could not mark the book for re-ingest");
-                return;
-            }
-        }
-        Err(err) => {
-            tracing::warn!(book_id, error = %err, "index lock poisoned; no re-ingest requested");
-            return;
-        }
+    let marked = match state.index.lock() {
+        Ok(index) => index
+            .mark_book_for_reingest(book_id)
+            .map_err(|e| e.to_string()),
+        Err(err) => Err(format!("index lock poisoned: {err}")),
+    };
+    if let Err(err) = marked {
+        tracing::warn!(book_id, error = %err, "could not mark the book for re-ingest; no reconcile requested");
+        return;
     }
     let send = match state.last_repair.lock() {
         Ok(mut last) => may_request_repair(&mut last, Instant::now()),

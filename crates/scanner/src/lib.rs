@@ -515,6 +515,26 @@ fn commit_scanned_book(
     }
 }
 
+/// Delete a file an ingest wrote only to measure it: a saver chapter, or a
+/// faststart copy.
+///
+/// Both land at a live serve path, so something else can delete them first. A
+/// cache eviction does, and so does the http layer when a file's size does not
+/// match the length the current row advertises. An already-gone file is
+/// therefore the expected case, not an error. Any OTHER failure aborts the
+/// ingest: a stale file left at a serve path would be served under the newly
+/// measured length, which is the one mismatch this scanner must never publish.
+fn remove_measured_file(path: &Path) -> Result<(), ScanError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(ScanError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
 /// Log one indexed book, naming the shape the scan ingested.
 fn log_indexed(book: &BookRow, folder: bool) {
     if folder {
@@ -669,23 +689,13 @@ fn ingest_single(
                 source,
             })?;
             let ep = remux_faststart(input, book_out, 0, out_ext, probed.duration_sec)?;
-            // NotFound is fine here, as it is for the saver cleanup below: the
-            // copy lands at the live cache path, so the serve layer can drop
-            // it first. It does exactly that when the copy's size does not
+            // The copy lands at the live cache path, so the serve layer can
+            // drop it first: it does exactly that when the copy's size does not
             // match the length the OLD row still advertises, which is the
             // normal state mid-re-ingest. Aborting the book for that would
             // leave the old rows in place and need another remux to recover
             // (Greptile P2). The measurement is already taken either way.
-            match std::fs::remove_file(&ep.path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(source) => {
-                    return Err(ScanError::Io {
-                        path: ep.path.clone(),
-                        source,
-                    });
-                }
-            }
+            remove_measured_file(&ep.path)?;
             vec![ep]
         } else {
             // Serve in place from the read-only library: no ffmpeg, no copy.
@@ -757,16 +767,7 @@ fn ingest_single(
         // in sync. NotFound is fine: a concurrent cache eviction may have removed
         // it already.
         for ep in &eps {
-            match std::fs::remove_file(&ep.path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(source) => {
-                    return Err(ScanError::Io {
-                        path: ep.path.clone(),
-                        source,
-                    });
-                }
-            }
+            remove_measured_file(&ep.path)?;
         }
         eps
     } else {
@@ -3603,6 +3604,21 @@ mod tests {
         assert_eq!(next("dracula"), "dracula-2");
         assert_eq!(next("dracula"), "dracula-3");
         assert_eq!(next("other"), "other");
+    }
+
+    /// A measurement file is deleted after its size is recorded, and something
+    /// else can get there first (a cache eviction, or the serve layer dropping
+    /// a file whose size no longer matches the row). An already-gone file is
+    /// the expected case, not an ingest failure.
+    #[test]
+    fn removing_a_measured_file_tolerates_one_that_is_already_gone() {
+        let dir = scratch("remove-measured");
+        let path = dir.join("001.m4a");
+        std::fs::write(&path, b"measured bytes").unwrap();
+
+        remove_measured_file(&path).expect("an existing file is removed");
+        assert!(!path.exists(), "the file is gone");
+        remove_measured_file(&path).expect("a file already gone is not an error");
     }
 
     /// The cross-book worker pool must not disturb either load-bearing
