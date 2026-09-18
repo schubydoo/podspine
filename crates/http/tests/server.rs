@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
@@ -414,6 +415,450 @@ async fn saver_mode_regenerates_a_chapter_on_demand() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
     assert_eq!(body_bytes(resp).await.len(), 10, "range served 10 bytes");
+}
+
+/// A `saver` book between ingests must not rebuild a chapter. The rebuild
+/// reads the CURRENT source, but the feed already published the length the
+/// ingest measured, so the two can disagree. Refresh is the deterministic way
+/// to enter that state (it sets `source_mtime` to -1), and an edited source
+/// file produces the same row-versus-file mismatch.
+#[tokio::test]
+async fn a_book_between_ingests_waits_instead_of_rebuilding_a_chapter() {
+    skip_unless_ffmpeg!();
+    let dir = scratch("http-saver-reingest-gate");
+    let data = dir.join("data");
+
+    let index = Index::open_in_memory().unwrap();
+    let input = synth_book(&dir);
+    let book = scan_book_as(
+        &input,
+        "reingestbook",
+        &data,
+        &index,
+        ScanOptions {
+            storage: StorageMode::Saver,
+            ..Default::default()
+        },
+        &BookOverrides::default(),
+    )
+    .unwrap();
+    let feed_id = book.feed_id.clone();
+    let chapter = index.episodes_for_book(&book.id).unwrap()[0]
+        .file_path
+        .clone();
+
+    // The Refresh button's half: invalidate the row, then wait for the
+    // watcher. Until that re-ingest lands, the row does not describe the
+    // source.
+    index.mark_book_for_reingest(&book.id).unwrap();
+
+    let reconciles = Arc::new(AtomicUsize::new(0));
+    let state = AppState::new(
+        index,
+        "http://test".to_string(),
+        &data,
+        &dir,
+        None,
+        StorageMode::Saver,
+        None,
+        None,
+        Arc::new({
+            let reconciles = Arc::clone(&reconciles);
+            move || {
+                reconciles.fetch_add(1, AtomicOrdering::SeqCst);
+            }
+        }),
+    )
+    .expect("test dirs canonicalize");
+    let app = router(state);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/audio/{feed_id}/1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a book between ingests answers 503, not stale bytes"
+    );
+    assert_eq!(
+        resp.headers().get(header::RETRY_AFTER).unwrap(),
+        "5",
+        "a podcatcher is told to come back, not that the episode is gone"
+    );
+    assert!(
+        !std::path::Path::new(&chapter).exists(),
+        "no chapter was rebuilt from the unmeasured source"
+    );
+    assert_eq!(
+        reconciles.load(AtomicOrdering::SeqCst),
+        1,
+        "a book turned away at the mtime gate still asks the watcher to repair it"
+    );
+}
+
+/// A cached chapter is not trusted just because it exists. Its size is checked
+/// against the published length on every request, which is what makes the
+/// guard hold for a concurrent reader: a rebuild publishes at the final path,
+/// so a second request can find the file there and never enter the rebuild
+/// branch at all.
+///
+/// The refusal also asks the watcher to reconcile, which is all the serve path
+/// does about it: the single index writer decides, and the scan's own
+/// up-to-date check compares each file against its recorded length, so it
+/// re-ingests this book.
+#[tokio::test]
+async fn a_cached_chapter_of_the_wrong_size_is_refused_and_asks_for_a_re_ingest() {
+    let dir = scratch("http-cached-length-guard");
+    let library = dir.join("library");
+    let data = dir.join("data");
+    let book_id = "cachedlengthbook";
+    let book_dir = data.join("books").join(book_id);
+    std::fs::create_dir_all(&book_dir).unwrap();
+    std::fs::create_dir_all(&library).unwrap();
+    let source = library.join("book.m4b");
+    std::fs::write(&source, b"source inside the library").unwrap();
+    // A cached chapter that is NOT the length the feed advertises below.
+    let cached = book_dir.join("001.m4a");
+    std::fs::write(&cached, b"twelve bytes").unwrap();
+
+    let index = Index::open_in_memory().unwrap();
+    let feed_id = "capabilityidforcachedlen";
+    let mut book = book_row(book_id, feed_id);
+    book.source_path = source.to_string_lossy().into_owned();
+    book.storage_mode = Some(StorageMode::Saver);
+    index.upsert_book(&book).unwrap();
+    index
+        .upsert_episode(&episode_row(book_id, 0, 4096))
+        .unwrap();
+
+    let reconciles = Arc::new(AtomicUsize::new(0));
+    let state = AppState::new(
+        index,
+        "http://test".to_string(),
+        &data,
+        &library,
+        None,
+        StorageMode::Saver,
+        None,
+        None,
+        Arc::new({
+            let reconciles = Arc::clone(&reconciles);
+            move || {
+                reconciles.fetch_add(1, AtomicOrdering::SeqCst);
+            }
+        }),
+    )
+    .expect("test dirs canonicalize");
+    let probe = state.clone();
+
+    let resp = router(state)
+        .oneshot(
+            Request::get(format!("/audio/{feed_id}/1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a cached file of the wrong size is refused, not served"
+    );
+    assert!(
+        cached.exists(),
+        "the mismatched file stays: it is never served, and deleting it would \
+         make every retry pay for another rebuild"
+    );
+    assert_eq!(
+        probe
+            .index
+            .lock()
+            .unwrap()
+            .get_book(book_id)
+            .unwrap()
+            .unwrap()
+            .source_mtime,
+        0,
+        "the serve path never writes to the index: the row is untouched"
+    );
+    assert_eq!(
+        reconciles.load(AtomicOrdering::SeqCst),
+        1,
+        "the watcher is asked to reconcile once"
+    );
+}
+
+/// The other half of the outage rule: while the source IS readable, a missing
+/// file is worth reporting. The scan treats a missing file the same way it
+/// treats one of the wrong length, so the reconcile this asks for re-ingests
+/// the book.
+#[tokio::test]
+async fn a_missing_file_with_a_readable_source_asks_for_a_re_ingest() {
+    let dir = scratch("http-missing-with-source");
+    let library = dir.join("library");
+    let data = dir.join("data");
+    let book_id = "missingfilebook";
+    std::fs::create_dir_all(data.join("books").join(book_id)).unwrap();
+    std::fs::create_dir_all(&library).unwrap();
+    let source = library.join("book.m4b");
+    std::fs::write(&source, b"source inside the library").unwrap();
+
+    let index = Index::open_in_memory().unwrap();
+    let feed_id = "capabilityidformissing";
+    let mut book = book_row(book_id, feed_id);
+    book.source_path = source.to_string_lossy().into_owned();
+    // `full` mode, so the chapter is not regenerable and its absence is a 404.
+    book.storage_mode = Some(StorageMode::Full);
+    index.upsert_book(&book).unwrap();
+    index
+        .upsert_episode(&episode_row(book_id, 0, 4096))
+        .unwrap();
+
+    let reconciles = Arc::new(AtomicUsize::new(0));
+    let state = AppState::new(
+        index,
+        "http://test".to_string(),
+        &data,
+        &library,
+        None,
+        StorageMode::Full,
+        None,
+        None,
+        Arc::new({
+            let reconciles = Arc::clone(&reconciles);
+            move || {
+                reconciles.fetch_add(1, AtomicOrdering::SeqCst);
+            }
+        }),
+    )
+    .expect("test dirs canonicalize");
+
+    let resp = router(state)
+        .oneshot(
+            Request::get(format!("/audio/{feed_id}/1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        reconciles.load(AtomicOrdering::SeqCst),
+        1,
+        "a readable source means the reconcile can only help"
+    );
+}
+
+/// A source the server cannot read must not cost a listener their
+/// subscription. A reconcile treats a source it cannot see as deleted, and the
+/// prune takes the book's capability id with it, so restoring the file mints a
+/// new feed URL and every subscription breaks.
+///
+/// The dangerous shape is a saver book during a partial outage: its chapters
+/// are absent by design, and the resolver cannot offer a rebuild it has no
+/// source for, so the request lands on the plain 404 path. That path must stay
+/// silent.
+#[tokio::test]
+async fn an_unreadable_source_is_never_reported_to_the_watcher() {
+    let dir = scratch("http-unreadable-source");
+    let library = dir.join("library");
+    let data = dir.join("data");
+    let book_id = "outagebook";
+    std::fs::create_dir_all(data.join("books").join(book_id)).unwrap();
+    std::fs::create_dir_all(&library).unwrap();
+    // Another book keeps the library root populated, so the scanner's
+    // unmount guard would NOT save this one.
+    std::fs::write(library.join("other.m4b"), b"another book").unwrap();
+
+    let index = Index::open_in_memory().unwrap();
+    let feed_id = "capabilityidforoutage";
+    let mut book = book_row(book_id, feed_id);
+    // The share holding this book is gone: the path is indexed, not readable.
+    book.source_path = library
+        .join("unmounted/book.m4b")
+        .to_string_lossy()
+        .into_owned();
+    book.storage_mode = Some(StorageMode::Saver);
+    index.upsert_book(&book).unwrap();
+    index
+        .upsert_episode(&episode_row(book_id, 0, 4096))
+        .unwrap();
+
+    let reconciles = Arc::new(AtomicUsize::new(0));
+    let state = AppState::new(
+        index,
+        "http://test".to_string(),
+        &data,
+        &library,
+        None,
+        StorageMode::Saver,
+        None,
+        None,
+        Arc::new({
+            let reconciles = Arc::clone(&reconciles);
+            move || {
+                reconciles.fetch_add(1, AtomicOrdering::SeqCst);
+            }
+        }),
+    )
+    .expect("test dirs canonicalize");
+
+    let resp = router(state)
+        .oneshot(
+            Request::get(format!("/audio/{feed_id}/1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "there is nothing to serve while the source is away"
+    );
+    assert_eq!(
+        reconciles.load(AtomicOrdering::SeqCst),
+        0,
+        "no reconcile is requested: it would prune the book and its feed id"
+    );
+}
+
+/// A repeated mismatch must ask for a re-ingest ONCE. A `full`-mode file is
+/// kept for the scan to replace, so every retry re-detects the same mismatch,
+/// and the watcher restarts its quiet period on each signal it receives. An
+/// unthrottled ask would therefore hold the reconcile off for as long as the
+/// retries keep coming, and stall unrelated library changes with it.
+#[tokio::test]
+async fn a_repeated_length_mismatch_asks_for_one_re_ingest() {
+    let dir = scratch("http-mismatch-coalesce");
+    let library = dir.join("library");
+    let data = dir.join("data");
+    let book_id = "coalescebook";
+    let book_dir = data.join("books").join(book_id);
+    std::fs::create_dir_all(&book_dir).unwrap();
+    std::fs::create_dir_all(&library).unwrap();
+    std::fs::write(library.join("book.m4b"), b"source inside the library").unwrap();
+    // A `full`-mode chapter (no regeneration), so the file stays put and the
+    // mismatch repeats on every request.
+    let chapter = book_dir.join("001.m4a");
+    std::fs::write(&chapter, b"twelve bytes").unwrap();
+
+    let index = Index::open_in_memory().unwrap();
+    let feed_id = "capabilityidforcoalesce";
+    let mut book = book_row(book_id, feed_id);
+    book.source_path = library.join("book.m4b").to_string_lossy().into_owned();
+    book.storage_mode = Some(StorageMode::Full);
+    index.upsert_book(&book).unwrap();
+    index
+        .upsert_episode(&episode_row(book_id, 0, 4096))
+        .unwrap();
+
+    let reconciles = Arc::new(AtomicUsize::new(0));
+    let state = AppState::new(
+        index,
+        "http://test".to_string(),
+        &data,
+        &library,
+        None,
+        StorageMode::Full,
+        None,
+        None,
+        Arc::new({
+            let reconciles = Arc::clone(&reconciles);
+            move || {
+                reconciles.fetch_add(1, AtomicOrdering::SeqCst);
+            }
+        }),
+    )
+    .expect("test dirs canonicalize");
+    let app = router(state);
+
+    for _ in 0..3 {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/audio/{feed_id}/1"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    assert!(
+        chapter.exists(),
+        "a full-mode file is the artifact, not a cache entry, so it is kept"
+    );
+    assert_eq!(
+        reconciles.load(AtomicOrdering::SeqCst),
+        1,
+        "three refusals ask the watcher once, not three times"
+    );
+}
+
+/// The last line of defense for the `enclosure length` rule: if a rebuild
+/// produces a file whose size is not the length the feed advertises, the
+/// bytes are not served and the file is not kept. A wrong `byte_length` on
+/// the row stands in here for any cause of that divergence.
+#[tokio::test]
+async fn a_rebuilt_chapter_that_misses_the_published_length_is_refused() {
+    skip_unless_ffmpeg!();
+    let dir = scratch("http-saver-length-guard");
+    let data = dir.join("data");
+
+    let index = Index::open_in_memory().unwrap();
+    let input = synth_book(&dir);
+    let book = scan_book_as(
+        &input,
+        "lengthguardbook",
+        &data,
+        &index,
+        ScanOptions {
+            storage: StorageMode::Saver,
+            ..Default::default()
+        },
+        &BookOverrides::default(),
+    )
+    .unwrap();
+    let feed_id = book.feed_id.clone();
+
+    // Publish a length the rebuild cannot produce. The source is untouched,
+    // so the mtime gate passes and the request reaches the rebuild.
+    let mut ep = index.episodes_for_book(&book.id).unwrap()[0].clone();
+    let chapter = ep.file_path.clone();
+    ep.byte_length += 4096;
+    index.upsert_episode(&ep).unwrap();
+
+    let state = saver_state(index, &data, &dir);
+    let resp = router(state)
+        .oneshot(
+            Request::get(format!("/audio/{feed_id}/1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "bytes that contradict the enclosure length are never served"
+    );
+    assert!(
+        std::path::Path::new(&chapter).exists(),
+        "the mismatched rebuild stays on disk, refused rather than deleted, so \
+         a retry costs a stat instead of another ffmpeg run"
+    );
 }
 
 #[tokio::test]
