@@ -416,6 +416,123 @@ async fn saver_mode_regenerates_a_chapter_on_demand() {
     assert_eq!(body_bytes(resp).await.len(), 10, "range served 10 bytes");
 }
 
+/// A `saver` book between ingests must not rebuild a chapter. The rebuild
+/// reads the CURRENT source, but the feed already published the length the
+/// ingest measured, so the two can disagree. Refresh is the deterministic way
+/// to enter that state (it sets `source_mtime` to -1), and an edited source
+/// file produces the same row-versus-file mismatch.
+#[tokio::test]
+async fn a_book_between_ingests_waits_instead_of_rebuilding_a_chapter() {
+    skip_unless_ffmpeg!();
+    let dir = scratch("http-saver-reingest-gate");
+    let data = dir.join("data");
+
+    let index = Index::open_in_memory().unwrap();
+    let input = synth_book(&dir);
+    let book = scan_book_as(
+        &input,
+        "reingestbook",
+        &data,
+        &index,
+        ScanOptions {
+            storage: StorageMode::Saver,
+            ..Default::default()
+        },
+        &BookOverrides::default(),
+    )
+    .unwrap();
+    let feed_id = book.feed_id.clone();
+    let chapter = index.episodes_for_book(&book.id).unwrap()[0]
+        .file_path
+        .clone();
+
+    // The Refresh button's half: invalidate the row, then wait for the
+    // watcher. Until that re-ingest lands, the row does not describe the
+    // source.
+    index.mark_book_for_reingest(&book.id).unwrap();
+
+    let state = saver_state(index, &data, &dir);
+    let app = router(state);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/audio/{feed_id}/1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a book between ingests answers 503, not stale bytes"
+    );
+    assert_eq!(
+        resp.headers().get(header::RETRY_AFTER).unwrap(),
+        "5",
+        "a podcatcher is told to come back, not that the episode is gone"
+    );
+    assert!(
+        !std::path::Path::new(&chapter).exists(),
+        "no chapter was rebuilt from the unmeasured source"
+    );
+}
+
+/// The last line of defense for the `enclosure length` rule: if a rebuild
+/// produces a file whose size is not the length the feed advertises, the
+/// bytes are not served and the file is not kept. A wrong `byte_length` on
+/// the row stands in here for any cause of that divergence.
+#[tokio::test]
+async fn a_rebuilt_chapter_that_misses_the_published_length_is_refused() {
+    skip_unless_ffmpeg!();
+    let dir = scratch("http-saver-length-guard");
+    let data = dir.join("data");
+
+    let index = Index::open_in_memory().unwrap();
+    let input = synth_book(&dir);
+    let book = scan_book_as(
+        &input,
+        "lengthguardbook",
+        &data,
+        &index,
+        ScanOptions {
+            storage: StorageMode::Saver,
+            ..Default::default()
+        },
+        &BookOverrides::default(),
+    )
+    .unwrap();
+    let feed_id = book.feed_id.clone();
+
+    // Publish a length the rebuild cannot produce. The source is untouched,
+    // so the mtime gate passes and the request reaches the rebuild.
+    let mut ep = index.episodes_for_book(&book.id).unwrap()[0].clone();
+    let chapter = ep.file_path.clone();
+    ep.byte_length += 4096;
+    index.upsert_episode(&ep).unwrap();
+
+    let state = saver_state(index, &data, &dir);
+    let resp = router(state)
+        .oneshot(
+            Request::get(format!("/audio/{feed_id}/1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "bytes that contradict the enclosure length are never served"
+    );
+    assert!(
+        !std::path::Path::new(&chapter).exists(),
+        "the mismatched rebuild is dropped, not cached"
+    );
+}
+
 #[tokio::test]
 async fn saver_cache_evicts_over_the_size_cap() {
     skip_unless_ffmpeg!();

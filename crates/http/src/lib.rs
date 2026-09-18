@@ -274,6 +274,42 @@ fn scanning_unavailable() -> Response {
         .into_response()
 }
 
+/// 503 + `Retry-After` for ONE book that is between ingests: its index row no
+/// longer describes its source, so nothing regenerated from that source can
+/// match the `enclosure length` the feed already advertises.
+///
+/// This is the per-book twin of [`scanning_unavailable`], and it is a
+/// readiness state for the same reason: the watcher re-ingests the book, and
+/// the client that retries then gets the right bytes. Serving is what must not
+/// happen here. A 404 would tell a podcatcher the episode is gone.
+fn reingesting_unavailable() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, "5")],
+        "This book is being re-ingested; try again shortly.\n",
+    )
+        .into_response()
+}
+
+/// Whether `source` still has the mtime that the index recorded for the book.
+///
+/// A `saver` chapter and a faststart copy are both rebuilt from the library
+/// source on demand, and they are served under the `enclosure length` that the
+/// feed published at ingest. So a rebuild is only safe while the source is the
+/// one that was measured. Two things break that: an edited or replaced source
+/// file, and the Refresh button, which sets `source_mtime` to -1 to mark the
+/// row as no longer describing the source.
+///
+/// The comparison mirrors the scanner's `mtime_epoch`: whole seconds since the
+/// epoch, with an unreadable or pre-epoch time treated as a mismatch.
+fn source_mtime_matches(source: &FsPath, recorded: i64) -> bool {
+    std::fs::metadata(source)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .is_some_and(|d| d.as_secs() as i64 == recorded)
+}
+
 /// Build the router with all routes and middleware layers.
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -749,7 +785,45 @@ async fn audio(
     // file) it is a genuine 404.
     if !target.path.exists() {
         match &target.regen {
-            Some(regen) => ensure_cached(&state, &target.path, regen).await?,
+            Some(regen) => {
+                // A rebuild reads the CURRENT source, but it is served under
+                // the length the feed published at ingest. So refuse to build
+                // from a source the row no longer describes: a re-ingest is
+                // due (the source changed, or Refresh invalidated the row),
+                // and until it lands this book waits instead of serving bytes
+                // of the wrong length. An already-cached file is not affected:
+                // the ingest that wrote the row produced it.
+                if !source_mtime_matches(&regen.source, regen.source_mtime) {
+                    tracing::info!(
+                        feed_id,
+                        number,
+                        "source changed since ingest; waiting for the re-ingest"
+                    );
+                    return Ok(reingesting_unavailable());
+                }
+                ensure_cached(&state, &target.path, regen).await?;
+                // The rebuilt file must be exactly the bytes the feed already
+                // advertises for this episode. A stream copy is deterministic,
+                // so a mismatch means the row and the source disagree in a way
+                // the mtime gate did not catch (a same-second edit, say).
+                // Drop the file and make the client retry, rather than serve a
+                // body whose length contradicts the enclosure.
+                let produced = tokio::fs::metadata(&target.path)
+                    .await
+                    .map(|m| m.len())
+                    .map_err(|_| AppError::NotFound)?;
+                if produced != target.byte_length {
+                    tracing::warn!(
+                        feed_id,
+                        number,
+                        produced,
+                        advertised = target.byte_length,
+                        "regenerated chapter size != enclosure length; refusing to serve"
+                    );
+                    let _ = tokio::fs::remove_file(&target.path).await;
+                    return Ok(reingesting_unavailable());
+                }
+            }
             None => return Err(AppError::NotFound),
         }
     }
@@ -857,6 +931,9 @@ fn book_is_saver(book: &BookRow, global: StorageMode) -> bool {
 struct AudioTarget {
     path: PathBuf,
     regen: Option<Regen>,
+    /// The `enclosure length` the feed advertises for this episode. A
+    /// regenerated file must match it exactly, or it is not served.
+    byte_length: u64,
 }
 
 /// Inputs to regenerate one cache file on demand: a `saver` chapter split, or
@@ -870,6 +947,9 @@ struct Regen {
     out_dir: PathBuf,
     out_ext: String,
     op: RegenOp,
+    /// The source mtime the ingest recorded on the book row. A rebuild is only
+    /// safe while the source still carries it (see [`source_mtime_matches`]).
+    source_mtime: i64,
 }
 
 /// Which ffmpeg operation regenerates the cache file.
@@ -964,6 +1044,7 @@ fn resolve_audio_target(
         return Ok(AudioTarget {
             path: src,
             regen: None,
+            byte_length: ep.byte_length.max(0) as u64,
         });
     }
 
@@ -995,7 +1076,12 @@ fn resolve_audio_target(
     }
     let path = out_dir.join(episode_file_name(idx as usize, &out_ext));
 
-    // Two kinds of episode materialize under the data dir here:
+    // Two kinds of episode materialize under the data dir here. Both are
+    // rebuilt from the library source on demand, so both are gated on the
+    // source still being the one the ingest measured (see
+    // [`source_mtime_matches`]). A book whose source changed, or whose row the
+    // Refresh button invalidated, is between ingests: it waits rather than
+    // serve bytes under a length the feed can no longer vouch for.
     let regen = if !ep.source_path.is_empty() && ep.needs_faststart {
         // A non-faststart whole-file episode remuxed to a faststart cache
         // copy (Sprint 6.3, `file_path != source_path`). Regenerate it on
@@ -1020,6 +1106,7 @@ fn resolve_audio_target(
                 idx: idx as usize,
                 duration_sec: ep.duration_sec,
             },
+            source_mtime: book.source_mtime,
         })
     } else if book_is_saver(&book, state.storage)
         && !book_is_transcoded(&book)
@@ -1061,11 +1148,16 @@ fn resolve_audio_target(
                 start_sec: ep.start_sec,
                 end_sec: ep.start_sec + ep.duration_sec,
             }),
+            source_mtime: book.source_mtime,
         })
     } else {
         None
     };
-    Ok(AudioTarget { path, regen })
+    Ok(AudioTarget {
+        path,
+        regen,
+        byte_length: ep.byte_length.max(0) as u64,
+    })
 }
 
 /// Ensure that `target` exists; regenerate it on demand (a `saver` chapter
