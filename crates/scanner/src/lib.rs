@@ -360,7 +360,21 @@ fn plan_book(
             let files_present = eps.iter().all(|e| {
                 let regenerable = (saver && !stored_transcoded && e.source_path.is_empty())
                     || (!e.source_path.is_empty() && e.file_path != e.source_path);
-                regenerable || file_has_length(&e.file_path, e.byte_length)
+                if regenerable {
+                    // Absent is the regenerable steady state, so that is fine.
+                    // PRESENT is what must be checked: the serve layer refuses
+                    // a file of the wrong length and deliberately does not
+                    // delete it, because deleting it would make every retry
+                    // pay for another rebuild. Only a re-ingest clears it, and
+                    // this is what asks for one. A rebuild that keeps landing
+                    // on the wrong length (a source edited inside the same
+                    // second as its recorded mtime) would otherwise refuse
+                    // forever.
+                    !Path::new(&e.file_path).exists()
+                        || file_has_length(&e.file_path, e.byte_length)
+                } else {
+                    file_has_length(&e.file_path, e.byte_length)
+                }
             });
             // A `.podspine.toml` edit does not change the audio mtime. So also
             // re-ingest when the persisted metadata no longer matches the current
@@ -3682,6 +3696,57 @@ mod tests {
             std::fs::metadata(&ep.file_path).unwrap().len(),
             ep.byte_length as u64,
             "the re-ingest restored the published length"
+        );
+        assert_eq!(
+            index.episodes_for_book(&book.id).unwrap()[0].guid,
+            ep.guid,
+            "the guid is unchanged, so no client re-downloads the book"
+        );
+    }
+
+    /// A saver chapter is allowed to be absent, which is its steady state. One
+    /// that is PRESENT with the wrong length is a different matter: the serve
+    /// layer refuses such a file and does not delete it, so only a re-ingest
+    /// clears it. The scan must therefore not call that book up to date.
+    #[test]
+    fn a_present_saver_chapter_of_the_wrong_length_forces_a_reingest() {
+        skip_unless_ffmpeg!();
+        let root = scratch("saver-length-drift");
+        let input = synth(&root, true);
+        let data = root.join("data");
+        let index = Index::open_in_memory().unwrap();
+        let opts = ScanOptions {
+            storage: StorageMode::Saver,
+            ..Default::default()
+        };
+        let scan = || {
+            scan_book_as(
+                &input,
+                "saverdrift",
+                &data,
+                &index,
+                opts,
+                &BookOverrides::default(),
+            )
+            .expect("scan")
+        };
+
+        let book = scan();
+        let ep = index.episodes_for_book(&book.id).unwrap()[0].clone();
+        assert!(
+            !Path::new(&ep.file_path).exists(),
+            "saver keeps no chapter files: absent is the steady state"
+        );
+
+        // A rebuild that landed on the wrong bytes, refused and left in place
+        // by the serve layer.
+        std::fs::write(&ep.file_path, b"wrong bytes").unwrap();
+
+        scan();
+
+        assert!(
+            !Path::new(&ep.file_path).exists(),
+            "the re-ingest cleared the refused file"
         );
         assert_eq!(
             index.episodes_for_book(&book.id).unwrap()[0].guid,

@@ -853,9 +853,12 @@ async fn audio(
             }
             // A file that is not regenerable and not on disk is a 404. Ask
             // for a reconcile too: the scanner treats a missing file the same
-            // way it treats a wrong-sized one, so it re-ingests the book.
+            // way it treats a wrong-sized one, so it re-ingests the book. The
+            // ask is gated on the source, because an uncached saver chapter
+            // lands here whenever its source is unreadable: the resolver
+            // cannot offer a rebuild it has no source for.
             None => {
-                request_repair(&state);
+                request_repair_if_source_readable(&state, &target.source_path);
                 return Err(AppError::NotFound);
             }
         }
@@ -902,11 +905,12 @@ async fn audio(
             // The re-ingest replaces it, and the saver ingest clears it.
             //
             // Ask the watcher to look at the library. The scanner's own
-            // up-to-date check compares each non-regenerable file against its
-            // recorded length, so a reconcile re-ingests exactly this book.
+            // up-to-date check compares every episode file that is present
+            // against its recorded length, including a rebuilt one, so a
+            // reconcile re-ingests exactly this book and clears this file.
             // Nothing here writes to the index: the http layer refuses and
             // asks, the single writer decides.
-            request_repair(&state);
+            request_repair_if_source_readable(&state, &target.source_path);
             return Ok(reingesting_unavailable());
         }
     }
@@ -1020,6 +1024,10 @@ struct AudioTarget {
     /// The book this episode belongs to, so that a length mismatch can ask for
     /// a re-ingest of the book that caused it.
     book_id: String,
+    /// The book's library source. A repair ask is only safe while this is
+    /// readable, so every ask is routed through
+    /// [`request_repair_if_source_readable`].
+    source_path: PathBuf,
 }
 
 /// Read this episode's CURRENT `enclosure length` from the index. `None` when
@@ -1043,6 +1051,37 @@ fn current_episode_length(state: &AppState, book_id: &str, number: u32) -> Optio
         .into_iter()
         .find(|e| e.idx == idx)?;
     Some(ep.byte_length.max(0) as u64)
+}
+
+/// Ask for a repair only while the book's source can be read.
+///
+/// A reconcile treats a source it cannot see as deleted: `prune_orphans`
+/// removes the book, its episode rows, its output directory, and with them the
+/// capability id every subscription URL carries. Restoring the source mints a
+/// new one, so every listener has to re-subscribe.
+///
+/// Every refusal in the serve path goes through here, rather than calling
+/// [`request_repair`] directly, because the refusals that do NOT already know
+/// the source is readable are exactly the ones that fire during an outage: an
+/// uncached saver chapter resolves to no rebuild at all when its source is
+/// unreadable, which is the normal saver state made dangerous.
+///
+/// This keeps the serve path from becoming a new way to prune a book that is
+/// only temporarily away. It is NOT a guarantee that no reconcile runs during
+/// an outage: a reconcile prunes every book whose source is missing, and any
+/// library event, or a refusal on a different book whose source is readable,
+/// still starts one. Making that safe belongs in `prune_orphans`, which today
+/// guards only the whole-library case (an empty or unreadable root).
+fn request_repair_if_source_readable(state: &AppState, source: &FsPath) {
+    if let Err(err) = std::fs::metadata(source) {
+        tracing::warn!(
+            source = %source.display(),
+            error = %err,
+            "source unreadable; not asking for a re-ingest that would prune this book"
+        );
+        return;
+    }
+    request_repair(state);
 }
 
 /// Ask the watcher (the single index writer) to reconcile, at most once per
@@ -1208,6 +1247,7 @@ fn resolve_audio_target(
             regen: None,
             byte_length: ep.byte_length.max(0) as u64,
             book_id: book.id,
+            source_path: PathBuf::from(ep.source_path),
         });
     }
 
@@ -1321,6 +1361,7 @@ fn resolve_audio_target(
         regen,
         byte_length: ep.byte_length.max(0) as u64,
         book_id: book.id,
+        source_path: PathBuf::from(book.source_path),
     })
 }
 

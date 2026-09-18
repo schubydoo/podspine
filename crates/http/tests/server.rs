@@ -595,6 +595,143 @@ async fn a_cached_chapter_of_the_wrong_size_is_refused_and_asks_for_a_re_ingest(
     );
 }
 
+/// The other half of the outage rule: while the source IS readable, a missing
+/// file is worth reporting. The scan treats a missing file the same way it
+/// treats one of the wrong length, so the reconcile this asks for re-ingests
+/// the book.
+#[tokio::test]
+async fn a_missing_file_with_a_readable_source_asks_for_a_re_ingest() {
+    let dir = scratch("http-missing-with-source");
+    let library = dir.join("library");
+    let data = dir.join("data");
+    let book_id = "missingfilebook";
+    std::fs::create_dir_all(data.join("books").join(book_id)).unwrap();
+    std::fs::create_dir_all(&library).unwrap();
+    let source = library.join("book.m4b");
+    std::fs::write(&source, b"source inside the library").unwrap();
+
+    let index = Index::open_in_memory().unwrap();
+    let feed_id = "capabilityidformissing";
+    let mut book = book_row(book_id, feed_id);
+    book.source_path = source.to_string_lossy().into_owned();
+    // `full` mode, so the chapter is not regenerable and its absence is a 404.
+    book.storage_mode = Some(StorageMode::Full);
+    index.upsert_book(&book).unwrap();
+    index
+        .upsert_episode(&episode_row(book_id, 0, 4096))
+        .unwrap();
+
+    let reconciles = Arc::new(AtomicUsize::new(0));
+    let state = AppState::new(
+        index,
+        "http://test".to_string(),
+        &data,
+        &library,
+        None,
+        StorageMode::Full,
+        None,
+        None,
+        Arc::new({
+            let reconciles = Arc::clone(&reconciles);
+            move || {
+                reconciles.fetch_add(1, AtomicOrdering::SeqCst);
+            }
+        }),
+    )
+    .expect("test dirs canonicalize");
+
+    let resp = router(state)
+        .oneshot(
+            Request::get(format!("/audio/{feed_id}/1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        reconciles.load(AtomicOrdering::SeqCst),
+        1,
+        "a readable source means the reconcile can only help"
+    );
+}
+
+/// A source the server cannot read must not cost a listener their
+/// subscription. A reconcile treats a source it cannot see as deleted, and the
+/// prune takes the book's capability id with it, so restoring the file mints a
+/// new feed URL and every subscription breaks.
+///
+/// The dangerous shape is a saver book during a partial outage: its chapters
+/// are absent by design, and the resolver cannot offer a rebuild it has no
+/// source for, so the request lands on the plain 404 path. That path must stay
+/// silent.
+#[tokio::test]
+async fn an_unreadable_source_is_never_reported_to_the_watcher() {
+    let dir = scratch("http-unreadable-source");
+    let library = dir.join("library");
+    let data = dir.join("data");
+    let book_id = "outagebook";
+    std::fs::create_dir_all(data.join("books").join(book_id)).unwrap();
+    std::fs::create_dir_all(&library).unwrap();
+    // Another book keeps the library root populated, so the scanner's
+    // unmount guard would NOT save this one.
+    std::fs::write(library.join("other.m4b"), b"another book").unwrap();
+
+    let index = Index::open_in_memory().unwrap();
+    let feed_id = "capabilityidforoutage";
+    let mut book = book_row(book_id, feed_id);
+    // The share holding this book is gone: the path is indexed, not readable.
+    book.source_path = library
+        .join("unmounted/book.m4b")
+        .to_string_lossy()
+        .into_owned();
+    book.storage_mode = Some(StorageMode::Saver);
+    index.upsert_book(&book).unwrap();
+    index
+        .upsert_episode(&episode_row(book_id, 0, 4096))
+        .unwrap();
+
+    let reconciles = Arc::new(AtomicUsize::new(0));
+    let state = AppState::new(
+        index,
+        "http://test".to_string(),
+        &data,
+        &library,
+        None,
+        StorageMode::Saver,
+        None,
+        None,
+        Arc::new({
+            let reconciles = Arc::clone(&reconciles);
+            move || {
+                reconciles.fetch_add(1, AtomicOrdering::SeqCst);
+            }
+        }),
+    )
+    .expect("test dirs canonicalize");
+
+    let resp = router(state)
+        .oneshot(
+            Request::get(format!("/audio/{feed_id}/1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "there is nothing to serve while the source is away"
+    );
+    assert_eq!(
+        reconciles.load(AtomicOrdering::SeqCst),
+        0,
+        "no reconcile is requested: it would prune the book and its feed id"
+    );
+}
+
 /// A repeated mismatch must ask for a re-ingest ONCE. A `full`-mode file is
 /// kept for the scan to replace, so every retry re-detects the same mismatch,
 /// and the watcher restarts its quiet period on each signal it receives. An
