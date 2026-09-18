@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
@@ -476,6 +477,96 @@ async fn a_book_between_ingests_waits_instead_of_rebuilding_a_chapter() {
     assert!(
         !std::path::Path::new(&chapter).exists(),
         "no chapter was rebuilt from the unmeasured source"
+    );
+}
+
+/// A cached chapter is not trusted just because it exists. Its size is checked
+/// against the published length on every request, which is what makes the
+/// guard hold for a concurrent reader: a rebuild publishes at the final path,
+/// so a second request can find the file there and never enter the rebuild
+/// branch at all.
+///
+/// The mismatch must also heal itself. Nothing else would notice it, because
+/// the scanner treats a book whose source mtime is unchanged as up to date,
+/// even in saver mode with no chapter files on disk. So the serve marks the
+/// book for re-ingest and asks the watcher to reconcile, exactly as the
+/// Refresh button does.
+#[tokio::test]
+async fn a_cached_chapter_of_the_wrong_size_is_refused_and_asks_for_a_re_ingest() {
+    let dir = scratch("http-cached-length-guard");
+    let library = dir.join("library");
+    let data = dir.join("data");
+    let book_id = "cachedlengthbook";
+    let book_dir = data.join("books").join(book_id);
+    std::fs::create_dir_all(&book_dir).unwrap();
+    std::fs::create_dir_all(&library).unwrap();
+    let source = library.join("book.m4b");
+    std::fs::write(&source, b"source inside the library").unwrap();
+    // A cached chapter that is NOT the length the feed advertises below.
+    let cached = book_dir.join("001.m4a");
+    std::fs::write(&cached, b"twelve bytes").unwrap();
+
+    let index = Index::open_in_memory().unwrap();
+    let feed_id = "capabilityidforcachedlen";
+    let mut book = book_row(book_id, feed_id);
+    book.source_path = source.to_string_lossy().into_owned();
+    book.storage_mode = Some(StorageMode::Saver);
+    index.upsert_book(&book).unwrap();
+    index
+        .upsert_episode(&episode_row(book_id, 0, 4096))
+        .unwrap();
+
+    let reconciles = Arc::new(AtomicUsize::new(0));
+    let state = AppState::new(
+        index,
+        "http://test".to_string(),
+        &data,
+        &library,
+        None,
+        StorageMode::Saver,
+        None,
+        None,
+        Arc::new({
+            let reconciles = Arc::clone(&reconciles);
+            move || {
+                reconciles.fetch_add(1, AtomicOrdering::SeqCst);
+            }
+        }),
+    )
+    .expect("test dirs canonicalize");
+    let probe = state.clone();
+
+    let resp = router(state)
+        .oneshot(
+            Request::get(format!("/audio/{feed_id}/1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a cached file of the wrong size is refused, not served"
+    );
+    assert!(!cached.exists(), "the mismatched cache entry is dropped");
+    assert_eq!(
+        probe
+            .index
+            .lock()
+            .unwrap()
+            .get_book(book_id)
+            .unwrap()
+            .unwrap()
+            .source_mtime,
+        -1,
+        "the book is marked for re-ingest, so the mismatch can heal"
+    );
+    assert_eq!(
+        reconciles.load(AtomicOrdering::SeqCst),
+        1,
+        "the watcher is asked to reconcile once"
     );
 }
 

@@ -300,14 +300,22 @@ fn reingesting_unavailable() -> Response {
 /// file, and the Refresh button, which sets `source_mtime` to -1 to mark the
 /// row as no longer describing the source.
 ///
-/// The comparison mirrors the scanner's `mtime_epoch`: whole seconds since the
-/// epoch, with an unreadable or pre-epoch time treated as a mismatch.
+/// The comparison mirrors the scanner's `mtime_epoch` exactly, including its
+/// treatment of a pre-epoch timestamp as 0. A source dated before 1970 is
+/// ingested with `source_mtime = 0`, so it must compare equal here, or its
+/// chapters could never be rebuilt (Greptile P2). Only an unreadable source
+/// is a mismatch, and the Refresh sentinel of -1 stays distinct from every
+/// real mtime.
 fn source_mtime_matches(source: &FsPath, recorded: i64) -> bool {
     std::fs::metadata(source)
         .and_then(|m| m.modified())
         .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .is_some_and(|d| d.as_secs() as i64 == recorded)
+        .map(|t| {
+            t.duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0)
+        })
+        .is_some_and(|mtime| mtime == recorded)
 }
 
 /// Build the router with all routes and middleware layers.
@@ -791,8 +799,7 @@ async fn audio(
                 // from a source the row no longer describes: a re-ingest is
                 // due (the source changed, or Refresh invalidated the row),
                 // and until it lands this book waits instead of serving bytes
-                // of the wrong length. An already-cached file is not affected:
-                // the ingest that wrote the row produced it.
+                // of the wrong length.
                 if !source_mtime_matches(&regen.source, regen.source_mtime) {
                     tracing::info!(
                         feed_id,
@@ -802,30 +809,42 @@ async fn audio(
                     return Ok(reingesting_unavailable());
                 }
                 ensure_cached(&state, &target.path, regen).await?;
-                // The rebuilt file must be exactly the bytes the feed already
-                // advertises for this episode. A stream copy is deterministic,
-                // so a mismatch means the row and the source disagree in a way
-                // the mtime gate did not catch (a same-second edit, say).
-                // Drop the file and make the client retry, rather than serve a
-                // body whose length contradicts the enclosure.
-                let produced = tokio::fs::metadata(&target.path)
-                    .await
-                    .map(|m| m.len())
-                    .map_err(|_| AppError::NotFound)?;
-                if produced != target.byte_length {
-                    tracing::warn!(
-                        feed_id,
-                        number,
-                        produced,
-                        advertised = target.byte_length,
-                        "regenerated chapter size != enclosure length; refusing to serve"
-                    );
-                    let _ = tokio::fs::remove_file(&target.path).await;
-                    return Ok(reingesting_unavailable());
-                }
             }
             None => return Err(AppError::NotFound),
         }
+    }
+    // The bytes about to be served must be the length the feed advertises for
+    // this episode. Checked on EVERY request, not only after a rebuild: a
+    // rebuild publishes at the final path, so a concurrent request can find
+    // the file already there and would otherwise skip the check (Greptile P1).
+    // It also covers a cache file an older build left behind.
+    let on_disk = tokio::fs::metadata(&target.path)
+        .await
+        .map(|m| m.len())
+        .map_err(|_| AppError::NotFound)?;
+    if on_disk != target.byte_length {
+        tracing::warn!(
+            feed_id,
+            number,
+            on_disk,
+            advertised = target.byte_length,
+            "file size != enclosure length; refusing to serve and re-ingesting"
+        );
+        // A regenerable file is a cache entry, so drop it: the next request
+        // rebuilds it from whatever the re-ingest records. A `full`-mode file
+        // is the artifact itself and is left alone for the scan to replace.
+        if target.regen.is_some() {
+            let _ = tokio::fs::remove_file(&target.path).await;
+        }
+        // Then heal the cause. Nothing else would: a source edited inside the
+        // same second keeps its recorded mtime, and a saver book with that
+        // mtime looks up to date to the scanner even with no chapter files, so
+        // the request would otherwise rebuild and refuse forever (Greptile
+        // P1). Invalidating the row is what the Refresh button does, and it
+        // also short-circuits the retries: -1 fails the mtime gate above, so
+        // they cost no ffmpeg.
+        invalidate_for_reingest(&state, &target.book_id);
+        return Ok(reingesting_unavailable());
     }
     // Final defense in depth: the file now exists, so canonicalize it (this
     // resolves any symlink) and confirm that it still lives under a trusted
@@ -931,9 +950,36 @@ fn book_is_saver(book: &BookRow, global: StorageMode) -> bool {
 struct AudioTarget {
     path: PathBuf,
     regen: Option<Regen>,
-    /// The `enclosure length` the feed advertises for this episode. A
-    /// regenerated file must match it exactly, or it is not served.
+    /// The `enclosure length` the feed advertises for this episode. What is
+    /// served must match it exactly.
     byte_length: u64,
+    /// The book this episode belongs to, so that a length mismatch can ask for
+    /// a re-ingest of the book that caused it.
+    book_id: String,
+}
+
+/// Mark one book for re-ingest and ask the watcher (the single index writer)
+/// to reconcile, the same two steps the Refresh handler takes.
+///
+/// Called when a serve finds a file whose size is not the length the feed
+/// published. That means the row and the file disagree, and nothing else would
+/// notice: the scanner treats a book whose source mtime is unchanged as up to
+/// date. Both steps are best-effort, because a failure here must not turn a
+/// clean 503 into a 500. The request is refused either way.
+fn invalidate_for_reingest(state: &AppState, book_id: &str) {
+    match state.index.lock() {
+        Ok(index) => {
+            if let Err(err) = index.mark_book_for_reingest(book_id) {
+                tracing::warn!(book_id, error = %err, "could not mark the book for re-ingest");
+                return;
+            }
+        }
+        Err(err) => {
+            tracing::warn!(book_id, error = %err, "index lock poisoned; no re-ingest requested");
+            return;
+        }
+    }
+    (state.reconcile)();
 }
 
 /// Inputs to regenerate one cache file on demand: a `saver` chapter split, or
@@ -1045,6 +1091,7 @@ fn resolve_audio_target(
             path: src,
             regen: None,
             byte_length: ep.byte_length.max(0) as u64,
+            book_id: book.id,
         });
     }
 
@@ -1157,6 +1204,7 @@ fn resolve_audio_target(
         path,
         regen,
         byte_length: ep.byte_length.max(0) as u64,
+        book_id: book.id,
     })
 }
 
