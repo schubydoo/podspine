@@ -37,7 +37,7 @@ use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::extract::{Path, State};
@@ -66,6 +66,12 @@ use podspine_ui::{
 /// Max concurrent in-flight requests before backpressure (DoS guard). Generous
 /// for a homelab tool; only bounds a pathological flood.
 const MAX_INFLIGHT_REQUESTS: usize = 512;
+
+/// How long the server waits between repair reconcile requests (see
+/// [`invalidate_for_reingest`]). Long enough that these asks cannot hold off
+/// the watcher's two-second quiet period, short enough that a re-ingest which
+/// failed transiently is retried while a listener is still trying to play.
+const REPAIR_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// Whether a URL slug is safe to use as an opaque index key. Allow-list only:
 /// non-empty and `[a-z0-9-]`, exactly what the scanner's `slugify` produces.
@@ -197,6 +203,9 @@ pub struct AppState {
     /// binary wires this to a channel send; a test passes a no-op. Kept as an
     /// opaque callback so this crate does not depend on the scanner.
     reconcile: Arc<dyn Fn() + Send + Sync>,
+    /// When a repair reconcile was last requested, for the rate limit in
+    /// [`invalidate_for_reingest`]. `None` means never.
+    last_repair: Arc<Mutex<Option<Instant>>>,
 }
 
 impl AppState {
@@ -241,6 +250,7 @@ impl AppState {
             inflight: Arc::new(Mutex::new(HashMap::new())),
             ready: Arc::new(AtomicBool::new(true)),
             reconcile,
+            last_repair: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -967,24 +977,26 @@ struct AudioTarget {
 /// date. Both steps are best-effort, because a failure here must not turn a
 /// clean 503 into a 500. The request is refused either way.
 ///
-/// A book that is ALREADY marked sends nothing. That matters because the
-/// watcher restarts its quiet period on every signal it receives, so a
-/// mismatch that each retry re-reports (a `full`-mode file, which is kept for
-/// the scan to replace rather than deleted) could hold the reconcile off
-/// indefinitely and stall unrelated library changes with it (Greptile P1).
-/// One request asks, the rest wait.
+/// The row is marked on every mismatch, which is idempotent. The SIGNAL is
+/// rate-limited to one per [`REPAIR_COOLDOWN`], for two reasons that pull
+/// against each other.
+///
+/// Signalling per request would starve the watcher: it restarts its quiet
+/// period on every signal, so a mismatch that each retry re-reports (a
+/// `full`-mode file, kept for the scan to replace rather than deleted) could
+/// hold the reconcile off indefinitely, and stall unrelated library changes
+/// with it. Signalling only once would strand the book instead: a re-ingest
+/// that fails transiently leaves the row marked, so a "already marked, say
+/// nothing" rule would suppress every later attempt, and playback would sit at
+/// 503 until a manual Refresh or a restart (Greptile P1). A cooldown does
+/// both: it cannot extend the debounce, and it retries for as long as requests
+/// keep arriving.
+///
+/// The cooldown is server-wide rather than per book, because one reconcile
+/// walks the whole library. A single signal repairs every book that is waiting.
 fn invalidate_for_reingest(state: &AppState, book_id: &str) {
     match state.index.lock() {
         Ok(index) => {
-            match index.get_book(book_id) {
-                // `mark_book_for_reingest` stores -1, a sentinel no real mtime
-                // can equal, so this is "a re-ingest is already pending".
-                Ok(Some(book)) if book.source_mtime < 0 => return,
-                Ok(_) => {}
-                Err(err) => {
-                    tracing::warn!(book_id, error = %err, "could not read the book row; asking for a re-ingest anyway");
-                }
-            }
             if let Err(err) = index.mark_book_for_reingest(book_id) {
                 tracing::warn!(book_id, error = %err, "could not mark the book for re-ingest");
                 return;
@@ -995,7 +1007,28 @@ fn invalidate_for_reingest(state: &AppState, book_id: &str) {
             return;
         }
     }
-    (state.reconcile)();
+    let send = match state.last_repair.lock() {
+        Ok(mut last) => may_request_repair(&mut last, Instant::now()),
+        Err(err) => {
+            tracing::warn!(book_id, error = %err, "repair clock poisoned; no reconcile requested");
+            false
+        }
+    };
+    if send {
+        (state.reconcile)();
+    }
+}
+
+/// Whether a repair reconcile may be asked for at `now`, given when the last
+/// one was asked for. Records `now` when it says yes. Split out from
+/// [`invalidate_for_reingest`] so the rule can be tested without waiting for a
+/// real minute to pass.
+fn may_request_repair(last: &mut Option<Instant>, now: Instant) -> bool {
+    if last.is_some_and(|sent| now.duration_since(sent) < REPAIR_COOLDOWN) {
+        return false;
+    }
+    *last = Some(now);
+    true
 }
 
 /// Inputs to regenerate one cache file on demand: a `saver` chapter split, or
@@ -1479,6 +1512,40 @@ impl IntoResponse for AppError {
 mod tests {
     use super::*;
     use podspine_test_support::scratch;
+
+    /// The repair rate limit has to hold both ways. Asks inside the cooldown
+    /// are dropped, so they cannot keep restarting the watcher's quiet period.
+    /// An ask after it is allowed, so a re-ingest that failed transiently is
+    /// tried again instead of leaving the book stuck at 503.
+    #[test]
+    fn a_repair_is_asked_for_once_per_cooldown_and_again_after_it() {
+        let start = Instant::now();
+        let mut last = None;
+
+        assert!(
+            may_request_repair(&mut last, start),
+            "the first ask goes through"
+        );
+        assert!(
+            !may_request_repair(&mut last, start + REPAIR_COOLDOWN / 2),
+            "an ask inside the cooldown is dropped"
+        );
+        assert!(
+            !may_request_repair(
+                &mut last,
+                start + REPAIR_COOLDOWN - Duration::from_millis(1)
+            ),
+            "the cooldown runs to its full length"
+        );
+        assert!(
+            may_request_repair(&mut last, start + REPAIR_COOLDOWN),
+            "an ask after the cooldown retries the repair"
+        );
+        assert!(
+            !may_request_repair(&mut last, start + REPAIR_COOLDOWN + Duration::from_secs(1)),
+            "the retry starts a fresh cooldown"
+        );
+    }
 
     #[test]
     fn mime_by_extension() {
