@@ -35,6 +35,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::UNIX_EPOCH;
 
 // All three re-exports are part of this crate's public surface. `BookOverrides`
@@ -47,7 +48,7 @@ use podspine_index::{BookRow, EpisodeRow, Index, IndexError};
 use podspine_prober::{ProbeError, needs_faststart, probe};
 use podspine_splitter::{
     ChapterCut, Encoding, SplitEpisode, SplitError, cover_thumb_path, extract_cover,
-    extract_cover_thumb, remux_faststart, split_book_encoded, transcode_whole,
+    extract_cover_thumb, ffmpeg_parallelism, remux_faststart, split_book_encoded, transcode_whole,
 };
 
 /// DRM extensions that the scanner refuses to ingest. The match ignores case.
@@ -152,6 +153,118 @@ pub fn scan_book_as(
     opts: ScanOptions,
     overrides: &BookOverrides,
 ) -> Result<BookRow, ScanError> {
+    match plan_book(input, id, data_dir, index, opts, overrides)? {
+        BookPlan::UpToDate(book) => Ok(*book),
+        BookPlan::Ingest(task) => commit_book(index, run_ingest(&task, ffmpeg_parallelism())?),
+    }
+}
+
+/// What one book needs from a scan, decided by the index reads in
+/// [`plan_book`] and [`plan_mp3_folder`].
+enum BookPlan {
+    /// Already indexed at this mtime, with every file the storage mode needs
+    /// present: nothing to probe, split, or write.
+    UpToDate(Box<BookRow>),
+    /// Work for [`run_ingest`], to be written by [`commit_book`].
+    Ingest(Box<IngestTask>),
+}
+
+/// One book's ingest inputs. It carries NO index handle, on purpose.
+///
+/// [`scan_library`] runs [`run_ingest`] for many books on worker threads while
+/// the index stays on the scan thread. `Index` wraps one SQLite connection,
+/// which is `Send` but not `Sync`, and the scanner tests open the database in
+/// memory, where a second connection would see nothing. So each book splits
+/// into index reads ([`plan_book`]), index-free work ([`run_ingest`]), and
+/// index writes ([`commit_book`]).
+struct IngestTask {
+    /// The canonical source: an audio file, or an MP3 folder.
+    input: PathBuf,
+    /// The book id, which is also its slug.
+    id: String,
+    /// `<data_dir>/books/<id>`, this book's output directory.
+    book_out: PathBuf,
+    /// The source mtime that anchors every `guid` and `pubDate`.
+    source_mtime: i64,
+    /// Effective title (override → file stem, or the folder name).
+    title: String,
+    /// Effective author, when a sidecar names one.
+    author: Option<String>,
+    /// Effective fallback cover URL, when a sidecar names one.
+    cover_url: Option<String>,
+    /// Which ingest to run.
+    kind: IngestKind,
+}
+
+/// Which ingest [`run_ingest`] runs for a task.
+enum IngestKind {
+    /// A single audiobook file: probe, resolve chapters, then split, transcode,
+    /// or serve in place.
+    Single(Box<SingleIngest>),
+    /// A folder of per-chapter MP3s served in place (Task 3.3, Sprint 6.2),
+    /// holding the track paths [`plan_mp3_folder`] collected.
+    Mp3Folder(Vec<PathBuf>),
+}
+
+/// The settings a single-file ingest needs, after a `.podspine.toml` refines
+/// the global flags (Sprint 6.4).
+struct SingleIngest {
+    /// The server data directory (the saver temp split dir lives under it).
+    data_dir: PathBuf,
+    /// The server-global options.
+    opts: ScanOptions,
+    /// Ignore a `.cue`/`.ffmeta` sidecar and use embedded chapters (Task 3.8).
+    force_embedded: bool,
+    /// Remux a non-faststart whole-file mp4 instead of serving it in place.
+    remux_non_faststart: bool,
+    /// The effective storage mode, persisted on the book row.
+    storage: StorageMode,
+    /// `storage == StorageMode::Saver`, the on-demand mode (Sprint 5.1).
+    saver: bool,
+    /// The cover path the previous ingest stored. A failed re-extraction keeps
+    /// it, so still-valid art is never orphaned. [`plan_book`] reads it,
+    /// because [`run_ingest`] has no index.
+    previous_cover: Option<String>,
+}
+
+/// One book's finished ingest: the rows to write, and the files to sweep once
+/// they are written.
+struct PreparedBook {
+    /// The book row.
+    book: BookRow,
+    /// Every episode row, in chapter order.
+    episodes: Vec<EpisodeRow>,
+    /// The filesystem cleanup that follows the index writes.
+    sweep: Sweep,
+    /// When the ingest started, for the `book_total` stage timing.
+    book_start: std::time::Instant,
+}
+
+/// The filesystem cleanup an ingest defers until its rows are in the index.
+enum Sweep {
+    /// The episodes stream from the library: reclaim any per-episode copy an
+    /// older ingest left under `<data_dir>`.
+    InPlace(PathBuf),
+    /// Keep only the files this ingest wrote under `<data_dir>/books/<id>`.
+    Files {
+        /// The book's output directory.
+        book_out: PathBuf,
+        /// The file names to keep.
+        keep: HashSet<String>,
+    },
+}
+
+/// Read this book's index state and decide what the scan owes it. These are the
+/// only index reads a single-file ingest makes before [`commit_book`], so
+/// [`scan_library`] runs them serially and hands the work to a pool.
+fn plan_book(
+    input: &Path,
+    id: &str,
+    data_dir: &Path,
+    index: &Index,
+    opts: ScanOptions,
+    overrides: &BookOverrides,
+) -> Result<BookPlan, ScanError> {
     if !input.is_file() {
         return Err(ScanError::NotAFile(input.to_path_buf()));
     }
@@ -181,7 +294,7 @@ pub fn scan_book_as(
     // Compute the effective per-book metadata (override → default) up here, for
     // two reasons. The idempotency check can then spot a `.podspine.toml` edit
     // and re-ingest (such an edit does not change the audio mtime). And the
-    // `BookRow` build below reuses these values.
+    // `BookRow` build in the ingest reuses these values.
     let eff_title = overrides.title.clone().unwrap_or_else(|| file_stem(input));
     let eff_author = overrides.author.clone();
     let eff_cover = overrides.default_cover_url.clone();
@@ -190,110 +303,260 @@ pub fn scan_book_as(
     let source_mtime = mtime_epoch(input)?;
     let book_out = data_dir.join("books").join(&id);
 
+    // The cover the previous ingest stored, kept for the failure path in
+    // `ingest_single`: a failed re-extraction must not orphan still-valid art.
+    // Read here, because the ingest itself runs without an index.
+    let mut previous_cover = None;
+
     // Idempotency check: if the book is already indexed at this mtime and all
     // files are present, the scan is done. Do not re-probe or re-split.
-    if let Some(existing) = index.get_book(&id)?
-        && existing.source_mtime == source_mtime
-    {
-        let eps = index.episodes_for_book(&id)?;
-        // In `saver` mode the split files are intentionally absent (the http
-        // layer regenerates them on demand). Do not require them on disk. The
-        // index entry is enough.
-        //
-        // BUT guard against a migrated database. `Index::migrate` back-fills
-        // `start_sec = 0` for pre-5.1 rows. A non-first chapter with
-        // `start_sec == 0` cannot drive correct on-demand regeneration: it
-        // would run ffmpeg with `-ss 0` and serve the book's opening seconds.
-        // Force a one-time re-split (skip this early return), so that the
-        // re-split records the real offsets before any eviction can serve the
-        // wrong segment. Chapter 0 legitimately starts at 0, so this check
-        // covers only non-first chapters.
-        let start_secs_recorded =
-            !saver || eps.iter().filter(|e| e.idx > 0).all(|e| e.start_sec > 0.0);
-        // Faststart re-ingest guard (Sprint 6.3). `PODSPINE_REMUX_NON_FASTSTART`
-        // can change between scans. The recorded serve mode of a
-        // `needs_faststart` whole-file episode (in place ⇒
-        // `file_path == source_path`; remuxed ⇒ `file_path != source_path`)
-        // then no longer matches the flag. Re-ingest, so that the scan records
-        // `byte_length`/`file_path` again for the current mode.
-        let faststart_consistent = eps.iter().all(|e| {
-            !e.needs_faststart
-                || e.source_path.is_empty()
-                || (e.file_path != e.source_path) == remux_non_faststart
-        });
-        // An episode's file may legitimately be absent when the server
-        // regenerates it on demand: a saver chapter, or a remuxed whole-file
-        // cache copy. Everything else (full chapters, in-place whole files)
-        // must be present on disk.
-        let files_present = eps.iter().all(|e| {
-            let regenerable = (saver && e.source_path.is_empty())
-                || (!e.source_path.is_empty() && e.file_path != e.source_path);
-            regenerable || Path::new(&e.file_path).exists()
-        });
-        // A `.podspine.toml` edit does not change the audio mtime. So also
-        // re-ingest when the persisted metadata no longer matches the current
-        // overrides (Greptile 6.4 P1). Otherwise a changed
-        // title/author/storage_mode/cover would stay stale in the index.
-        // `source_mtime` is unchanged, so episode `guid`s stay stable (clients
-        // do not re-download anything).
-        let metadata_consistent = existing.title == eff_title
-            && existing.author == eff_author
-            && existing.storage_mode == Some(storage)
-            && existing.default_cover_url == eff_cover
-            // `force_embedded_chapters` changes the chapter SOURCE (embedded vs
-            // a `.cue`/`.ffmeta` sidecar) and touches none of the fields above.
-            // So a toggle must also re-ingest (Greptile 6.4 P1).
-            && existing.force_embedded == force_embedded;
-        // Transcode toggle guard (Task 5.2). A `PODSPINE_TRANSCODE` flip changes
-        // the episode container AND every recorded `byte_length`, and touches
-        // no source mtime. So re-ingest when the persisted mode no longer
-        // matches what this setting would produce. A stream copy produced each
-        // pre-5.2 row (`None`), and a stream copy is exactly what `Off` means.
-        // Such a row is therefore not a mismatch, and an upgrade re-splits
-        // nobody's library.
-        let stored_transcode = existing.transcode.unwrap_or(TranscodeMode::Off);
-        let transcode_consistent = expected_transcode(input, opts.transcode)
-            .is_none_or(|expected| stored_transcode == expected);
-        // `force_reingest` (a troubleshooting option) always skips the early
-        // return. While it is set, every scan re-processes the book.
-        if !force_reingest
-            && metadata_consistent
-            && !eps.is_empty()
-            && start_secs_recorded
-            && faststart_consistent
-            && transcode_consistent
-            && files_present
-        {
-            // The book is up to date, but a browse-UI thumbnail can be missing:
-            // a library that predates thumbnails, or a thumbnail deleted from
-            // the cache. Backfill it from the already-extracted cover, without
-            // a re-split. The grid then gets thumbnails on the next reconcile,
-            // not on a re-index.
-            if let Some(cover) = existing.cover_path.as_deref()
-                && !cover_thumb_path(&book_out).exists()
-                && let Err(err) = extract_cover_thumb(Path::new(cover), &book_out)
+    if let Some(existing) = index.get_book(&id)? {
+        previous_cover = existing.cover_path.clone();
+        if existing.source_mtime == source_mtime {
+            let eps = index.episodes_for_book(&id)?;
+            // In `saver` mode the split files are intentionally absent (the http
+            // layer regenerates them on demand). Do not require them on disk. The
+            // index entry is enough.
+            //
+            // BUT guard against a migrated database. `Index::migrate` back-fills
+            // `start_sec = 0` for pre-5.1 rows. A non-first chapter with
+            // `start_sec == 0` cannot drive correct on-demand regeneration: it
+            // would run ffmpeg with `-ss 0` and serve the book's opening seconds.
+            // Force a one-time re-split (skip this early return), so that the
+            // re-split records the real offsets before any eviction can serve the
+            // wrong segment. Chapter 0 legitimately starts at 0, so this check
+            // covers only non-first chapters.
+            let start_secs_recorded =
+                !saver || eps.iter().filter(|e| e.idx > 0).all(|e| e.start_sec > 0.0);
+            // Faststart re-ingest guard (Sprint 6.3). `PODSPINE_REMUX_NON_FASTSTART`
+            // can change between scans. The recorded serve mode of a
+            // `needs_faststart` whole-file episode (in place ⇒
+            // `file_path == source_path`; remuxed ⇒ `file_path != source_path`)
+            // then no longer matches the flag. Re-ingest, so that the scan records
+            // `byte_length`/`file_path` again for the current mode.
+            let faststart_consistent = eps.iter().all(|e| {
+                !e.needs_faststart
+                    || e.source_path.is_empty()
+                    || (e.file_path != e.source_path) == remux_non_faststart
+            });
+            // An episode's file may legitimately be absent when the server
+            // regenerates it on demand: a saver chapter, or a remuxed whole-file
+            // cache copy. Everything else (full chapters, in-place whole files)
+            // must be present on disk.
+            let files_present = eps.iter().all(|e| {
+                let regenerable = (saver && e.source_path.is_empty())
+                    || (!e.source_path.is_empty() && e.file_path != e.source_path);
+                regenerable || Path::new(&e.file_path).exists()
+            });
+            // A `.podspine.toml` edit does not change the audio mtime. So also
+            // re-ingest when the persisted metadata no longer matches the current
+            // overrides (Greptile 6.4 P1). Otherwise a changed
+            // title/author/storage_mode/cover would stay stale in the index.
+            // `source_mtime` is unchanged, so episode `guid`s stay stable (clients
+            // do not re-download anything).
+            let metadata_consistent = existing.title == eff_title
+                && existing.author == eff_author
+                && existing.storage_mode == Some(storage)
+                && existing.default_cover_url == eff_cover
+                // `force_embedded_chapters` changes the chapter SOURCE (embedded vs
+                // a `.cue`/`.ffmeta` sidecar) and touches none of the fields above.
+                // So a toggle must also re-ingest (Greptile 6.4 P1).
+                && existing.force_embedded == force_embedded;
+            // Transcode toggle guard (Task 5.2). A `PODSPINE_TRANSCODE` flip changes
+            // the episode container AND every recorded `byte_length`, and touches
+            // no source mtime. So re-ingest when the persisted mode no longer
+            // matches what this setting would produce. A stream copy produced each
+            // pre-5.2 row (`None`), and a stream copy is exactly what `Off` means.
+            // Such a row is therefore not a mismatch, and an upgrade re-splits
+            // nobody's library.
+            let stored_transcode = existing.transcode.unwrap_or(TranscodeMode::Off);
+            let transcode_consistent = expected_transcode(input, opts.transcode)
+                .is_none_or(|expected| stored_transcode == expected);
+            // `force_reingest` (a troubleshooting option) always skips the early
+            // return. While it is set, every scan re-processes the book.
+            if !force_reingest
+                && metadata_consistent
+                && !eps.is_empty()
+                && start_secs_recorded
+                && faststart_consistent
+                && transcode_consistent
+                && files_present
             {
-                tracing::warn!(error = %err, id = %id, "cover thumbnail backfill failed; browse UI will use the full cover");
+                // The book is up to date, but a browse-UI thumbnail can be missing:
+                // a library that predates thumbnails, or a thumbnail deleted from
+                // the cache. Backfill it from the already-extracted cover, without
+                // a re-split. The grid then gets thumbnails on the next reconcile,
+                // not on a re-index.
+                if let Some(cover) = existing.cover_path.as_deref()
+                    && !cover_thumb_path(&book_out).exists()
+                    && let Err(err) = extract_cover_thumb(Path::new(cover), &book_out)
+                {
+                    tracing::warn!(error = %err, id = %id, "cover thumbnail backfill failed; browse UI will use the full cover");
+                }
+                return Ok(BookPlan::UpToDate(Box::new(existing)));
             }
-            return Ok(existing);
         }
     }
 
+    Ok(BookPlan::Ingest(Box::new(IngestTask {
+        input: input.to_path_buf(),
+        id,
+        book_out,
+        source_mtime,
+        title: eff_title,
+        author: eff_author,
+        cover_url: eff_cover,
+        kind: IngestKind::Single(Box::new(SingleIngest {
+            data_dir: data_dir.to_path_buf(),
+            opts,
+            force_embedded,
+            remux_non_faststart,
+            storage,
+            saver,
+            previous_cover,
+        })),
+    })))
+}
+
+/// Run one prepared book's ingest: the probe, split, transcode, and cover work.
+/// This is the expensive half of a scan, and the half that touches no index, so
+/// [`scan_library`] runs it on a worker pool.
+///
+/// `split_workers` is this book's share of the CPU budget for its own chapter
+/// split. A scan that already runs several books at once passes a smaller
+/// share, so the book pool and the split pools together stay near one thread
+/// per CPU.
+fn run_ingest(task: &IngestTask, split_workers: usize) -> Result<PreparedBook, ScanError> {
+    match &task.kind {
+        IngestKind::Single(single) => ingest_single(task, single, split_workers),
+        IngestKind::Mp3Folder(files) => ingest_mp3_folder(task, files),
+    }
+}
+
+/// Run every task across a bounded worker pool, and commit each book as soon
+/// as its own ingest finishes.
+///
+/// A book is committed on THIS thread the moment its worker hands it over, not
+/// after the whole pool drains. That ordering is load-bearing. An ingest
+/// publishes its episode files at the live serve paths, so a re-ingest that
+/// waited for unrelated books would leave the new bytes on disk under the old
+/// rows, and the feed would advertise the previous `enclosure length` for them
+/// (Greptile P1). Committing per book keeps that window as short as the serial
+/// scan's: the file publish and the row write stay next to each other.
+///
+/// Books therefore commit in completion order, not discovery order. Nothing
+/// depends on the row order: the browse list and every feed sort by their own
+/// keys, and ids come from the serial planning phase.
+///
+/// Cross-book order is safe for the sequential-`pubDate` invariant: a
+/// `pubdate_epoch` is anchored on the book's own `source_mtime` and its own
+/// chapter index, so it never depends on which book a scan reaches first. The
+/// invariant is within a book, and one book stays with one worker.
+///
+/// The pool is sized like the process-wide ffmpeg gate, and each worker gets a
+/// share of that same budget for its book's chapter split. Two nested pools
+/// therefore spawn about one thread per CPU in total, not one per CPU per book
+/// (Greptile P2), and the gate still bounds the ffmpeg children themselves.
+fn ingest_and_commit(tasks: &[IngestTask], index: &Index, summary: &mut ScanSummary) {
+    // One book (the usual watcher rescan) does not need a thread, and it gets
+    // the whole split budget.
+    if tasks.len() < 2 {
+        for task in tasks {
+            let prepared = run_ingest(task, ffmpeg_parallelism());
+            commit_scanned_book(task, prepared, index, summary);
+        }
+        return;
+    }
+    let workers = ffmpeg_parallelism().min(tasks.len());
+    let split_workers = (ffmpeg_parallelism() / workers).max(1);
+    let next = AtomicUsize::new(0);
+    let next = &next;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let tx = tx.clone();
+            scope.spawn(move || {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(task) = tasks.get(i) else { break };
+                    // A closed channel means this scan is already unwinding.
+                    if tx.send((i, run_ingest(task, split_workers))).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        // Drop the scan thread's own sender, so the loop below ends when the
+        // last worker drops its clone.
+        drop(tx);
+        for (i, prepared) in rx {
+            commit_scanned_book(&tasks[i], prepared, index, summary);
+        }
+    });
+}
+
+/// Commit one finished ingest and record it in the scan summary. A failed
+/// ingest is skipped, never fatal: one bad book must not stop a scan.
+fn commit_scanned_book(
+    task: &IngestTask,
+    prepared: Result<PreparedBook, ScanError>,
+    index: &Index,
+    summary: &mut ScanSummary,
+) {
+    match prepared.and_then(|p| commit_book(index, p)) {
+        Ok(book) => {
+            summary.indexed += 1;
+            log_indexed(&book, matches!(task.kind, IngestKind::Mp3Folder(_)));
+        }
+        Err(err) => {
+            summary.skipped += 1;
+            tracing::warn!(error = %err, path = %task.input.display(), "skipped");
+        }
+    }
+}
+
+/// Log one indexed book, naming the shape the scan ingested.
+fn log_indexed(book: &BookRow, folder: bool) {
+    if folder {
+        tracing::info!(slug = %book.slug, title = %book.title, "indexed MP3-folder book");
+    } else {
+        tracing::info!(slug = %book.slug, title = %book.title, "indexed book");
+    }
+}
+
+/// Ingest one audiobook file: probe it, resolve its chapter source, extract the
+/// episodes, and build its rows. Touches no index (see [`IngestTask`]).
+fn ingest_single(
+    task: &IngestTask,
+    single: &SingleIngest,
+    split_workers: usize,
+) -> Result<PreparedBook, ScanError> {
+    let input = task.input.as_path();
+    let id = task.id.as_str();
+    let book_out = &task.book_out;
+    let source_mtime = task.source_mtime;
+    let opts = single.opts;
+    let saver = single.saver;
+
     // Per-stage timing (debug only; see `log_stage`). `book_total` spans the
-    // full first-ingest work below (the idempotency early-return above is not
-    // counted: it does no work).
+    // full first-ingest work below (the idempotency early-return in
+    // `plan_book` is not counted: it does no work).
     let book_start = std::time::Instant::now();
 
     let probe_start = std::time::Instant::now();
     let probed = probe(input)?;
-    log_stage(&id, "probe", probe_start);
+    log_stage(id, "probe", probe_start);
 
     // Resolve the chapter source: a sibling `.cue`/`.ffmeta` sidecar wins over
     // embedded markers unless `force_embedded` overrides it (Task 3.8).
     let resolve_start = std::time::Instant::now();
-    let resolved =
-        podspine_chapters::resolve(input, &probed.chapters, probed.duration_sec, force_embedded);
-    log_stage(&id, "resolve", resolve_start);
+    let resolved = podspine_chapters::resolve(
+        input,
+        &probed.chapters,
+        probed.duration_sec,
+        single.force_embedded,
+    );
+    log_stage(id, "resolve", resolve_start);
     if resolved.source != podspine_chapters::ChapterSource::Embedded {
         tracing::info!(id = %id, source = ?resolved.source, "using sidecar chapters");
     }
@@ -383,7 +646,7 @@ pub fn scan_book_as(
         // clip it.
         vec![transcode_whole(
             input,
-            &book_out,
+            book_out,
             0,
             out_ext,
             probed.duration_sec,
@@ -396,16 +659,16 @@ pub fn scan_book_as(
         // non-faststart whole-file mp4 (`moov` after `mdat`) seeks slowly when
         // streamed in place. Detect it without ffmpeg.
         needs_ft = needs_faststart(input);
-        if needs_ft && remux_non_faststart {
+        if needs_ft && single.remux_non_faststart {
             // Opt-in remux: write a faststart cache copy (byte-deterministic
             // `-c copy`), measure it, then delete it. The http layer
             // regenerates the copy on demand and evicts it under the cache cap.
             // The source stays untouched.
-            std::fs::create_dir_all(&book_out).map_err(|source| ScanError::Io {
+            std::fs::create_dir_all(book_out).map_err(|source| ScanError::Io {
                 path: book_out.clone(),
                 source,
             })?;
-            let ep = remux_faststart(input, &book_out, 0, out_ext, probed.duration_sec)?;
+            let ep = remux_faststart(input, book_out, 0, out_ext, probed.duration_sec)?;
             std::fs::remove_file(&ep.path).map_err(|source| ScanError::Io {
                 path: ep.path.clone(),
                 source,
@@ -454,13 +717,13 @@ pub fn scan_book_as(
         // real sizes there, then drop the whole dir. The book dir stays empty,
         // which is the correct saver steady state. The stored `file_path` is the
         // live path the http layer regenerates to (serving recomputes it anyway).
-        std::fs::create_dir_all(&book_out).map_err(|source| ScanError::Io {
+        std::fs::create_dir_all(book_out).map_err(|source| ScanError::Io {
             path: book_out.clone(),
             source,
         })?;
-        let tmp = data_dir.join(".scan-tmp").join(&id);
+        let tmp = single.data_dir.join(".scan-tmp").join(id);
         let _ = std::fs::remove_dir_all(&tmp); // clear any leftover from a crashed scan
-        let mut eps = split_book_encoded(input, &tmp, &cuts, out_ext, enc)?;
+        let mut eps = split_book_encoded(input, &tmp, &cuts, out_ext, enc, split_workers)?;
         for ep in &mut eps {
             if let Some(name) = ep.path.file_name() {
                 ep.path = book_out.join(name);
@@ -494,9 +757,9 @@ pub fn scan_book_as(
         }
         eps
     } else {
-        split_book_encoded(input, &book_out, &cuts, out_ext, enc)?
+        split_book_encoded(input, book_out, &cuts, out_ext, enc, split_workers)?
     };
-    log_stage(&id, "split", split_start);
+    log_stage(id, "split", split_start);
 
     // Extract the embedded cover, if any. A missing cover is a normal case. An
     // extraction failure never fails the book; the server then serves no cover
@@ -504,21 +767,21 @@ pub fn scan_book_as(
     let cover_start = std::time::Instant::now();
     let cover_path = if probed.has_cover {
         let ext = cover_ext(probed.cover_codec.as_deref());
-        match extract_cover(input, &book_out, ext) {
+        match extract_cover(input, book_out, ext) {
             Ok(path) => {
                 // Regenerate the browse-UI thumbnail from the freshly extracted
-                // cover, in this same (single) scanner thread and atomically,
-                // so that it always matches the cover. The http layer only ever
-                // *serves* the thumbnail. That split keeps thumbnail and cover
-                // consistent with no cross-thread race.
+                // cover, in this same thread and atomically, so that it always
+                // matches the cover. The http layer only ever *serves* the
+                // thumbnail. That split keeps thumbnail and cover consistent
+                // with no cross-thread race.
                 //
                 // Delete the previous thumbnail FIRST. If regeneration then
                 // fails, the book is left with NO thumbnail, not with a stale
                 // one derived from the old cover. (The serve layer falls back
                 // to the current full cover, and the next reconcile backfills
                 // the thumbnail.)
-                let _ = std::fs::remove_file(cover_thumb_path(&book_out));
-                if let Err(err) = extract_cover_thumb(&path, &book_out) {
+                let _ = std::fs::remove_file(cover_thumb_path(book_out));
+                if let Err(err) = extract_cover_thumb(&path, book_out) {
                     tracing::warn!(error = %err, id = %id, "cover thumbnail failed; browse UI will use the full cover");
                 }
                 Some(path.to_string_lossy().into_owned())
@@ -530,13 +793,12 @@ pub fn scan_book_as(
                 // intact on disk. Keep the stored path; do not drop it to
                 // `None` and orphan that still-valid art. `None` would 404 both
                 // cover routes and block the reconcile thumbnail backfill,
-                // which requires a populated `cover_path`. `upsert_book` below
-                // has not run yet, so this read still sees the prior row.
-                let kept = index
-                    .get_book(&id)
-                    .ok()
-                    .flatten()
-                    .and_then(|b| b.cover_path)
+                // which requires a populated `cover_path`. `plan_book` read
+                // this path from the row that is still current: nothing has
+                // been committed for this ingest yet.
+                let kept = single
+                    .previous_cover
+                    .clone()
                     .filter(|p| Path::new(p).exists());
                 if kept.is_some() {
                     tracing::warn!(error = %err, id = %id, "cover extraction failed; keeping the previously extracted cover");
@@ -549,42 +811,40 @@ pub fn scan_book_as(
     } else {
         None
     };
-    log_stage(&id, "cover", cover_start);
+    log_stage(id, "cover", cover_start);
 
-    // `index` covers all DB writes for the book: the book row, every episode
-    // row, and the retain sweep.
-    let index_start = std::time::Instant::now();
     let book = BookRow {
-        id: id.clone(),
-        slug: id.clone(),
+        id: task.id.clone(),
+        slug: task.id.clone(),
         feed_id: podspine_index::capability::generate(),
-        // Per-book overrides (Sprint 6.4). The code above computes them, and
-        // the idempotency guard re-checks them, so a sidecar edit re-persists
-        // them.
-        title: eff_title,
-        author: eff_author,
+        // Per-book overrides (Sprint 6.4). `plan_book` computes them, and its
+        // idempotency guard re-checks them, so a sidecar edit re-persists them.
+        title: task.title.clone(),
+        author: task.author.clone(),
         cover_path,
         source_path: input.to_string_lossy().into_owned(),
         source_mtime,
         // Persist the effective mode so serve/evict honor it without the sidecar.
-        storage_mode: Some(storage),
-        default_cover_url: eff_cover,
-        force_embedded,
+        storage_mode: Some(single.storage),
+        default_cover_url: task.cover_url.clone(),
+        force_embedded: single.force_embedded,
         // What actually happened to this book's audio (Task 5.2): `Off` means a
         // stream copy. The serve/evict layers read this field (nothing
-        // regenerates a transcoded book), and so does the toggle guard above.
+        // regenerates a transcoded book), and so does the toggle guard in
+        // `plan_book`.
         transcode: Some(if transcoding {
             opts.transcode
         } else {
             TranscodeMode::Off
         }),
     };
-    index.upsert_book(&book)?;
 
-    for (ep, (cut, title)) in episodes.iter().zip(&specs) {
-        index.upsert_episode(&EpisodeRow {
-            guid: episode_guid(&id, ep.idx, source_mtime),
-            book_id: id.clone(),
+    let rows: Vec<EpisodeRow> = episodes
+        .iter()
+        .zip(&specs)
+        .map(|(ep, (cut, title))| EpisodeRow {
+            guid: episode_guid(id, ep.idx, source_mtime),
+            book_id: task.id.clone(),
             idx: ep.idx as i64,
             title: title.clone(),
             file_path: ep.path.to_string_lossy().into_owned(),
@@ -599,70 +859,97 @@ pub fn scan_book_as(
             },
             // This flag is only ever true for the single whole-file episode.
             // It drives the http remux-vs-in-place decision and the toggle
-            // guard above.
+            // guard in `plan_book`.
             needs_faststart: needs_ft,
             byte_length: ep.byte_length as i64,
             duration_sec: ep.duration_sec,
             start_sec: cut.start_sec,
             pubdate_epoch: pubdate_epoch(source_mtime, ep.idx, n),
-        })?;
+        })
+        .collect();
+
+    let sweep = if serve_in_place {
+        // Episodes stream from the library now. Any per-episode copy that a
+        // pre-6.2 ingest or a previous transcode left under `<data_dir>` is
+        // therefore dead weight.
+        Sweep::InPlace(book_out.clone())
+    } else {
+        // Keep only the files this ingest wrote; drop old-container leftovers
+        // and files for chapters a shrunk re-ingest dropped.
+        Sweep::Files {
+            book_out: book_out.clone(),
+            keep: episodes
+                .iter()
+                .filter_map(|ep| {
+                    ep.path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(str::to_string)
+                })
+                .collect(),
+        }
+    };
+
+    Ok(PreparedBook {
+        book,
+        episodes: rows,
+        sweep,
+        book_start,
+    })
+}
+
+/// Write one finished ingest to the index, then sweep the files it replaced.
+///
+/// The sweep runs AFTER the rows land, so the server keeps serving the previous
+/// files until the new ones are indexed. An ingest can sit inside a re-encode
+/// for minutes; an up-front delete would 404 every request for that whole
+/// window, and a failed encode would leave the book with no playable episodes
+/// at all. Once the rows are written, any file left in another container is
+/// unreferenced.
+///
+/// A residual window remains, deliberately unguarded. A request can snapshot an
+/// episode row just before the upsert and reach its `File::open` just after the
+/// unlink. That request gets a clean 404 (the http layer fails closed at three
+/// points; it never serves partial or wrong bytes). Three facts bound the
+/// window:
+/// - Only the few microseconds between that snapshot and the open are exposed.
+/// - It can only fire on an ingest that actually CHANGED a book's container: a
+///   transcode flag or target flip. A steady-state rescan deletes nothing.
+/// - On POSIX, a reader that already opened the file keeps its inode regardless.
+///
+/// A guard would mean one of two bad options: hold the index lock across
+/// blocking file I/O, or add a re-resolve-and-retry in the handler that no test
+/// can drive deterministically. Neither is worth it for one retryable 404 during
+/// an operator-triggered re-ingest.
+fn commit_book(index: &Index, prepared: PreparedBook) -> Result<BookRow, ScanError> {
+    let PreparedBook {
+        book,
+        episodes,
+        sweep,
+        book_start,
+    } = prepared;
+
+    // `index` covers all DB writes for the book: the book row, every episode
+    // row, and the retain sweep.
+    let index_start = std::time::Instant::now();
+    index.upsert_book(&book)?;
+    for ep in &episodes {
+        index.upsert_episode(ep)?;
     }
     // Drop any episode rows this ingest did not write: a re-ingest whose chapter
     // list shrank, or whose mtime change reassigned every guid. Done AFTER the
     // upserts, so the feed never sees an empty set (same order rule as the file
     // sweep below).
-    let keep: Vec<String> = episodes
-        .iter()
-        .map(|ep| episode_guid(&id, ep.idx, source_mtime))
-        .collect();
-    index.retain_episodes(&id, &keep)?;
-    log_stage(&id, "index", index_start);
+    let keep: Vec<String> = episodes.iter().map(|ep| ep.guid.clone()).collect();
+    index.retain_episodes(&book.id, &keep)?;
+    log_stage(&book.id, "index", index_start);
 
-    // Sweep leftovers only now, AFTER the index points at this ingest's
-    // episodes. Until that upsert lands, the server still serves the old files,
-    // and this function can sit inside a re-encode for minutes. An up-front
-    // delete would 404 every request for that whole window. And if the encode
-    // then failed, it would leave the book with no playable episodes at all.
-    // Once the rows are written, any file left in another container is
-    // unreferenced.
-    //
-    // A residual window remains, deliberately unguarded. A request can
-    // snapshot an episode row just before the upsert and reach its
-    // `File::open` just after the unlink. That request gets a clean 404 (the
-    // http layer fails closed at three points; it never serves partial or
-    // wrong bytes). Three facts bound the window:
-    // - Only the few microseconds between that snapshot and the open are
-    //   exposed.
-    // - It can only fire on an ingest that actually CHANGED a book's
-    //   container: a transcode flag or target flip. A steady-state rescan
-    //   deletes nothing.
-    // - On POSIX, a reader that already opened the file keeps its inode
-    //   regardless.
-    // A guard would mean one of two bad options: hold the index lock across
-    // blocking file I/O, or add a re-resolve-and-retry in the handler that no
-    // test can drive deterministically. Neither is worth it for one retryable
-    // 404 during an operator-triggered re-ingest.
-    if serve_in_place {
-        // Episodes stream from the library now. Any per-episode copy that a
-        // pre-6.2 ingest or a previous transcode left under `<data_dir>` is
-        // therefore dead weight.
-        remove_stale_episode_copies(&book_out);
-    } else {
-        // Keep only the files this ingest wrote; drop old-container leftovers
-        // and files for chapters a shrunk re-ingest dropped.
-        let keep_files: std::collections::HashSet<String> = episodes
-            .iter()
-            .filter_map(|ep| {
-                ep.path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(str::to_string)
-            })
-            .collect();
-        remove_unreferenced_episode_files(&book_out, &keep_files);
+    match sweep {
+        Sweep::InPlace(book_out) => remove_stale_episode_copies(&book_out),
+        Sweep::Files { book_out, keep } => remove_unreferenced_episode_files(&book_out, &keep),
     }
 
-    log_stage(&id, "book_total", book_start);
+    log_stage(&book.id, "book_total", book_start);
     Ok(book)
 }
 
@@ -751,20 +1038,26 @@ struct Mp3Track {
     title: String,
 }
 
-/// Ingest a folder of per-chapter MP3s as one book under `id`: one episode per
+/// Read an MP3 folder's index state and decide what the scan owes it.
+///
+/// A folder of per-chapter MP3s becomes one book under `id`: one episode per
 /// file, with **no split, no re-encode, and no copy**. The server serves each
 /// track in place from the library (Sprint 6.2). Track number sets the file
-/// order when every track number is present and distinct; otherwise filename
+/// order when every track number is present and distinct. Otherwise filename
 /// order applies and the scan logs a warning. The scan is idempotent on an
 /// unchanged folder.
-fn scan_mp3_folder(
+///
+/// These are the folder's only index reads before [`commit_book`], so
+/// [`scan_library`] runs them serially and hands the probing in
+/// [`ingest_mp3_folder`] to a worker pool.
+fn plan_mp3_folder(
     dir: &Path,
     id: &str,
     data_dir: &Path,
     index: &Index,
     overrides: &BookOverrides,
     library_root: &Path,
-) -> Result<BookRow, ScanError> {
+) -> Result<BookPlan, ScanError> {
     // Canonicalize the folder, so that every track path stored below is
     // absolute and symlink-resolved. In-place serving must not depend on the
     // server's cwd.
@@ -813,9 +1106,28 @@ fn scan_mp3_folder(
                 .iter()
                 .all(|e| !e.source_path.is_empty() && Path::new(&e.source_path).exists())
         {
-            return Ok(existing);
+            return Ok(BookPlan::UpToDate(Box::new(existing)));
         }
     }
+
+    Ok(BookPlan::Ingest(Box::new(IngestTask {
+        input: dir.to_path_buf(),
+        id: id.to_string(),
+        book_out,
+        source_mtime,
+        title: eff_title,
+        author: eff_author,
+        cover_url: eff_cover,
+        kind: IngestKind::Mp3Folder(files),
+    })))
+}
+
+/// Probe an MP3 folder's tracks and build its rows: one episode per file, with
+/// **no split, no re-encode, and no copy**. Touches no index (see
+/// [`IngestTask`]).
+fn ingest_mp3_folder(task: &IngestTask, files: &[PathBuf]) -> Result<PreparedBook, ScanError> {
+    let dir = task.input.as_path();
+    let id = task.id.as_str();
 
     // Per-stage timing (debug only; see `log_stage`). `book_total` spans the
     // full first-ingest work below.
@@ -825,7 +1137,7 @@ fn scan_mp3_folder(
     // file; it is not fatal to the book.
     let probe_start = std::time::Instant::now();
     let mut tracks: Vec<Mp3Track> = Vec::new();
-    for path in &files {
+    for path in files {
         match probe(path) {
             Ok(p) => tracks.push(Mp3Track {
                 duration_sec: p.duration_sec,
@@ -844,36 +1156,31 @@ fn scan_mp3_folder(
     order_mp3_tracks(&mut tracks, dir);
     log_stage(id, "probe", probe_start);
 
-    let index_start = std::time::Instant::now();
     let book = BookRow {
         id: id.to_string(),
         slug: id.to_string(),
         feed_id: podspine_index::capability::generate(),
-        // Per-book overrides (Sprint 6.4). The code above computes them, and
-        // the idempotency guard re-checks them, so a sidecar edit re-persists
+        // Per-book overrides (Sprint 6.4). `plan_mp3_folder` computes them, and
+        // its idempotency guard re-checks them, so a sidecar edit re-persists
         // them. `storage_mode`/`remux`/`force_embedded` are no-ops for MP3
         // folders (the server serves tracks in place), so persist no
         // `storage_mode` (`None` = follow the global setting).
-        title: eff_title,
-        author: eff_author,
+        title: task.title.clone(),
+        author: task.author.clone(),
         cover_path: None,
         source_path: dir.to_string_lossy().into_owned(),
-        source_mtime,
+        source_mtime: task.source_mtime,
         storage_mode: None,
-        default_cover_url: eff_cover,
+        default_cover_url: task.cover_url.clone(),
         // An MP3 folder has no chapters, so `force_embedded` never applies.
         force_embedded: false,
         // MP3 is podcast-safe: the scan never re-encodes an MP3 folder
         // (Task 5.2).
         transcode: Some(TranscodeMode::Off),
     };
-    index.upsert_book(&book)?;
 
     let n = tracks.len();
-    // Each track is a whole file. The server serves it in place from the
-    // library, with no copy. Reclaim any verbatim copies that a pre-6.2 ingest
-    // wrote under `<data_dir>`.
-    remove_stale_episode_copies(&book_out);
+    let mut episodes = Vec::with_capacity(n);
     for (idx, t) in tracks.iter().enumerate() {
         let byte_length = std::fs::metadata(&t.path)
             .map_err(|source| ScanError::Io {
@@ -881,8 +1188,8 @@ fn scan_mp3_folder(
                 source,
             })?
             .len();
-        index.upsert_episode(&EpisodeRow {
-            guid: episode_guid(id, idx, source_mtime),
+        episodes.push(EpisodeRow {
+            guid: episode_guid(id, idx, task.source_mtime),
             book_id: id.to_string(),
             idx: idx as i64,
             title: t.title.clone(),
@@ -896,20 +1203,22 @@ fn scan_mp3_folder(
             // Tracks are whole files, not sub-ranges of a container, so each
             // starts at 0.
             start_sec: 0.0,
-            pubdate_epoch: pubdate_epoch(source_mtime, idx, n),
-        })?;
+            pubdate_epoch: pubdate_epoch(task.source_mtime, idx, n),
+        });
     }
-    // Prune episode rows this ingest did not write (a folder that lost tracks, or
-    // an mtime change that reassigned guids). AFTER the upserts, so the feed
-    // never sees an empty set.
-    let keep: Vec<String> = (0..n)
-        .map(|idx| episode_guid(id, idx, source_mtime))
-        .collect();
-    index.retain_episodes(id, &keep)?;
-    log_stage(id, "index", index_start);
 
-    log_stage(id, "book_total", book_start);
-    Ok(book)
+    Ok(PreparedBook {
+        book,
+        episodes,
+        // Each track is a whole file that the server streams in place from the
+        // library, with no copy. Any verbatim copy a pre-6.2 ingest wrote under
+        // `<data_dir>` is dead weight, but ONLY once the new rows point into
+        // the library. A pre-6.2 book's live rows still name those copies, so
+        // deleting them before the commit would 404 that book until the commit
+        // landed (Greptile P1).
+        sweep: Sweep::InPlace(task.book_out.clone()),
+        book_start,
+    })
 }
 
 /// Order tracks by track number when every number is present and distinct.
@@ -1216,6 +1525,11 @@ pub fn scan_library(
 
     let mut seen = HashSet::new();
     let mut summary = ScanSummary::default();
+
+    // Phase 1, serial: assign each id and read the index. Slug assignment is
+    // order-dependent (it mutates `seen` and asks the index who owns an id), so
+    // it stays in discovery order on this thread, and so does every index read.
+    let mut tasks: Vec<IngestTask> = Vec::new();
     for source in sources {
         let source_path = source.path();
         // If this exact source is already indexed, keep its id. That rule
@@ -1263,33 +1577,35 @@ pub fn scan_library(
             summary.skipped += 1;
             continue;
         }
-        match source {
-            BookSource::File(path) => {
-                match scan_book_as(&path, &slug, data_dir, index, opts, &overrides) {
-                    Ok(book) => {
-                        summary.indexed += 1;
-                        tracing::info!(slug = %book.slug, title = %book.title, "indexed book");
-                    }
-                    Err(err) => {
-                        summary.skipped += 1;
-                        tracing::warn!(error = %err, path = %path.display(), "skipped");
-                    }
-                }
-            }
+        let folder = matches!(source, BookSource::Mp3Folder(_));
+        let plan = match &source {
+            BookSource::File(path) => plan_book(path, &slug, data_dir, index, opts, &overrides),
             BookSource::Mp3Folder(dir) => {
-                match scan_mp3_folder(&dir, &slug, data_dir, index, &overrides, &library_root) {
-                    Ok(book) => {
-                        summary.indexed += 1;
-                        tracing::info!(slug = %book.slug, title = %book.title, "indexed MP3-folder book");
-                    }
-                    Err(err) => {
-                        summary.skipped += 1;
-                        tracing::warn!(error = %err, path = %dir.display(), "skipped");
-                    }
-                }
+                plan_mp3_folder(dir, &slug, data_dir, index, &overrides, &library_root)
+            }
+        };
+        match plan {
+            // Nothing to re-ingest: the book is already indexed at this mtime
+            // with every file in place. It still counts as indexed, exactly as
+            // it did when one call did the check and the work together.
+            Ok(BookPlan::UpToDate(book)) => {
+                summary.indexed += 1;
+                log_indexed(&book, folder);
+            }
+            Ok(BookPlan::Ingest(task)) => tasks.push(*task),
+            Err(err) => {
+                summary.skipped += 1;
+                tracing::warn!(error = %err, path = %source.path().display(), "skipped");
             }
         }
     }
+
+    // Phase 2: the probe, split, transcode, and cover work runs on a worker
+    // pool, which is where a first scan spends nearly all of its wall-clock. No
+    // task holds an index handle, so a worker cannot touch the database. Each
+    // book is committed here on the scan thread as soon as its own ingest
+    // finishes, so a book's files and its rows land together.
+    ingest_and_commit(&tasks, index, &mut summary);
     tracing::info!(
         indexed = summary.indexed,
         skipped = summary.skipped,
@@ -2142,7 +2458,7 @@ mod tests {
         let index = Index::open_in_memory().unwrap();
         let data = dir.join("data");
 
-        let err = scan_mp3_folder(
+        let err = plan_mp3_folder(
             &dir,
             "book-id",
             &data,
@@ -2150,7 +2466,8 @@ mod tests {
             &BookOverrides::default(),
             &dir,
         )
-        .expect_err("a folder with no mp3s must not scan");
+        .err()
+        .expect("a folder with no mp3s must not scan");
 
         assert!(matches!(err, ScanError::EmptyFolder(_)), "got {err:?}");
     }
@@ -3273,6 +3590,70 @@ mod tests {
         assert_eq!(next("dracula"), "dracula-2");
         assert_eq!(next("dracula"), "dracula-3");
         assert_eq!(next("other"), "other");
+    }
+
+    /// The cross-book worker pool must not disturb either load-bearing
+    /// per-book invariant. Each book keeps its own ascending `pubDate` run
+    /// (oldest is chapter 1), and each `enclosure length` is the real file
+    /// size. A rescan must still reuse every id and `guid`.
+    #[test]
+    fn a_parallel_multi_book_scan_keeps_per_book_pubdates_and_lengths() {
+        skip_unless_ffmpeg!();
+        let root = scratch("parallel-books");
+        // Four books, so the scan fills the pool instead of taking the
+        // single-task path.
+        for name in ["alpha", "beta", "gamma", "delta"] {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            synth_three_chapters(&dir, "book.m4a");
+        }
+        let data = root.join("data");
+        let index = Index::open_in_memory().unwrap();
+
+        let summary = scan_library(&root, &data, &index, ScanOptions::default());
+        assert_eq!(summary.indexed, 4, "every book is indexed");
+
+        let books = index.list_books().unwrap();
+        assert_eq!(books.len(), 4, "one row per book");
+        let mut first_guids = Vec::new();
+        for book in &books {
+            let eps = index.episodes_for_book(&book.id).unwrap();
+            assert_eq!(eps.len(), 3, "{}: three chapters", book.slug);
+            for pair in eps.windows(2) {
+                assert!(
+                    pair[0].pubdate_epoch < pair[1].pubdate_epoch,
+                    "{}: pubDates must ascend with the chapter index",
+                    book.slug
+                );
+            }
+            for ep in &eps {
+                let real = std::fs::metadata(&ep.file_path).unwrap().len();
+                assert_eq!(
+                    ep.byte_length as u64, real,
+                    "{}: enclosure length is the real file size",
+                    book.slug
+                );
+            }
+            first_guids.extend(eps.iter().map(|e| e.guid.clone()));
+        }
+
+        // A second scan finds every book up to date: same rows, same guids.
+        let again = scan_library(&root, &data, &index, ScanOptions::default());
+        assert_eq!(again.indexed, 4, "a rescan still reports every book");
+        let mut second_guids = Vec::new();
+        for book in &index.list_books().unwrap() {
+            second_guids.extend(
+                index
+                    .episodes_for_book(&book.id)
+                    .unwrap()
+                    .iter()
+                    .map(|e| e.guid.clone()),
+            );
+        }
+        assert_eq!(
+            first_guids, second_guids,
+            "guids stay stable across a rescan"
+        );
     }
 
     // ---- recursive library discovery ----

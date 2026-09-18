@@ -278,10 +278,10 @@ impl Drop for Permit<'_> {
 }
 
 /// How many ffmpeg jobs may run at once: the CPU count (fallback 4 when the
-/// OS will not say). This is the single source of truth for both the
-/// process-wide [`ffmpeg_gate`] and the per-book split worker pool
-/// ([`split_book_encoded`]), so they agree.
-fn ffmpeg_parallelism() -> usize {
+/// OS will not say). This is the single source of truth for the process-wide
+/// [`ffmpeg_gate`], the per-book split worker pool ([`split_book_encoded`]),
+/// and the scanner's cross-book pool, so all three agree.
+pub fn ffmpeg_parallelism() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
@@ -526,18 +526,32 @@ pub fn split_book(
     chapters: &[ChapterCut],
     out_ext: &str,
 ) -> Result<Vec<SplitEpisode>, SplitError> {
-    split_book_encoded(input, out_dir, chapters, out_ext, Encoding::Copy)
+    split_book_encoded(
+        input,
+        out_dir,
+        chapters,
+        out_ext,
+        Encoding::Copy,
+        ffmpeg_parallelism(),
+    )
 }
 
 /// As [`split_book`], with an explicit [`Encoding`]. [`Encoding::Copy`] is
 /// the stream-copy default; the re-encode modes serve Task 5.2's opt-in
 /// transcoding of sources that podcatchers do not play.
+///
+/// `max_workers` caps this book's split pool. A caller that splits ONE book
+/// passes [`ffmpeg_parallelism`]. A caller that already runs several books at
+/// once passes its share of that budget, so the two pools together spawn about
+/// one thread per CPU instead of one per CPU per book. A value below 1 is read
+/// as 1.
 pub fn split_book_encoded(
     input: &Path,
     out_dir: &Path,
     chapters: &[ChapterCut],
     out_ext: &str,
     enc: Encoding,
+    max_workers: usize,
 ) -> Result<Vec<SplitEpisode>, SplitError> {
     fs::create_dir_all(out_dir).map_err(|source| SplitError::CreateDir {
         path: out_dir.to_path_buf(),
@@ -559,8 +573,8 @@ pub fn split_book_encoded(
     // independent ffmpeg stream copy (or re-encode) to its own
     // `{idx+1:03}.part.<ext>`, so the only shared state is the per-index
     // result slot that each worker writes exactly once. The process-wide
-    // `ffmpeg_gate` bounds the actual ffmpeg concurrency; the pool is capped
-    // at the same CPU count, because extra workers would only park. (This is
+    // `ffmpeg_gate` bounds the actual ffmpeg concurrency, and the pool is
+    // capped at `max_workers`, because extra workers would only park. (This is
     // the first-scan speed-up: the split was serial while the gate sat
     // unused.) Nothing is published yet, so the previously served episodes
     // stay untouched no matter what happens here.
@@ -568,7 +582,7 @@ pub fn split_book_encoded(
     let slots: Vec<Mutex<Option<Result<ProducedPart, SplitError>>>> =
         (0..n).map(|_| Mutex::new(None)).collect();
     let cursor = AtomicUsize::new(0);
-    let workers = ffmpeg_parallelism().min(n);
+    let workers = max_workers.max(1).min(n);
     std::thread::scope(|scope| {
         for _ in 0..workers {
             scope.spawn(|| {

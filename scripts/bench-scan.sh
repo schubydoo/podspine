@@ -198,11 +198,13 @@ ${table}
 
 scan_total (scanner, pure scan):  ${scan_total_s}s
 sum of per-book work (book_total): ${book_total_s}s
-effective parallelism (book_total/scan_total): ${ratio}x  of ${cores} cores
+book overlap (book_total/scan_total): ${ratio}x  on ${cores} cores
 launch -> all indexed (wall):     ${wall_s}s  (includes startup + HTTP poll)
 ========================================================
-A ratio near 1.0 means the scan ran serially across books and most cores sat
-idle -> cross-book parallelism is the win. A high per-stage total (e.g. split or
-index) names the stage to target. Numbers are host-specific; see
+A ratio near 1.0 means the scan ran one book at a time. Above 1.0, books
+overlapped: each book_total is wall-clock, so it also counts the time that book
+waited for an ffmpeg permit, and the ratio can pass the core count once the
+gate is the queue. Read scan_total for the real cost. A high per-stage total
+(e.g. split) names the stage to target. Numbers are host-specific; see
 docs/benchmarks.md for methodology.
 EOF
