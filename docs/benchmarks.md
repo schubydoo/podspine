@@ -90,7 +90,7 @@ parallel, bounded by a CPU-sized ffmpeg gate (measured ~9× on a 20-core host fo
 a 40-chapter book), so many-chapter books scale far better than a linear
 per-chapter model suggests. A library scan also runs whole books in parallel
 through a pool of the same size. On a 20-core host, a 200-book by 8-chapter
-library scanned in 8.0 s instead of 36.1 s (saver mode: 7.7 s instead of 35 s).
+library scanned in 8.7 s instead of 36.1 s (saver mode: 8.1 s instead of 35 s).
 Pre-split ingest remains I/O-bound on slow storage.
 This applies only to **chaptered** books — whole-file episodes (MP3-folder
 tracks, chapterless singles) are served in place from the library and skip the

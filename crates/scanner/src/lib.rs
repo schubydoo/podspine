@@ -35,7 +35,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::UNIX_EPOCH;
 
@@ -156,7 +155,7 @@ pub fn scan_book_as(
 ) -> Result<BookRow, ScanError> {
     match plan_book(input, id, data_dir, index, opts, overrides)? {
         BookPlan::UpToDate(book) => Ok(*book),
-        BookPlan::Ingest(task) => commit_book(index, run_ingest(&task)?),
+        BookPlan::Ingest(task) => commit_book(index, run_ingest(&task, ffmpeg_parallelism())?),
     }
 }
 
@@ -253,8 +252,6 @@ enum Sweep {
         /// The file names to keep.
         keep: HashSet<String>,
     },
-    /// Nothing left to sweep (an MP3 folder sweeps before it writes rows).
-    Done,
 }
 
 /// Read this book's index state and decide what the scan owes it. These are the
@@ -424,55 +421,98 @@ fn plan_book(
 /// Run one prepared book's ingest: the probe, split, transcode, and cover work.
 /// This is the expensive half of a scan, and the half that touches no index, so
 /// [`scan_library`] runs it on a worker pool.
-fn run_ingest(task: &IngestTask) -> Result<PreparedBook, ScanError> {
+///
+/// `split_workers` is this book's share of the CPU budget for its own chapter
+/// split. A scan that already runs several books at once passes a smaller
+/// share, so the book pool and the split pools together stay near one thread
+/// per CPU.
+fn run_ingest(task: &IngestTask, split_workers: usize) -> Result<PreparedBook, ScanError> {
     match &task.kind {
-        IngestKind::Single(single) => ingest_single(task, single),
+        IngestKind::Single(single) => ingest_single(task, single, split_workers),
         IngestKind::Mp3Folder(files) => ingest_mp3_folder(task, files),
     }
 }
 
-/// Run every task across a bounded worker pool and return the results in task
-/// order, so the caller commits them in discovery order.
+/// Run every task across a bounded worker pool, and commit each book as soon
+/// as its own ingest finishes.
+///
+/// A book is committed on THIS thread the moment its worker hands it over, not
+/// after the whole pool drains. That ordering is load-bearing. An ingest
+/// publishes its episode files at the live serve paths, so a re-ingest that
+/// waited for unrelated books would leave the new bytes on disk under the old
+/// rows, and the feed would advertise the previous `enclosure length` for them
+/// (Greptile P1). Committing per book keeps that window as short as the serial
+/// scan's: the file publish and the row write stay next to each other.
+///
+/// Books therefore commit in completion order, not discovery order. Nothing
+/// depends on the row order: the browse list and every feed sort by their own
+/// keys, and ids come from the serial planning phase.
 ///
 /// Cross-book order is safe for the sequential-`pubDate` invariant: a
 /// `pubdate_epoch` is anchored on the book's own `source_mtime` and its own
 /// chapter index, so it never depends on which book a scan reaches first. The
 /// invariant is within a book, and one book stays with one worker.
 ///
-/// The pool is sized like the process-wide ffmpeg gate. The per-book split
-/// pools that these workers start share that same gate, so nesting the two
-/// pools does not raise how many ffmpeg children run at once.
-fn run_ingests(tasks: &[IngestTask]) -> Vec<Result<PreparedBook, ScanError>> {
-    // One book (the usual watcher rescan) does not need a thread.
+/// The pool is sized like the process-wide ffmpeg gate, and each worker gets a
+/// share of that same budget for its book's chapter split. Two nested pools
+/// therefore spawn about one thread per CPU in total, not one per CPU per book
+/// (Greptile P2), and the gate still bounds the ffmpeg children themselves.
+fn ingest_and_commit(tasks: &[IngestTask], index: &Index, summary: &mut ScanSummary) {
+    // One book (the usual watcher rescan) does not need a thread, and it gets
+    // the whole split budget.
     if tasks.len() < 2 {
-        return tasks.iter().map(run_ingest).collect();
+        for task in tasks {
+            let prepared = run_ingest(task, ffmpeg_parallelism());
+            commit_scanned_book(task, prepared, index, summary);
+        }
+        return;
     }
     let workers = ffmpeg_parallelism().min(tasks.len());
+    let split_workers = (ffmpeg_parallelism() / workers).max(1);
     let next = AtomicUsize::new(0);
-    let done: Mutex<Vec<(usize, Result<PreparedBook, ScanError>)>> =
-        Mutex::new(Vec::with_capacity(tasks.len()));
+    let next = &next;
+    let (tx, rx) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
         for _ in 0..workers {
-            scope.spawn(|| {
+            let tx = tx.clone();
+            scope.spawn(move || {
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(task) = tasks.get(i) else { break };
-                    let prepared = run_ingest(task);
-                    // A poisoned lock means another worker panicked while it
-                    // held it. Keep the results that are already there; the
-                    // scope propagates that panic when it joins.
-                    done.lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .push((i, prepared));
+                    // A closed channel means this scan is already unwinding.
+                    if tx.send((i, run_ingest(task, split_workers))).is_err() {
+                        break;
+                    }
                 }
             });
         }
+        // Drop the scan thread's own sender, so the loop below ends when the
+        // last worker drops its clone.
+        drop(tx);
+        for (i, prepared) in rx {
+            commit_scanned_book(&tasks[i], prepared, index, summary);
+        }
     });
-    let mut done = done
-        .into_inner()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    done.sort_by_key(|(i, _)| *i);
-    done.into_iter().map(|(_, prepared)| prepared).collect()
+}
+
+/// Commit one finished ingest and record it in the scan summary. A failed
+/// ingest is skipped, never fatal: one bad book must not stop a scan.
+fn commit_scanned_book(
+    task: &IngestTask,
+    prepared: Result<PreparedBook, ScanError>,
+    index: &Index,
+    summary: &mut ScanSummary,
+) {
+    match prepared.and_then(|p| commit_book(index, p)) {
+        Ok(book) => {
+            summary.indexed += 1;
+            log_indexed(&book, matches!(task.kind, IngestKind::Mp3Folder(_)));
+        }
+        Err(err) => {
+            summary.skipped += 1;
+            tracing::warn!(error = %err, path = %task.input.display(), "skipped");
+        }
+    }
 }
 
 /// Log one indexed book, naming the shape the scan ingested.
@@ -486,7 +526,11 @@ fn log_indexed(book: &BookRow, folder: bool) {
 
 /// Ingest one audiobook file: probe it, resolve its chapter source, extract the
 /// episodes, and build its rows. Touches no index (see [`IngestTask`]).
-fn ingest_single(task: &IngestTask, single: &SingleIngest) -> Result<PreparedBook, ScanError> {
+fn ingest_single(
+    task: &IngestTask,
+    single: &SingleIngest,
+    split_workers: usize,
+) -> Result<PreparedBook, ScanError> {
     let input = task.input.as_path();
     let id = task.id.as_str();
     let book_out = &task.book_out;
@@ -679,7 +723,7 @@ fn ingest_single(task: &IngestTask, single: &SingleIngest) -> Result<PreparedBoo
         })?;
         let tmp = single.data_dir.join(".scan-tmp").join(id);
         let _ = std::fs::remove_dir_all(&tmp); // clear any leftover from a crashed scan
-        let mut eps = split_book_encoded(input, &tmp, &cuts, out_ext, enc)?;
+        let mut eps = split_book_encoded(input, &tmp, &cuts, out_ext, enc, split_workers)?;
         for ep in &mut eps {
             if let Some(name) = ep.path.file_name() {
                 ep.path = book_out.join(name);
@@ -713,7 +757,7 @@ fn ingest_single(task: &IngestTask, single: &SingleIngest) -> Result<PreparedBoo
         }
         eps
     } else {
-        split_book_encoded(input, book_out, &cuts, out_ext, enc)?
+        split_book_encoded(input, book_out, &cuts, out_ext, enc, split_workers)?
     };
     log_stage(id, "split", split_start);
 
@@ -903,7 +947,6 @@ fn commit_book(index: &Index, prepared: PreparedBook) -> Result<BookRow, ScanErr
     match sweep {
         Sweep::InPlace(book_out) => remove_stale_episode_copies(&book_out),
         Sweep::Files { book_out, keep } => remove_unreferenced_episode_files(&book_out, &keep),
-        Sweep::Done => {}
     }
 
     log_stage(&book.id, "book_total", book_start);
@@ -1137,12 +1180,6 @@ fn ingest_mp3_folder(task: &IngestTask, files: &[PathBuf]) -> Result<PreparedBoo
     };
 
     let n = tracks.len();
-    // Each track is a whole file. The server serves it in place from the
-    // library, with no copy. Reclaim any verbatim copies that a pre-6.2 ingest
-    // wrote under `<data_dir>`. This runs BEFORE the rows are committed, which
-    // is the order the pre-parallel scan used: the copies are unreferenced
-    // either way, because every row this ingest writes points into the library.
-    remove_stale_episode_copies(&task.book_out);
     let mut episodes = Vec::with_capacity(n);
     for (idx, t) in tracks.iter().enumerate() {
         let byte_length = std::fs::metadata(&t.path)
@@ -1173,9 +1210,13 @@ fn ingest_mp3_folder(task: &IngestTask, files: &[PathBuf]) -> Result<PreparedBoo
     Ok(PreparedBook {
         book,
         episodes,
-        // The stale-copy sweep above already ran, and an in-place track is
-        // never rewritten, so nothing is left to clean up after the commit.
-        sweep: Sweep::Done,
+        // Each track is a whole file that the server streams in place from the
+        // library, with no copy. Any verbatim copy a pre-6.2 ingest wrote under
+        // `<data_dir>` is dead weight, but ONLY once the new rows point into
+        // the library. A pre-6.2 book's live rows still name those copies, so
+        // deleting them before the commit would 404 that book until the commit
+        // landed (Greptile P1).
+        sweep: Sweep::InPlace(task.book_out.clone()),
         book_start,
     })
 }
@@ -1559,28 +1600,12 @@ pub fn scan_library(
         }
     }
 
-    // Phase 2, parallel: the probe, split, transcode, and cover work, which is
-    // where a first scan spends nearly all of its wall-clock. No task holds an
-    // index handle, so the workers cannot touch the database.
-    let prepared = run_ingests(&tasks);
-
-    // Phase 3, serial: write the finished ingests through the one index
-    // connection, in discovery order. Committing in that order (not in the
-    // order the workers happened to finish) keeps `created_at`, and every log
-    // line, the same as a serial scan produced.
-    for (task, prepared) in tasks.iter().zip(prepared) {
-        let folder = matches!(task.kind, IngestKind::Mp3Folder(_));
-        match prepared.and_then(|p| commit_book(index, p)) {
-            Ok(book) => {
-                summary.indexed += 1;
-                log_indexed(&book, folder);
-            }
-            Err(err) => {
-                summary.skipped += 1;
-                tracing::warn!(error = %err, path = %task.input.display(), "skipped");
-            }
-        }
-    }
+    // Phase 2: the probe, split, transcode, and cover work runs on a worker
+    // pool, which is where a first scan spends nearly all of its wall-clock. No
+    // task holds an index handle, so a worker cannot touch the database. Each
+    // book is committed here on the scan thread as soon as its own ingest
+    // finishes, so a book's files and its rows land together.
+    ingest_and_commit(&tasks, index, &mut summary);
     tracing::info!(
         indexed = summary.indexed,
         skipped = summary.skipped,
