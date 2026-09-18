@@ -452,7 +452,24 @@ async fn a_book_between_ingests_waits_instead_of_rebuilding_a_chapter() {
     // source.
     index.mark_book_for_reingest(&book.id).unwrap();
 
-    let state = saver_state(index, &data, &dir);
+    let reconciles = Arc::new(AtomicUsize::new(0));
+    let state = AppState::new(
+        index,
+        "http://test".to_string(),
+        &data,
+        &dir,
+        None,
+        StorageMode::Saver,
+        None,
+        None,
+        Arc::new({
+            let reconciles = Arc::clone(&reconciles);
+            move || {
+                reconciles.fetch_add(1, AtomicOrdering::SeqCst);
+            }
+        }),
+    )
+    .expect("test dirs canonicalize");
     let app = router(state);
     let resp = app
         .clone()
@@ -478,6 +495,11 @@ async fn a_book_between_ingests_waits_instead_of_rebuilding_a_chapter() {
         !std::path::Path::new(&chapter).exists(),
         "no chapter was rebuilt from the unmeasured source"
     );
+    assert_eq!(
+        reconciles.load(AtomicOrdering::SeqCst),
+        1,
+        "a book turned away at the mtime gate still asks the watcher to repair it"
+    );
 }
 
 /// A cached chapter is not trusted just because it exists. Its size is checked
@@ -486,11 +508,10 @@ async fn a_book_between_ingests_waits_instead_of_rebuilding_a_chapter() {
 /// so a second request can find the file there and never enter the rebuild
 /// branch at all.
 ///
-/// The mismatch must also heal itself. Nothing else would notice it, because
-/// the scanner treats a book whose source mtime is unchanged as up to date,
-/// even in saver mode with no chapter files on disk. So the serve marks the
-/// book for re-ingest and asks the watcher to reconcile, exactly as the
-/// Refresh button does.
+/// The refusal also asks the watcher to reconcile, which is all the serve path
+/// does about it: the single index writer decides, and the scan's own
+/// up-to-date check compares each file against its recorded length, so it
+/// re-ingests this book.
 #[tokio::test]
 async fn a_cached_chapter_of_the_wrong_size_is_refused_and_asks_for_a_re_ingest() {
     let dir = scratch("http-cached-length-guard");
@@ -550,7 +571,11 @@ async fn a_cached_chapter_of_the_wrong_size_is_refused_and_asks_for_a_re_ingest(
         StatusCode::SERVICE_UNAVAILABLE,
         "a cached file of the wrong size is refused, not served"
     );
-    assert!(!cached.exists(), "the mismatched cache entry is dropped");
+    assert!(
+        cached.exists(),
+        "the mismatched file stays: it is never served, and deleting it would \
+         make every retry pay for another rebuild"
+    );
     assert_eq!(
         probe
             .index
@@ -560,8 +585,8 @@ async fn a_cached_chapter_of_the_wrong_size_is_refused_and_asks_for_a_re_ingest(
             .unwrap()
             .unwrap()
             .source_mtime,
-        -1,
-        "the book is marked for re-ingest, so the mismatch can heal"
+        0,
+        "the serve path never writes to the index: the row is untouched"
     );
     assert_eq!(
         reconciles.load(AtomicOrdering::SeqCst),
@@ -693,8 +718,9 @@ async fn a_rebuilt_chapter_that_misses_the_published_length_is_refused() {
         "bytes that contradict the enclosure length are never served"
     );
     assert!(
-        !std::path::Path::new(&chapter).exists(),
-        "the mismatched rebuild is dropped, not cached"
+        std::path::Path::new(&chapter).exists(),
+        "the mismatched rebuild stays on disk, refused rather than deleted, so \
+         a retry costs a stat instead of another ffmpeg run"
     );
 }
 

@@ -68,7 +68,7 @@ use podspine_ui::{
 const MAX_INFLIGHT_REQUESTS: usize = 512;
 
 /// How long the server waits between repair reconcile requests (see
-/// [`invalidate_for_reingest`]). Long enough that these asks cannot hold off
+/// [`request_repair`]). Long enough that these asks cannot hold off
 /// the watcher's two-second quiet period, short enough that a re-ingest which
 /// failed transiently is retried while a listener is still trying to play.
 const REPAIR_COOLDOWN: Duration = Duration::from_secs(60);
@@ -204,7 +204,7 @@ pub struct AppState {
     /// opaque callback so this crate does not depend on the scanner.
     reconcile: Arc<dyn Fn() + Send + Sync>,
     /// When a repair reconcile was last requested, for the rate limit in
-    /// [`invalidate_for_reingest`]. `None` means never.
+    /// [`request_repair`]. `None` means never.
     last_repair: Arc<Mutex<Option<Instant>>>,
 }
 
@@ -301,31 +301,44 @@ fn reingesting_unavailable() -> Response {
         .into_response()
 }
 
-/// Whether `source` still has the mtime that the index recorded for the book.
+/// What a book's library source looks like next to the mtime its row records.
 ///
-/// A `saver` chapter and a faststart copy are both rebuilt from the library
-/// source on demand, and they are served under the `enclosure length` that the
-/// feed published at ingest. So a rebuild is only safe while the source is the
-/// one that was measured. Two things break that: an edited or replaced source
-/// file, and the Refresh button, which sets `source_mtime` to -1 to mark the
-/// row as no longer describing the source.
+/// A `saver` chapter and a faststart copy are both rebuilt from that source on
+/// demand, and served under the `enclosure length` the feed published at
+/// ingest. So a rebuild is only safe while the source is the one that was
+/// measured.
+enum SourceState {
+    /// Still the measured file. A rebuild is safe.
+    Current,
+    /// A different file now: edited, replaced, or marked by Refresh, which
+    /// stores -1 exactly so that no real mtime can match. A re-ingest is due.
+    Changed,
+    /// Cannot be read at all: an unmounted share, a permission error. This is
+    /// NOT the same as changed, because a reconcile treats a source it cannot
+    /// see as deleted.
+    Unreadable,
+}
+
+/// Classify `source` against the mtime the index recorded (see
+/// [`SourceState`]).
 ///
 /// The comparison mirrors the scanner's `mtime_epoch` exactly, including its
 /// treatment of a pre-epoch timestamp as 0. A source dated before 1970 is
 /// ingested with `source_mtime = 0`, so it must compare equal here, or its
-/// chapters could never be rebuilt (Greptile P2). Only an unreadable source
-/// is a mismatch, and the Refresh sentinel of -1 stays distinct from every
-/// real mtime.
-fn source_mtime_matches(source: &FsPath, recorded: i64) -> bool {
-    std::fs::metadata(source)
-        .and_then(|m| m.modified())
-        .ok()
-        .map(|t| {
-            t.duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0)
-        })
-        .is_some_and(|mtime| mtime == recorded)
+/// chapters could never be rebuilt.
+fn source_state(source: &FsPath, recorded: i64) -> SourceState {
+    let Ok(mtime) = std::fs::metadata(source).and_then(|m| m.modified()) else {
+        return SourceState::Unreadable;
+    };
+    let secs = mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if secs == recorded {
+        SourceState::Current
+    } else {
+        SourceState::Changed
+    }
 }
 
 /// Build the router with all routes and middleware layers.
@@ -810,51 +823,92 @@ async fn audio(
                 // due (the source changed, or Refresh invalidated the row),
                 // and until it lands this book waits instead of serving bytes
                 // of the wrong length.
-                if !source_mtime_matches(&regen.source, regen.source_mtime) {
-                    tracing::info!(
-                        feed_id,
-                        number,
-                        "source changed since ingest; waiting for the re-ingest"
-                    );
-                    return Ok(reingesting_unavailable());
+                match source_state(&regen.source, regen.source_mtime) {
+                    SourceState::Current => {}
+                    SourceState::Changed => {
+                        tracing::info!(
+                            feed_id,
+                            number,
+                            "source changed since ingest; waiting for the re-ingest"
+                        );
+                        request_repair(&state);
+                        return Ok(reingesting_unavailable());
+                    }
+                    // An unreadable source asks for NOTHING. A reconcile treats
+                    // a source it cannot see as deleted, and `prune_orphans`
+                    // then drops the book and its capability feed, so every
+                    // subscription URL dies. A flapping mount must not cost a
+                    // listener their feed. Wait for the source instead.
+                    SourceState::Unreadable => {
+                        tracing::warn!(
+                            feed_id,
+                            number,
+                            source = %regen.source.display(),
+                            "source is unreadable; not serving and not asking for a re-ingest"
+                        );
+                        return Ok(reingesting_unavailable());
+                    }
                 }
                 ensure_cached(&state, &target.path, regen).await?;
             }
-            None => return Err(AppError::NotFound),
+            // A file that is not regenerable and not on disk is a 404. Ask
+            // for a reconcile too: the scanner treats a missing file the same
+            // way it treats a wrong-sized one, so it re-ingests the book.
+            None => {
+                request_repair(&state);
+                return Err(AppError::NotFound);
+            }
         }
     }
     // The bytes about to be served must be the length the feed advertises for
     // this episode. Checked on EVERY request, not only after a rebuild: a
     // rebuild publishes at the final path, so a concurrent request can find
-    // the file already there and would otherwise skip the check (Greptile P1).
-    // It also covers a cache file an older build left behind.
-    let on_disk = tokio::fs::metadata(&target.path)
-        .await
-        .map(|m| m.len())
-        .map_err(|_| AppError::NotFound)?;
+    // the file already there and would otherwise skip the check. It also
+    // covers a cache file an older build left behind.
+    let on_disk = match tokio::fs::metadata(&target.path).await {
+        Ok(meta) => meta.len(),
+        // A regenerable file can be unlinked between the check above and here,
+        // by a concurrent refusal or a cache eviction. That is a retry, not a
+        // "gone": 404 would tell a podcatcher to drop the episode.
+        Err(_) if target.regen.is_some() => return Ok(reingesting_unavailable()),
+        Err(_) => return Err(AppError::NotFound),
+    };
     if on_disk != target.byte_length {
-        tracing::warn!(
-            feed_id,
-            number,
-            on_disk,
-            advertised = target.byte_length,
-            "file size != enclosure length; refusing to serve and re-ingesting"
-        );
-        // A regenerable file is a cache entry, so drop it: the next request
-        // rebuilds it from whatever the re-ingest records. A `full`-mode file
-        // is the artifact itself and is left alone for the scan to replace.
-        if target.regen.is_some() {
-            let _ = tokio::fs::remove_file(&target.path).await;
+        // The row was snapshotted before this file I/O, so a re-ingest may have
+        // committed a new length in between and this file may be the NEW,
+        // correct one. Re-read before acting, or a completed repair would be
+        // undone: the fresh file deleted and the book reported broken again.
+        let fresh = current_episode_length(&state, &target.book_id, number);
+        if fresh == Some(on_disk) {
+            tracing::debug!(
+                feed_id,
+                number,
+                "row changed under the request; serving the current file"
+            );
+        } else {
+            tracing::warn!(
+                feed_id,
+                number,
+                on_disk,
+                advertised = fresh.unwrap_or(target.byte_length),
+                "file size != enclosure length; refusing to serve"
+            );
+            // The file stays. Deleting it would send the next request back
+            // into the rebuild branch, so a book that keeps producing the
+            // wrong length (a source edited inside the same second as its
+            // recorded mtime, which neither side can see) would pay for one
+            // ffmpeg run per retry, forever. Leaving it makes every retry a
+            // cheap stat, and the file is never served: this check runs first.
+            // The re-ingest replaces it, and the saver ingest clears it.
+            //
+            // Ask the watcher to look at the library. The scanner's own
+            // up-to-date check compares each non-regenerable file against its
+            // recorded length, so a reconcile re-ingests exactly this book.
+            // Nothing here writes to the index: the http layer refuses and
+            // asks, the single writer decides.
+            request_repair(&state);
+            return Ok(reingesting_unavailable());
         }
-        // Then heal the cause. Nothing else would: a source edited inside the
-        // same second keeps its recorded mtime, and a saver book with that
-        // mtime looks up to date to the scanner even with no chapter files, so
-        // the request would otherwise rebuild and refuse forever (Greptile
-        // P1). Invalidating the row is what the Refresh button does, and it
-        // also short-circuits the retries: -1 fails the mtime gate above, so
-        // they cost no ffmpeg.
-        invalidate_for_reingest(&state, &target.book_id);
-        return Ok(reingesting_unavailable());
     }
     // Final defense in depth: the file now exists, so canonicalize it (this
     // resolves any symlink) and confirm that it still lives under a trusted
@@ -968,47 +1022,55 @@ struct AudioTarget {
     book_id: String,
 }
 
-/// Mark one book for re-ingest and ask the watcher (the single index writer)
-/// to reconcile, the same two steps the Refresh handler takes.
+/// Read this episode's CURRENT `enclosure length` from the index. `None` when
+/// the row is gone, or the index cannot be read.
 ///
-/// Called when a serve finds a file whose size is not the length the feed
-/// published. That means the row and the file disagree, and nothing else would
-/// notice: the scanner treats a book whose source mtime is unchanged as up to
-/// date. Both steps are best-effort, because a failure here must not turn a
-/// clean 503 into a 500. The request is refused either way.
+/// The audio handler snapshots its row before it touches the filesystem, so a
+/// re-ingest can commit between that snapshot and the size check. This gives
+/// the check a second, fresh look before it refuses anything.
+fn current_episode_length(state: &AppState, book_id: &str, number: u32) -> Option<u64> {
+    let idx = i64::from(number.checked_sub(1)?);
+    let index = state
+        .index
+        .lock()
+        .inspect_err(|err| {
+            tracing::warn!(book_id, error = %err, "index lock poisoned; treating the row as unread");
+        })
+        .ok()?;
+    let ep = index
+        .episodes_for_book(book_id)
+        .ok()?
+        .into_iter()
+        .find(|e| e.idx == idx)?;
+    Some(ep.byte_length.max(0) as u64)
+}
+
+/// Ask the watcher (the single index writer) to reconcile, at most once per
+/// [`REPAIR_COOLDOWN`]. This is the ONLY thing the serve path does about a book
+/// it had to refuse. It never writes to the index itself.
 ///
-/// The row is marked on every mismatch, which is idempotent. The SIGNAL is
-/// rate-limited to one per [`REPAIR_COOLDOWN`], for two reasons that pull
-/// against each other.
+/// Both refusal paths call it: a file whose size is not the published length,
+/// and a source that changed under a book that must be rebuilt from it. The
+/// scanner's up-to-date check compares every non-regenerable file against its
+/// recorded length, so the reconcile this asks for re-ingests exactly the book
+/// that is broken.
 ///
-/// Signalling per request would starve the watcher: it restarts its quiet
-/// period on every signal, so a mismatch that each retry re-reports (a
-/// `full`-mode file, kept for the scan to replace rather than deleted) could
-/// hold the reconcile off indefinitely, and stall unrelated library changes
-/// with it. Signalling only once would strand the book instead: a re-ingest
-/// that fails transiently leaves the row marked, so a "already marked, say
-/// nothing" rule would suppress every later attempt, and playback would sit at
-/// 503 until a manual Refresh or a restart (Greptile P1). A cooldown does
-/// both: it cannot extend the debounce, and it retries for as long as requests
-/// keep arriving.
+/// The rate limit matters in both directions. Signalling per request would
+/// starve the watcher, which restarts its quiet period on every signal, so a
+/// mismatch that each retry re-reports could hold the reconcile off and stall
+/// unrelated library changes with it. Never signalling again would strand a
+/// book whose re-ingest failed. A cooldown does both: it cannot extend the
+/// debounce, and it keeps retrying for as long as requests arrive. A suppressed
+/// ask is not lost work, because the next retry after the cooldown sends it,
+/// and a book that nobody retries has nobody waiting on it.
 ///
 /// The cooldown is server-wide rather than per book, because one reconcile
 /// walks the whole library. A single signal repairs every book that is waiting.
-fn invalidate_for_reingest(state: &AppState, book_id: &str) {
-    let marked = match state.index.lock() {
-        Ok(index) => index
-            .mark_book_for_reingest(book_id)
-            .map_err(|e| e.to_string()),
-        Err(err) => Err(format!("index lock poisoned: {err}")),
-    };
-    if let Err(err) = marked {
-        tracing::warn!(book_id, error = %err, "could not mark the book for re-ingest; no reconcile requested");
-        return;
-    }
+fn request_repair(state: &AppState) {
     let send = match state.last_repair.lock() {
         Ok(mut last) => may_request_repair(&mut last, Instant::now()),
         Err(err) => {
-            tracing::warn!(book_id, error = %err, "repair clock poisoned; no reconcile requested");
+            tracing::warn!(error = %err, "repair clock poisoned; no reconcile requested");
             false
         }
     };
@@ -1019,7 +1081,7 @@ fn invalidate_for_reingest(state: &AppState, book_id: &str) {
 
 /// Whether a repair reconcile may be asked for at `now`, given when the last
 /// one was asked for. Records `now` when it says yes. Split out from
-/// [`invalidate_for_reingest`] so the rule can be tested without waiting for a
+/// [`request_repair`] so the rule can be tested without waiting for a
 /// real minute to pass.
 fn may_request_repair(last: &mut Option<Instant>, now: Instant) -> bool {
     if last.is_some_and(|sent| now.duration_since(sent) < REPAIR_COOLDOWN) {
@@ -1041,7 +1103,7 @@ struct Regen {
     out_ext: String,
     op: RegenOp,
     /// The source mtime the ingest recorded on the book row. A rebuild is only
-    /// safe while the source still carries it (see [`source_mtime_matches`]).
+    /// safe while the source still carries it (see [`source_state`]).
     source_mtime: i64,
 }
 
@@ -1132,6 +1194,13 @@ fn resolve_audio_target(
                 number,
                 "in-place source size != recorded enclosure length; refusing to serve (corrupt row?)"
             );
+            // Ask for a reconcile on the way out. The scanner compares an
+            // in-place episode against its recorded length too, so it
+            // re-ingests this book and the row stops disagreeing with the
+            // file. Without the ask, a source restored with its original
+            // mtime would sit here until some unrelated library change
+            // happened to wake the watcher.
+            request_repair(state);
             return Err(AppError::NotFound);
         }
         return Ok(AudioTarget {
@@ -1173,7 +1242,7 @@ fn resolve_audio_target(
     // Two kinds of episode materialize under the data dir here. Both are
     // rebuilt from the library source on demand, so both are gated on the
     // source still being the one the ingest measured (see
-    // [`source_mtime_matches`]). A book whose source changed, or whose row the
+    // [`source_state`]). A book whose source changed, or whose row the
     // Refresh button invalidated, is between ingests: it waits rather than
     // serve bytes under a length the feed can no longer vouch for.
     let regen = if !ep.source_path.is_empty() && ep.needs_faststart {
@@ -1510,6 +1579,40 @@ impl IntoResponse for AppError {
 mod tests {
     use super::*;
     use podspine_test_support::scratch;
+
+    /// The three source states drive three different answers, so each one has
+    /// to be told apart. "Unreadable" is the one that must never be treated as
+    /// "changed": a reconcile would read a source it cannot see as deleted.
+    #[test]
+    fn a_source_is_current_changed_or_unreadable() {
+        let dir = scratch("http-source-state");
+        let source = dir.join("book.m4b");
+        std::fs::write(&source, b"audio").unwrap();
+        let mtime = std::fs::metadata(&source)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        assert!(matches!(source_state(&source, mtime), SourceState::Current));
+        assert!(
+            matches!(source_state(&source, mtime + 1), SourceState::Changed),
+            "a different mtime is a changed source"
+        );
+        assert!(
+            matches!(source_state(&source, -1), SourceState::Changed),
+            "the Refresh sentinel reads as changed, never as current"
+        );
+        assert!(
+            matches!(
+                source_state(&dir.join("gone.m4b"), mtime),
+                SourceState::Unreadable
+            ),
+            "a source that cannot be read is its own state"
+        );
+    }
 
     /// The repair rate limit has to hold both ways. Asks inside the cooldown
     /// are dropped, so they cannot keep restarting the watcher's quiet period.

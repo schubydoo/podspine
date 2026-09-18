@@ -342,11 +342,25 @@ fn plan_book(
             // An episode's file may legitimately be absent when the server
             // regenerates it on demand: a saver chapter, or a remuxed whole-file
             // cache copy. Everything else (full chapters, in-place whole files)
-            // must be present on disk.
+            // must be present on disk AND still be the size the feed publishes
+            // as its `enclosure length`. A file that no longer matches its row
+            // is not servable: the http layer refuses it rather than send bytes
+            // the feed cannot vouch for. Re-ingesting is what makes the two
+            // agree again, and this check is what notices. The stat costs the
+            // same as the existence check it replaces.
+            //
+            // A TRANSCODED book is never regenerable, whatever its storage
+            // mode says: a re-encode is not byte-reproducible, so the ingest
+            // stores its chapters in full and the serve layer refuses to
+            // rebuild them. Reading `saver` alone here would call those files
+            // regenerable and skip the check, and nothing else would ever
+            // notice a damaged one. The serve layer decides the same way,
+            // through `book_is_transcoded`.
+            let stored_transcoded = existing.transcode.is_some_and(TranscodeMode::is_on);
             let files_present = eps.iter().all(|e| {
-                let regenerable = (saver && e.source_path.is_empty())
+                let regenerable = (saver && !stored_transcoded && e.source_path.is_empty())
                     || (!e.source_path.is_empty() && e.file_path != e.source_path);
-                regenerable || Path::new(&e.file_path).exists()
+                regenerable || file_has_length(&e.file_path, e.byte_length)
             });
             // A `.podspine.toml` edit does not change the audio mtime. So also
             // re-ingest when the persisted metadata no longer matches the current
@@ -513,6 +527,16 @@ fn commit_scanned_book(
             tracing::warn!(error = %err, path = %task.input.display(), "skipped");
         }
     }
+}
+
+/// Whether the file at `path` exists and is exactly `expected` bytes.
+///
+/// A missing file and a file of the wrong size are the same answer here: the
+/// row does not describe what is on disk, so the book needs another ingest.
+/// An unreadable file counts as a mismatch too, which costs one re-ingest and
+/// never hides a stale file behind a permission error.
+fn file_has_length(path: &str, expected: i64) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.len() == expected.max(0) as u64)
 }
 
 /// Delete a file an ingest wrote only to measure it: a saver chapter, or a
@@ -1115,10 +1139,16 @@ fn plan_mp3_folder(
         && existing.default_cover_url == eff_cover
     {
         let eps = index.episodes_for_book(id)?;
+        // Every track is served in place, so each one must still be the file
+        // whose length the feed publishes. The folder's `source_mtime` is the
+        // NEWEST track's, so a restore that puts an older track back with its
+        // original timestamp changes no mtime the scan can see. The length
+        // does change, and the serve layer refuses such a track, so this check
+        // is what gets it re-ingested.
         if !eps.is_empty()
-            && eps
-                .iter()
-                .all(|e| !e.source_path.is_empty() && Path::new(&e.source_path).exists())
+            && eps.iter().all(|e| {
+                !e.source_path.is_empty() && file_has_length(&e.source_path, e.byte_length)
+            })
         {
             return Ok(BookPlan::UpToDate(Box::new(existing)));
         }
@@ -3379,9 +3409,18 @@ mod tests {
         };
         // A sentinel in the episode file: an early return leaves it, and a
         // re-ingest overwrites it. (Nothing else in a `full`-mode scan
-        // rewrites the file.)
-        let sentinel = |ep: &str| std::fs::write(ep, b"sentinel").unwrap();
-        let survived = |ep: &str| std::fs::read(ep).unwrap() == b"sentinel";
+        // rewrites the file.) It KEEPS the file's length, because the
+        // idempotency guard compares every non-regenerable file against the
+        // length its row records: a shorter sentinel would itself force the
+        // re-ingest this test is trying to detect.
+        let sentinel = |ep: &str| {
+            let len = std::fs::metadata(ep).unwrap().len() as usize;
+            std::fs::write(ep, vec![b'S'; len]).unwrap();
+        };
+        let survived = |ep: &str| {
+            let bytes = std::fs::read(ep).unwrap();
+            !bytes.is_empty() && bytes.iter().all(|b| *b == b'S')
+        };
 
         let book = scan();
         assert_eq!(book.transcode, Some(TranscodeMode::Off));
@@ -3604,6 +3643,51 @@ mod tests {
         assert_eq!(next("dracula"), "dracula-2");
         assert_eq!(next("dracula"), "dracula-3");
         assert_eq!(next("other"), "other");
+    }
+
+    /// A published file that no longer has the length its row records is not
+    /// servable: the http layer refuses it rather than send bytes the feed
+    /// cannot vouch for. So the next scan must re-ingest that book instead of
+    /// calling it up to date. This is what lets such a mismatch heal with
+    /// nobody writing to the index from the serve path.
+    #[test]
+    fn a_chapter_whose_file_no_longer_matches_its_recorded_length_is_reingested() {
+        skip_unless_ffmpeg!();
+        let root = scratch("length-drift");
+        let input = synth(&root, true);
+        let data = root.join("data");
+        let index = Index::open_in_memory().unwrap();
+        let scan = || {
+            scan_book_as(
+                &input,
+                "driftbook",
+                &data,
+                &index,
+                ScanOptions::default(),
+                &BookOverrides::default(),
+            )
+            .expect("scan")
+        };
+
+        let book = scan();
+        let ep = index.episodes_for_book(&book.id).unwrap()[0].clone();
+        assert!(ep.byte_length > 0, "the ingest recorded a real length");
+
+        // The file now holds fewer bytes than the feed advertises for it.
+        std::fs::write(&ep.file_path, b"truncated").unwrap();
+
+        scan();
+
+        assert_eq!(
+            std::fs::metadata(&ep.file_path).unwrap().len(),
+            ep.byte_length as u64,
+            "the re-ingest restored the published length"
+        );
+        assert_eq!(
+            index.episodes_for_book(&book.id).unwrap()[0].guid,
+            ep.guid,
+            "the guid is unchanged, so no client re-downloads the book"
+        );
     }
 
     /// A measurement file is deleted after its size is recorded, and something
