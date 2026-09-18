@@ -88,7 +88,10 @@ under budget, and idle memory is ~5× under. **P1** used to be the figure to
 watch, and it improved substantially in v1.7.0: chapters are now split in
 parallel, bounded by a CPU-sized ffmpeg gate (measured ~9× on a 20-core host for
 a 40-chapter book), so many-chapter books scale far better than a linear
-per-chapter model suggests. Pre-split ingest remains I/O-bound on slow storage.
+per-chapter model suggests. A library scan also runs whole books in parallel
+through a pool of the same size. On a 20-core host, a 200-book by 8-chapter
+library scanned in 8.0 s instead of 36.1 s (saver mode: 7.7 s instead of 35 s).
+Pre-split ingest remains I/O-bound on slow storage.
 This applies only to **chaptered** books — whole-file episodes (MP3-folder
 tracks, chapterless singles) are served in place from the library and skip the
 split entirely (Sprint 6.2), and `saver` mode trades the persistent split set
@@ -138,12 +141,14 @@ three summary lines:
 
 - `scan_total`: the scanner's own wall-clock for the whole scan.
 - `book_total`: the sum of every book's ingest time.
-- The ratio `book_total / scan_total`: the effective parallelism during the scan.
+- The ratio `book_total / scan_total`: how much the books overlapped.
 
-Read the ratio against the core count. A ratio near `1.0` means the scan ran one
-book at a time and the other cores sat idle. That idle time is the headroom for
-cross-book parallelism. A large per-stage total, for example split or probe,
-names the stage to target first.
+A ratio near `1.0` means the scan ran one book at a time. Above `1.0` the books
+overlapped. Each `book_total` is wall-clock, so it also counts the time that
+book waited for an ffmpeg permit. The ratio can therefore pass the core count
+once the gate is the queue, and it is a shape, not a speedup. Read `scan_total`
+for the real cost of a change. A large per-stage total, for example split or
+probe, names the stage to target first.
 
 The harness reuses `target/release/podspine`. To measure a code change, rebuild
 first with `cargo build --release`, or delete the binary so the harness rebuilds

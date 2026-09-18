@@ -278,10 +278,10 @@ impl Drop for Permit<'_> {
 }
 
 /// How many ffmpeg jobs may run at once: the CPU count (fallback 4 when the
-/// OS will not say). This is the single source of truth for both the
-/// process-wide [`ffmpeg_gate`] and the per-book split worker pool
-/// ([`split_book_encoded`]), so they agree.
-fn ffmpeg_parallelism() -> usize {
+/// OS will not say). This is the single source of truth for the process-wide
+/// [`ffmpeg_gate`], the per-book split worker pool ([`split_book_encoded`]),
+/// and the scanner's cross-book pool, so all three agree.
+pub fn ffmpeg_parallelism() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)

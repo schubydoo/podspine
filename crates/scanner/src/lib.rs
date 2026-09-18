@@ -35,6 +35,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::UNIX_EPOCH;
 
 // All three re-exports are part of this crate's public surface. `BookOverrides`
@@ -47,7 +49,7 @@ use podspine_index::{BookRow, EpisodeRow, Index, IndexError};
 use podspine_prober::{ProbeError, needs_faststart, probe};
 use podspine_splitter::{
     ChapterCut, Encoding, SplitEpisode, SplitError, cover_thumb_path, extract_cover,
-    extract_cover_thumb, remux_faststart, split_book_encoded, transcode_whole,
+    extract_cover_thumb, ffmpeg_parallelism, remux_faststart, split_book_encoded, transcode_whole,
 };
 
 /// DRM extensions that the scanner refuses to ingest. The match ignores case.
@@ -426,6 +428,59 @@ fn run_ingest(task: &IngestTask) -> Result<PreparedBook, ScanError> {
     match &task.kind {
         IngestKind::Single(single) => ingest_single(task, single),
         IngestKind::Mp3Folder(files) => ingest_mp3_folder(task, files),
+    }
+}
+
+/// Run every task across a bounded worker pool and return the results in task
+/// order, so the caller commits them in discovery order.
+///
+/// Cross-book order is safe for the sequential-`pubDate` invariant: a
+/// `pubdate_epoch` is anchored on the book's own `source_mtime` and its own
+/// chapter index, so it never depends on which book a scan reaches first. The
+/// invariant is within a book, and one book stays with one worker.
+///
+/// The pool is sized like the process-wide ffmpeg gate. The per-book split
+/// pools that these workers start share that same gate, so nesting the two
+/// pools does not raise how many ffmpeg children run at once.
+fn run_ingests(tasks: &[IngestTask]) -> Vec<Result<PreparedBook, ScanError>> {
+    // One book (the usual watcher rescan) does not need a thread.
+    if tasks.len() < 2 {
+        return tasks.iter().map(run_ingest).collect();
+    }
+    let workers = ffmpeg_parallelism().min(tasks.len());
+    let next = AtomicUsize::new(0);
+    let done: Mutex<Vec<(usize, Result<PreparedBook, ScanError>)>> =
+        Mutex::new(Vec::with_capacity(tasks.len()));
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(task) = tasks.get(i) else { break };
+                    let prepared = run_ingest(task);
+                    // A poisoned lock means another worker panicked while it
+                    // held it. Keep the results that are already there; the
+                    // scope propagates that panic when it joins.
+                    done.lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push((i, prepared));
+                }
+            });
+        }
+    });
+    let mut done = done
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    done.sort_by_key(|(i, _)| *i);
+    done.into_iter().map(|(_, prepared)| prepared).collect()
+}
+
+/// Log one indexed book, naming the shape the scan ingested.
+fn log_indexed(book: &BookRow, folder: bool) {
+    if folder {
+        tracing::info!(slug = %book.slug, title = %book.title, "indexed MP3-folder book");
+    } else {
+        tracing::info!(slug = %book.slug, title = %book.title, "indexed book");
     }
 }
 
@@ -940,29 +995,18 @@ struct Mp3Track {
     title: String,
 }
 
-/// Ingest a folder of per-chapter MP3s as one book under `id`: one episode per
+/// Read an MP3 folder's index state and decide what the scan owes it.
+///
+/// A folder of per-chapter MP3s becomes one book under `id`: one episode per
 /// file, with **no split, no re-encode, and no copy**. The server serves each
 /// track in place from the library (Sprint 6.2). Track number sets the file
-/// order when every track number is present and distinct; otherwise filename
+/// order when every track number is present and distinct. Otherwise filename
 /// order applies and the scan logs a warning. The scan is idempotent on an
 /// unchanged folder.
-fn scan_mp3_folder(
-    dir: &Path,
-    id: &str,
-    data_dir: &Path,
-    index: &Index,
-    overrides: &BookOverrides,
-    library_root: &Path,
-) -> Result<BookRow, ScanError> {
-    match plan_mp3_folder(dir, id, data_dir, index, overrides, library_root)? {
-        BookPlan::UpToDate(book) => Ok(*book),
-        BookPlan::Ingest(task) => commit_book(index, run_ingest(&task)?),
-    }
-}
-
-/// Read an MP3 folder's index state and decide what the scan owes it. These are
-/// the folder's only index reads before [`commit_book`], so [`scan_library`]
-/// runs them serially and hands the probing to a worker pool.
+///
+/// These are the folder's only index reads before [`commit_book`], so
+/// [`scan_library`] runs them serially and hands the probing in
+/// [`ingest_mp3_folder`] to a worker pool.
 fn plan_mp3_folder(
     dir: &Path,
     id: &str,
@@ -1440,6 +1484,11 @@ pub fn scan_library(
 
     let mut seen = HashSet::new();
     let mut summary = ScanSummary::default();
+
+    // Phase 1, serial: assign each id and read the index. Slug assignment is
+    // order-dependent (it mutates `seen` and asks the index who owns an id), so
+    // it stays in discovery order on this thread, and so does every index read.
+    let mut tasks: Vec<IngestTask> = Vec::new();
     for source in sources {
         let source_path = source.path();
         // If this exact source is already indexed, keep its id. That rule
@@ -1487,30 +1536,48 @@ pub fn scan_library(
             summary.skipped += 1;
             continue;
         }
-        match source {
-            BookSource::File(path) => {
-                match scan_book_as(&path, &slug, data_dir, index, opts, &overrides) {
-                    Ok(book) => {
-                        summary.indexed += 1;
-                        tracing::info!(slug = %book.slug, title = %book.title, "indexed book");
-                    }
-                    Err(err) => {
-                        summary.skipped += 1;
-                        tracing::warn!(error = %err, path = %path.display(), "skipped");
-                    }
-                }
-            }
+        let folder = matches!(source, BookSource::Mp3Folder(_));
+        let plan = match &source {
+            BookSource::File(path) => plan_book(path, &slug, data_dir, index, opts, &overrides),
             BookSource::Mp3Folder(dir) => {
-                match scan_mp3_folder(&dir, &slug, data_dir, index, &overrides, &library_root) {
-                    Ok(book) => {
-                        summary.indexed += 1;
-                        tracing::info!(slug = %book.slug, title = %book.title, "indexed MP3-folder book");
-                    }
-                    Err(err) => {
-                        summary.skipped += 1;
-                        tracing::warn!(error = %err, path = %dir.display(), "skipped");
-                    }
-                }
+                plan_mp3_folder(dir, &slug, data_dir, index, &overrides, &library_root)
+            }
+        };
+        match plan {
+            // Nothing to re-ingest: the book is already indexed at this mtime
+            // with every file in place. It still counts as indexed, exactly as
+            // it did when one call did the check and the work together.
+            Ok(BookPlan::UpToDate(book)) => {
+                summary.indexed += 1;
+                log_indexed(&book, folder);
+            }
+            Ok(BookPlan::Ingest(task)) => tasks.push(*task),
+            Err(err) => {
+                summary.skipped += 1;
+                tracing::warn!(error = %err, path = %source.path().display(), "skipped");
+            }
+        }
+    }
+
+    // Phase 2, parallel: the probe, split, transcode, and cover work, which is
+    // where a first scan spends nearly all of its wall-clock. No task holds an
+    // index handle, so the workers cannot touch the database.
+    let prepared = run_ingests(&tasks);
+
+    // Phase 3, serial: write the finished ingests through the one index
+    // connection, in discovery order. Committing in that order (not in the
+    // order the workers happened to finish) keeps `created_at`, and every log
+    // line, the same as a serial scan produced.
+    for (task, prepared) in tasks.iter().zip(prepared) {
+        let folder = matches!(task.kind, IngestKind::Mp3Folder(_));
+        match prepared.and_then(|p| commit_book(index, p)) {
+            Ok(book) => {
+                summary.indexed += 1;
+                log_indexed(&book, folder);
+            }
+            Err(err) => {
+                summary.skipped += 1;
+                tracing::warn!(error = %err, path = %task.input.display(), "skipped");
             }
         }
     }
@@ -2366,7 +2433,7 @@ mod tests {
         let index = Index::open_in_memory().unwrap();
         let data = dir.join("data");
 
-        let err = scan_mp3_folder(
+        let err = plan_mp3_folder(
             &dir,
             "book-id",
             &data,
@@ -2374,7 +2441,8 @@ mod tests {
             &BookOverrides::default(),
             &dir,
         )
-        .expect_err("a folder with no mp3s must not scan");
+        .err()
+        .expect("a folder with no mp3s must not scan");
 
         assert!(matches!(err, ScanError::EmptyFolder(_)), "got {err:?}");
     }
@@ -3497,6 +3565,70 @@ mod tests {
         assert_eq!(next("dracula"), "dracula-2");
         assert_eq!(next("dracula"), "dracula-3");
         assert_eq!(next("other"), "other");
+    }
+
+    /// The cross-book worker pool must not disturb either load-bearing
+    /// per-book invariant. Each book keeps its own ascending `pubDate` run
+    /// (oldest is chapter 1), and each `enclosure length` is the real file
+    /// size. A rescan must still reuse every id and `guid`.
+    #[test]
+    fn a_parallel_multi_book_scan_keeps_per_book_pubdates_and_lengths() {
+        skip_unless_ffmpeg!();
+        let root = scratch("parallel-books");
+        // Four books, so the scan fills the pool instead of taking the
+        // single-task path.
+        for name in ["alpha", "beta", "gamma", "delta"] {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            synth_three_chapters(&dir, "book.m4a");
+        }
+        let data = root.join("data");
+        let index = Index::open_in_memory().unwrap();
+
+        let summary = scan_library(&root, &data, &index, ScanOptions::default());
+        assert_eq!(summary.indexed, 4, "every book is indexed");
+
+        let books = index.list_books().unwrap();
+        assert_eq!(books.len(), 4, "one row per book");
+        let mut first_guids = Vec::new();
+        for book in &books {
+            let eps = index.episodes_for_book(&book.id).unwrap();
+            assert_eq!(eps.len(), 3, "{}: three chapters", book.slug);
+            for pair in eps.windows(2) {
+                assert!(
+                    pair[0].pubdate_epoch < pair[1].pubdate_epoch,
+                    "{}: pubDates must ascend with the chapter index",
+                    book.slug
+                );
+            }
+            for ep in &eps {
+                let real = std::fs::metadata(&ep.file_path).unwrap().len();
+                assert_eq!(
+                    ep.byte_length as u64, real,
+                    "{}: enclosure length is the real file size",
+                    book.slug
+                );
+            }
+            first_guids.extend(eps.iter().map(|e| e.guid.clone()));
+        }
+
+        // A second scan finds every book up to date: same rows, same guids.
+        let again = scan_library(&root, &data, &index, ScanOptions::default());
+        assert_eq!(again.indexed, 4, "a rescan still reports every book");
+        let mut second_guids = Vec::new();
+        for book in &index.list_books().unwrap() {
+            second_guids.extend(
+                index
+                    .episodes_for_book(&book.id)
+                    .unwrap()
+                    .iter()
+                    .map(|e| e.guid.clone()),
+            );
+        }
+        assert_eq!(
+            first_guids, second_guids,
+            "guids stay stable across a rescan"
+        );
     }
 
     // ---- recursive library discovery ----
