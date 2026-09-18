@@ -570,6 +570,80 @@ async fn a_cached_chapter_of_the_wrong_size_is_refused_and_asks_for_a_re_ingest(
     );
 }
 
+/// A repeated mismatch must ask for a re-ingest ONCE. A `full`-mode file is
+/// kept for the scan to replace, so every retry re-detects the same mismatch,
+/// and the watcher restarts its quiet period on each signal it receives. An
+/// unthrottled ask would therefore hold the reconcile off for as long as the
+/// retries keep coming, and stall unrelated library changes with it.
+#[tokio::test]
+async fn a_repeated_length_mismatch_asks_for_one_re_ingest() {
+    let dir = scratch("http-mismatch-coalesce");
+    let library = dir.join("library");
+    let data = dir.join("data");
+    let book_id = "coalescebook";
+    let book_dir = data.join("books").join(book_id);
+    std::fs::create_dir_all(&book_dir).unwrap();
+    std::fs::create_dir_all(&library).unwrap();
+    std::fs::write(library.join("book.m4b"), b"source inside the library").unwrap();
+    // A `full`-mode chapter (no regeneration), so the file stays put and the
+    // mismatch repeats on every request.
+    let chapter = book_dir.join("001.m4a");
+    std::fs::write(&chapter, b"twelve bytes").unwrap();
+
+    let index = Index::open_in_memory().unwrap();
+    let feed_id = "capabilityidforcoalesce";
+    let mut book = book_row(book_id, feed_id);
+    book.source_path = library.join("book.m4b").to_string_lossy().into_owned();
+    book.storage_mode = Some(StorageMode::Full);
+    index.upsert_book(&book).unwrap();
+    index
+        .upsert_episode(&episode_row(book_id, 0, 4096))
+        .unwrap();
+
+    let reconciles = Arc::new(AtomicUsize::new(0));
+    let state = AppState::new(
+        index,
+        "http://test".to_string(),
+        &data,
+        &library,
+        None,
+        StorageMode::Full,
+        None,
+        None,
+        Arc::new({
+            let reconciles = Arc::clone(&reconciles);
+            move || {
+                reconciles.fetch_add(1, AtomicOrdering::SeqCst);
+            }
+        }),
+    )
+    .expect("test dirs canonicalize");
+    let app = router(state);
+
+    for _ in 0..3 {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/audio/{feed_id}/1"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    assert!(
+        chapter.exists(),
+        "a full-mode file is the artifact, not a cache entry, so it is kept"
+    );
+    assert_eq!(
+        reconciles.load(AtomicOrdering::SeqCst),
+        1,
+        "three refusals ask the watcher once, not three times"
+    );
+}
+
 /// The last line of defense for the `enclosure length` rule: if a rebuild
 /// produces a file whose size is not the length the feed advertises, the
 /// bytes are not served and the file is not kept. A wrong `byte_length` on

@@ -966,9 +966,25 @@ struct AudioTarget {
 /// notice: the scanner treats a book whose source mtime is unchanged as up to
 /// date. Both steps are best-effort, because a failure here must not turn a
 /// clean 503 into a 500. The request is refused either way.
+///
+/// A book that is ALREADY marked sends nothing. That matters because the
+/// watcher restarts its quiet period on every signal it receives, so a
+/// mismatch that each retry re-reports (a `full`-mode file, which is kept for
+/// the scan to replace rather than deleted) could hold the reconcile off
+/// indefinitely and stall unrelated library changes with it (Greptile P1).
+/// One request asks, the rest wait.
 fn invalidate_for_reingest(state: &AppState, book_id: &str) {
     match state.index.lock() {
         Ok(index) => {
+            match index.get_book(book_id) {
+                // `mark_book_for_reingest` stores -1, a sentinel no real mtime
+                // can equal, so this is "a re-ingest is already pending".
+                Ok(Some(book)) if book.source_mtime < 0 => return,
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(book_id, error = %err, "could not read the book row; asking for a re-ingest anyway");
+                }
+            }
             if let Err(err) = index.mark_book_for_reingest(book_id) {
                 tracing::warn!(book_id, error = %err, "could not mark the book for re-ingest");
                 return;

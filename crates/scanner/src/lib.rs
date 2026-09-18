@@ -669,10 +669,23 @@ fn ingest_single(
                 source,
             })?;
             let ep = remux_faststart(input, book_out, 0, out_ext, probed.duration_sec)?;
-            std::fs::remove_file(&ep.path).map_err(|source| ScanError::Io {
-                path: ep.path.clone(),
-                source,
-            })?;
+            // NotFound is fine here, as it is for the saver cleanup below: the
+            // copy lands at the live cache path, so the serve layer can drop
+            // it first. It does exactly that when the copy's size does not
+            // match the length the OLD row still advertises, which is the
+            // normal state mid-re-ingest. Aborting the book for that would
+            // leave the old rows in place and need another remux to recover
+            // (Greptile P2). The measurement is already taken either way.
+            match std::fs::remove_file(&ep.path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(ScanError::Io {
+                        path: ep.path.clone(),
+                        source,
+                    });
+                }
+            }
             vec![ep]
         } else {
             // Serve in place from the read-only library: no ffmpeg, no copy.
