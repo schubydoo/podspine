@@ -464,8 +464,9 @@ the library or how much traffic it takes.
 - **Auto-refresh:** the library is watched while the server runs — adding, replacing,
   or removing a book is picked up automatically within a couple of seconds, no
   restart needed (a removed source is pruned from the index along with its split
-  output). It's also reconciled once at startup. A source that went missing under an
-  empty or unreadable folder is kept instead of pruned, so an unmounted share does not
+  output). It's also reconciled once at startup. A source that went missing under a folder
+  that is now unreadable, or that holds nothing but housekeeping files (`.DS_Store`,
+  `@eaDir`, `lost+found`), is kept instead of pruned, so an unmounted share does not
   delete those books or their feed URLs — the cost is that a book you delete from a
   folder that is now empty stays listed until you remove that folder.
 - **Your source library** is never modified — Podspine only reads it.

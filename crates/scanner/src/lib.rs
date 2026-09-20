@@ -1682,8 +1682,9 @@ pub fn scan_library(
 /// with their split output under `<data_dir>/books/<id>/`. Return the count of
 /// pruned books.
 ///
-/// **Empty-root guard:** if the library root is missing, unreadable, or empty,
-/// the prune removes nothing. A transiently unmounted library looks like
+/// **Empty-root guard:** if the library root is missing, unreadable, or holds
+/// nothing but ignored housekeeping names, the prune removes nothing. A
+/// transiently unmounted library looks like
 /// "every source vanished"; without this guard, an unmount would wipe the
 /// whole index. The cost: when you genuinely delete your *last* book, it stays
 /// indexed until another book is present. That is a safe trade.
@@ -1693,16 +1694,24 @@ pub fn scan_library(
 /// The root guard does not fire, and every book of that share looks deleted.
 /// A prune deletes the book row and its `feed_id` with it, so a remount mints
 /// a new feed URL and breaks every subscription to that book. The prune
-/// therefore keeps a book whose nearest surviving folder is empty or
-/// unreadable (see [`source_folder_is_live`]). The cost: a book you delete
-/// from a folder that is now empty stays indexed until you remove that folder.
+/// therefore keeps a book whose nearest surviving folder holds no content of
+/// its own (see [`source_folder_is_live`] and [`folder_holds_content`]). The
+/// cost: a book you delete from a folder that is now empty stays indexed until
+/// you remove that folder.
 pub fn prune_orphans(library: &Path, data_dir: &Path, index: &Index) -> Result<usize, ScanError> {
-    let root_has_entries = std::fs::read_dir(library)
-        .map(|mut rd| rd.next().is_some())
-        .unwrap_or(false);
+    // A stored `source_path` is canonical, so the containment check below needs
+    // a canonical root to compare it against. A library given as a relative
+    // path, or through a symlink (`/var` on macOS, `/library` bind-mounted
+    // somewhere else), would otherwise fail the check for every book, and the
+    // guard would pass them all through to the prune (Greptile P1).
+    let library_root = library
+        .canonicalize()
+        .unwrap_or_else(|_| library.to_path_buf());
+
+    let root_has_entries = std::fs::read_dir(&library_root).is_ok_and(folder_holds_content);
     if !root_has_entries {
         tracing::warn!(
-            library = %library.display(),
+            library = %library_root.display(),
             "library root empty or unreadable — skipping orphan prune (unmount guard)"
         );
         return Ok(0);
@@ -1714,7 +1723,7 @@ pub fn prune_orphans(library: &Path, data_dir: &Path, index: &Index) -> Result<u
         if source.exists() {
             continue;
         }
-        if !source_folder_is_live(library, source) {
+        if !source_folder_is_live(&library_root, source) {
             tracing::warn!(
                 slug = %book.slug,
                 source = %book.source_path,
@@ -1738,22 +1747,22 @@ pub fn prune_orphans(library: &Path, data_dir: &Path, index: &Index) -> Result<u
 
 /// Tell "this one book was deleted" apart from "the share that held it went
 /// away". Walk up from a missing source to the nearest folder that reads, and
-/// stop at the library root.
+/// stop at `library_root`, which must be canonical.
 ///
 /// An unmount leaves the mount point behind as an empty directory, and a
 /// stale network handle leaves it unreadable. Both answer `false`, so the
 /// caller keeps the book. A real delete leaves the surrounding folder
 /// populated, or takes that folder with it, and the walk then reaches a
 /// populated ancestor and answers `true`.
-fn source_folder_is_live(library: &Path, source: &Path) -> bool {
+fn source_folder_is_live(library_root: &Path, source: &Path) -> bool {
     let mut candidate = source.parent();
     while let Some(dir) = candidate {
         // A source outside the library root is not this guard's business.
-        if !dir.starts_with(library) {
+        if !dir.starts_with(library_root) {
             return true;
         }
         match std::fs::read_dir(dir) {
-            Ok(mut entries) => return entries.next().is_some(),
+            Ok(entries) => return folder_holds_content(entries),
             // This folder went with the book. Try the one above it.
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             // Unreadable is not proof of a delete.
@@ -1762,6 +1771,25 @@ fn source_folder_is_live(library: &Path, source: &Path) -> bool {
         candidate = dir.parent();
     }
     true
+}
+
+/// Whether a directory listing proves that the storage behind it is here.
+///
+/// An entry that fails to read answers `false`: a stale network handle fails
+/// part way through its listing, and a half-read share is not proof of a
+/// delete. The names the walk ignores ([`is_ignored_name`]: dotfiles,
+/// `@eaDir`, `lost+found`) answer `false` on their own, because an unmounted
+/// mount point keeps such housekeeping entries while every book under it is
+/// gone (Greptile P1). A name that is not valid UTF-8 is a real entry, not an
+/// ignored one.
+fn folder_holds_content(entries: std::fs::ReadDir) -> bool {
+    for entry in entries {
+        let Ok(entry) = entry else { return false };
+        if !entry.file_name().to_str().is_some_and(is_ignored_name) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Reconcile the index with the library: [`scan_library`] (add/update), then
@@ -5804,6 +5832,59 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn prune_orphans_keeps_a_book_whose_share_left_only_housekeeping_files() {
+        skip_unless_ffmpeg!();
+        // A mount point rarely comes back bare. A file manager, a NAS, or a
+        // sync client leaves a dotfile or a `@eaDir` behind, and the walk
+        // ignores exactly those names. They must not read as "the share is
+        // here" (Greptile P1).
+        let (root, data, index) = two_share_library("prune-share-junk");
+        scan_library(&root, &data, &index, ScanOptions::default());
+        assert_eq!(index.list_books().unwrap().len(), 2);
+
+        let share_a = root.join("share-a");
+        std::fs::remove_file(share_a.join("alpha.m4a")).unwrap();
+        std::fs::write(share_a.join(".DS_Store"), b"junk").unwrap();
+        std::fs::create_dir_all(share_a.join("@eaDir")).unwrap();
+        let pruned = prune_orphans(&root, &data, &index).unwrap();
+
+        assert_eq!(pruned, 0, "ignored names are not proof of a live share");
+        assert_eq!(index.list_books().unwrap().len(), 2);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// The library root reaches the guard exactly as the operator wrote it,
+    /// while every stored `source_path` is canonical. On macOS the scratch
+    /// root is already such a pair (`/var` links to `/private/var`), and a
+    /// bind-mounted `/library` is the same shape on Linux. Without a
+    /// canonical root the containment check fails for every book, and the
+    /// guard passes them all to the prune (Greptile P1).
+    #[cfg(unix)]
+    #[test]
+    fn prune_orphans_guards_a_library_reached_through_a_symlink() {
+        skip_unless_ffmpeg!();
+        let (root, data, index) = two_share_library("prune-share-symlink");
+        scan_library(&root, &data, &index, ScanOptions::default());
+        assert_eq!(index.list_books().unwrap().len(), 2);
+
+        let alias = scratch("prune-share-alias");
+        let linked_root = alias.join("library");
+        std::os::unix::fs::symlink(root.as_ref() as &Path, &linked_root).unwrap();
+
+        std::fs::remove_file(root.join("share-a").join("alpha.m4a")).unwrap();
+        let pruned = prune_orphans(&linked_root, &data, &index).unwrap();
+
+        assert_eq!(pruned, 0, "the guard holds through a symlinked root");
+        assert_eq!(index.list_books().unwrap().len(), 2);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&alias);
     }
 
     #[test]
