@@ -753,10 +753,11 @@ book's QR code to open its one-tap <a href="importing/">subscribe page</a>.</p>
 <p>On first start Podspine processes your whole library — <strong>chaptered</strong> books are
 split into per-chapter episodes (whole-file books, like MP3 folders, stream in
 place), so a large chaptered library can take minutes. While it runs, the browse
-page shows a self-refreshing <strong>"Scanning…"</strong> message (it isn't broken — it turns
-into your book grid when the scan finishes), and feed/audio requests answer <code>503</code>
-with <code>Retry-After</code> so podcatchers simply retry. A restart with an already-populated
-<code>/data</code> volume is fast — it only processes what's new or changed.</p>
+page shows a self-refreshing <strong>"Scanning…"</strong> message with the count of books
+finished so far (it isn't broken — it turns into your book grid when the scan
+finishes), and feed/audio requests answer <code>503</code> with <code>Retry-After</code> so podcatchers
+simply retry. A restart with an already-populated <code>/data</code> volume is fast — it only
+processes what's new or changed.</p>
 </div>
 <div class="admonition tip">
 <p class="admonition-title">Set <code>PODSPINE_BASE_URL</code></p>
