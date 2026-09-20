@@ -33,7 +33,7 @@ The crates are described below; the pipeline runs left to right, with the SQLite
 | Crate | Responsibility |
 |---|---|
 | `config` | Resolve settings from CLI flags → env → TOML (in that precedence); preflight `ffmpeg`/`ffprobe` so a missing toolchain fails at startup, not mid-request. |
-| `scanner` | Walk the library, classify each book (single audio file, per-book subfolder, or multi-track MP3 folder), and orchestrate probe → chapters → split → cover → index. Assigns collision-free slugs; one bad book never aborts the scan. Also hosts the background watcher that debounces filesystem changes and re-reconciles the index while the server runs. |
+| `scanner` | Walk the library, classify each book (single audio file, per-book subfolder, or multi-track folder), and orchestrate probe → chapters → split → cover → index. Assigns collision-free slugs; one bad book never aborts the scan. Also hosts the background watcher that debounces filesystem changes and re-reconciles the index while the server runs. |
 | `prober` | Thin `ffprobe` wrapper → `ProbedBook` (duration, audio codec, cover presence/codec, track/title tags, embedded chapters). Parsing is separated from the subprocess call so it's unit-testable. |
 | `chapters` | Resolve the chapter source: a sibling `.cue` (75 fps `INDEX 01`) or `.ffmeta` sidecar wins over embedded markers (priority `.cue` > `.ffmeta` > embedded). `.opf`/`.nfo`/`.odm` are never chapter sources. |
 | `splitter` | `ffmpeg` wrapper: stream-copy each chapter into a codec-matching container (no re-encode). Bounds concurrency with a semaphore and enforces a per-child timeout/kill. Also extracts cover art. |
@@ -69,9 +69,11 @@ flowchart TD
   with chapters) are split by chapter via stream copy into a container matching
   the source codec (`m4a`/`mp3`/`flac`/`ogg`/`opus`) — see the storage model below
   for `full` vs `saver`.
-- **MP3 folders** (per-chapter tracks) are treated as one episode per file, ordered
-  by track number (falling back to filename order) and **served in place** from the
-  library — no copy, no re-split, no re-encode.
+- **Track folders** (a folder of per-chapter files: several `.mp3`, or several
+  `.ogg`/`.opus`/`.flac`) are treated as one episode per file, ordered by track
+  number (falling back to filename order) and **served in place** from the library
+  — no copy, no re-split, no re-encode. A folder of several `.m4b`/`.m4a` files is
+  several books instead, unless its `.podspine.toml` sets `folder_is_one_book`.
 - A book with no chapters and no sidecar degrades to a single-episode feed with a
   warning; that whole file is also **served in place** (Sprint 6.2).
 

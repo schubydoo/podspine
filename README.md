@@ -160,7 +160,14 @@ is scanned as-is, series folders and all. Nothing needs rearranging.
 | Tier | Formats | Chapter source |
 |---|---|---|
 | **1** | M4B / M4A (AAC/ALAC), single-file MP3, **folder of per-chapter MP3s** | embedded chapters / file (track) order |
-| **2** | OGG Vorbis, Opus, FLAC | embedded chapters, or a `.cue` sidecar (FLAC needs one) |
+| **2** | OGG Vorbis, Opus, FLAC, **folder of per-chapter Tier-2 tracks** | embedded chapters, or a `.cue` sidecar (FLAC needs one) / file (track) order |
+
+Folder tracks are served exactly as they are, so `PODSPINE_TRANSCODE` does not reach
+them yet: a folder of FLAC tracks needs a podcast app that plays FLAC.
+
+A folder of several `.m4b`/`.m4a` files is several books, one per file — that is what
+an author folder usually is. Put `folder_is_one_book = true` in a `.podspine.toml`
+inside the folder when it is really one book split by disc.
 
 **Chapter sidecars.** A companion file beside the audio is preferred over
 embedded chapters, in priority order: **`.cue`** (`INDEX 01`, 75 frames/sec) →

@@ -195,9 +195,17 @@ library/
   episode whose file resolves outside the library root — indexing it would publish
   a feed whose audio 404s. A link that stays inside the library is fine, and the
   same book reached two ways is indexed once.
-- Several `.ogg`/`.opus`/`.flac` files in one folder are **skipped with a warning**
-  — only `.mp3` folders are read as one book's tracks. Give each such book its own
-  folder, or add a `.cue`.
+- **Several `.ogg`/`.opus`/`.flac` files in one folder are one book's tracks**, the
+  same rule `.mp3` folders have always had. Folder tracks are served as they are,
+  so a podcast app that does not play Opus or FLAC will not play such a book yet —
+  `PODSPINE_TRANSCODE` covers single files, not folder tracks.
+- **A folder of several `.m4b`/`.m4a` files stays several books.** That is what an
+  author folder usually is, and each file keeps its own feed URL. If the folder is
+  really one book split by disc, put `folder_is_one_book = true` in a
+  `.podspine.toml` inside it. Flipping that key **retires the books of the old
+  shape**, with their feed URLs, so one folder is one reading of its audio and never
+  two. A book is retired only once the new shape is indexed and serving every one of
+  its episodes, so a scan that fails leaves the old books playing.
 
 ## Per-book overrides (`.podspine.toml`)
 
@@ -211,8 +219,8 @@ env → global config file → default.**
 - **A single file** — name it after the file: `Author - Title.podspine.toml`
   beside `Author - Title.m4b` (same as a `.cue` sidecar). Works whether the file
   is at the top level or in its own folder.
-- **A multi-file (MP3-folder) book, or a lone file kept in its own folder** — drop
-  a `.podspine.toml` **inside that folder**.
+- **A multi-track folder book, or a lone file kept in its own folder** — drop a
+  `.podspine.toml` **inside that folder**.
 
 **Keys you can set:**
 
@@ -223,6 +231,7 @@ env → global config file → default.**
 | `remux_non_faststart` | Remux this book to faststart if it's a non-faststart mp4. |
 | `default_cover_url` | Feed cover fallback for this book. |
 | `title` / `author` | Override the feed title/author (fix metadata without renaming files). |
+| `folder_is_one_book` | `true` makes every audio file in this folder one book's tracks, whatever their extension. |
 | `disabled` | `true` removes this book from the index and every feed/page. |
 | `force_reingest` | `true` re-processes the book on every scan (drop it once you're done). |
 
@@ -231,6 +240,9 @@ env → global config file → default.**
 storage_mode = "saver"
 title = "The Correct Title"
 ```
+
+Editing a `.podspine.toml` starts a reconcile on its own, like any other library
+change, so an edit takes effect within a couple of seconds.
 
 Server-wide keys (`bind`, `base_url`, `library`, `data_dir`, `cache_size`,
 `cache_ttl`, `transcode`, …) are **ignored with a log warning** if they appear in a
