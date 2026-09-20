@@ -1598,10 +1598,9 @@ fn collapse_duplicate_source_rows(index: &Index, data_dir: &Path) {
     }
 }
 
-/// The canonical paths one scan discovered, in the three shapes
-/// [`retire_regrouped_books`] compares a stored row against.
+/// The canonical source paths one scan discovered.
 struct DiscoveredPaths {
-    /// Every discovered source.
+    /// Every discovered source, folder books and single files alike.
     sources: HashSet<PathBuf>,
     /// The folders discovered as one book of tracks.
     track_folders: HashSet<PathBuf>,
@@ -1637,20 +1636,10 @@ impl DiscoveredPaths {
         }
         this
     }
-
-    /// Whether this scan supersedes a stored book whose source is `source`:
-    /// the path is no longer a book of its own, and the folder around it is a
-    /// book now, or its own children are.
-    fn supersedes(&self, source: &Path) -> bool {
-        !self.sources.contains(source)
-            && (source
-                .parent()
-                .is_some_and(|parent| self.track_folders.contains(parent))
-                || self.file_parents.contains(source))
-    }
 }
 
-/// Retire the rows of a folder's previous shape after its grouping changed.
+/// Retire a book that another book now serves in full, after a folder changed
+/// shape.
 ///
 /// `folder_is_one_book` changes what a folder's books ARE: several single-file
 /// books become one folder book, and removing the key turns them back. The
@@ -1661,12 +1650,20 @@ impl DiscoveredPaths {
 /// serve both readings of the same audio, each under its own feed URL
 /// (Greptile P1).
 ///
-/// So a superseded row is deleted here, in the scan's serial phase, before any
-/// ingest publishes the new shape. A row counts as superseded when its source
-/// is still on disk, is not itself a discovered source, and either sits
-/// directly inside a discovered track folder, or is the folder that holds a
-/// discovered file. The operator asked for the change, and its cost is plain:
-/// the retired books lose their feed URLs.
+/// **A row is retired only when another indexed book already serves every one
+/// of its episodes.** Paths alone are not proof of a regrouping: dropping one
+/// stray `.m4b` into an established MP3 folder makes that file a book of its
+/// own, and a rule that read "a child of mine is a book now" would delete the
+/// folder's feed over a file it never served (Greptile P1). The episode check
+/// answers the real question instead, because the audio a listener holds a
+/// feed for is exactly what must not go missing.
+///
+/// This runs **after** the scan committed the new shape, for the same reason.
+/// A book is retired once its replacement is in the index, so an ingest that
+/// fails leaves the old books playing. The row goes before its files, the
+/// order [`commit_book`] uses: a row that outlives its files serves errors,
+/// while files that outlive their row are only wasted bytes that the next
+/// scan reclaims.
 fn retire_regrouped_books(index: &Index, data_dir: &Path, sources: &[BookSource]) {
     let discovered = DiscoveredPaths::of(sources);
     let books = match index.list_books() {
@@ -1676,20 +1673,19 @@ fn retire_regrouped_books(index: &Index, data_dir: &Path, sources: &[BookSource]
             return;
         }
     };
-    for book in books {
+    for book in &books {
         // A source that is gone is `prune_orphans`' business, not this one.
         let Ok(source) = Path::new(&book.source_path).canonicalize() else {
             continue;
         };
-        if !discovered.supersedes(&source) {
+        if discovered.sources.contains(&source) {
+            // Still a book in its own right.
             continue;
         }
-        let book_out = data_dir.join("books").join(&book.id);
-        if book_out.exists()
-            && let Err(err) = std::fs::remove_dir_all(&book_out)
-        {
-            tracing::warn!(error = %err, dir = %book_out.display(), "could not remove a regrouped book's output");
+        if !fully_served_elsewhere(index, book, &source, &discovered, &books) {
+            continue;
         }
+        // The row first, then its files.
         match index.delete_book(&book.id) {
             Ok(_) => tracing::warn!(
                 slug = %book.slug,
@@ -1697,10 +1693,70 @@ fn retire_regrouped_books(index: &Index, data_dir: &Path, sources: &[BookSource]
                 "retired a book whose folder is now grouped differently — its feed URL is gone"
             ),
             Err(err) => {
-                tracing::warn!(error = %err, slug = %book.slug, "could not retire a regrouped book")
+                tracing::warn!(error = %err, slug = %book.slug, "could not retire a regrouped book");
+                continue;
             }
         }
+        let book_out = data_dir.join("books").join(&book.id);
+        if book_out.exists()
+            && let Err(err) = std::fs::remove_dir_all(&book_out)
+        {
+            tracing::warn!(error = %err, dir = %book_out.display(), "could not remove a regrouped book's output");
+        }
     }
+}
+
+/// Whether another indexed book already serves every episode of `book`.
+///
+/// Two shapes qualify, one per direction of a `folder_is_one_book` flip:
+///
+/// - `book` is a file that now sits inside a discovered track folder. The
+///   folder book serves it when one of its episodes streams this very file.
+/// - `book` is a folder whose children are discovered as single files now.
+///   The per-file books serve it when every episode of `book` names a file
+///   that is itself an indexed book.
+///
+/// Anything else answers `false`, including the stray-file case that looks
+/// like a regrouping from the paths alone.
+fn fully_served_elsewhere(
+    index: &Index,
+    book: &BookRow,
+    source: &Path,
+    discovered: &DiscoveredPaths,
+    books: &[BookRow],
+) -> bool {
+    let episodes_of = |id: &str| match index.episodes_for_book(id) {
+        Ok(eps) => eps,
+        Err(err) => {
+            tracing::warn!(error = %err, id, "could not read episodes; leaving the book alone");
+            Vec::new()
+        }
+    };
+
+    if let Some(parent) = source.parent()
+        && discovered.track_folders.contains(parent)
+    {
+        let wanted = parent.to_string_lossy();
+        let Some(folder_book) = books.iter().find(|b| b.source_path == wanted) else {
+            // The folder book is not in the index (its ingest failed), so
+            // nothing serves this file yet.
+            return false;
+        };
+        return episodes_of(&folder_book.id)
+            .iter()
+            .any(|e| Path::new(&e.source_path) == source);
+    }
+
+    if discovered.file_parents.contains(source) {
+        let indexed_sources: HashSet<&str> = books.iter().map(|b| b.source_path.as_str()).collect();
+        let episodes = episodes_of(&book.id);
+        return !episodes.is_empty()
+            && episodes
+                .iter()
+                .all(|e| indexed_sources.contains(e.source_path.as_str()));
+    }
+
+    false
 }
 
 /// Scan a library root of many audiobooks into `index`. Write each book's
@@ -1748,10 +1804,6 @@ fn scan_library_with_progress(
     // Enforce one row per source BEFORE this scan reads the reuse map, so that
     // the map cannot inherit a duplicate (invariant A; see the function's doc).
     collapse_duplicate_source_rows(index, data_dir);
-    // Then retire the rows of a grouping that this scan no longer sees, for
-    // the same reason: the reuse map below must not carry a book that the
-    // library has stopped having.
-    retire_regrouped_books(index, data_dir, &sources);
 
     // Every already-indexed book, keyed by its (canonical) source path. A
     // source that is already indexed keeps whatever id it has, including a
@@ -1786,7 +1838,7 @@ fn scan_library_with_progress(
     // up-to-date book, and the failed plan. A book that reaches `tasks` is
     // counted in phase 2 instead, when its commit returns.
     let mut tasks: Vec<IngestTask> = Vec::new();
-    for source in sources {
+    for source in &sources {
         let source_path = source.path();
         // If this exact source is already indexed, keep its id. That rule
         // makes a feed URL stable across scans, and it stops a once-suffixed
@@ -1815,7 +1867,7 @@ fn scan_library_with_progress(
         // book's own `.podspine.toml` says otherwise. An explicit title always
         // wins.
         if overrides.title.is_none()
-            && let Some(title) = nested_title(&source, &library_root)
+            && let Some(title) = nested_title(source, &library_root)
         {
             overrides.title = Some(title);
         }
@@ -1865,6 +1917,10 @@ fn scan_library_with_progress(
     // book is committed here on the scan thread as soon as its own ingest
     // finishes, so a book's files and its rows land together.
     ingest_and_commit(&tasks, index, &mut summary, progress);
+    // The new shape is committed, so any book it replaced can go. This runs
+    // last on purpose: a book is retired only once its replacement is in the
+    // index, so an ingest that failed leaves the old books playing.
+    retire_regrouped_books(index, data_dir, &sources);
     tracing::info!(
         indexed = summary.indexed,
         skipped = summary.skipped,
@@ -4950,6 +5006,45 @@ mod tests {
             !split_again.contains(&grouped[0]),
             "the folder book is retired, not kept beside them"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn a_stray_file_in_a_track_folder_never_retires_its_book() {
+        skip_unless_ffmpeg!();
+        // One `.m4b`/`.m4a` dropped into an established MP3 folder makes that
+        // file a book of its own, because a folder holding one is an author
+        // folder by the classification rules. The folder's own book must
+        // survive: nothing serves its tracks, so retiring it would delete a
+        // live feed over a file it never carried (Greptile P1).
+        let root = scratch("stray-lib");
+        let data = scratch("stray-data");
+        let folder = root.join("A Folder Book");
+        if synth_mp3(&folder, "01.mp3", Some(1), 3).is_none()
+            || synth_mp3(&folder, "02.mp3", Some(2), 3).is_none()
+        {
+            skip!("no libmp3lame encoder");
+        }
+        let index = Index::open_in_memory().unwrap();
+
+        scan_library(&root, &data, &index, ScanOptions::default());
+        let before = index.list_books().unwrap();
+        assert_eq!(before.len(), 1, "the folder is one book");
+        let feed_id = before[0].feed_id.clone();
+
+        let stray = synth(&folder, false);
+        std::fs::rename(&stray, folder.join("bonus.m4a")).unwrap();
+        scan_library(&root, &data, &index, ScanOptions::default());
+
+        let after = index.list_books().unwrap();
+        let slugs: Vec<&str> = after.iter().map(|b| b.slug.as_str()).collect();
+        assert!(
+            after.iter().any(|b| b.feed_id == feed_id),
+            "the folder book keeps its feed URL: {slugs:?}"
+        );
+        assert_eq!(after.len(), 2, "the stray file is its own book: {slugs:?}");
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&data);

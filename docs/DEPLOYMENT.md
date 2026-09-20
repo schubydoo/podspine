@@ -203,7 +203,9 @@ library/
   author folder usually is, and each file keeps its own feed URL. If the folder is
   really one book split by disc, put `folder_is_one_book = true` in a
   `.podspine.toml` inside it. Flipping that key **retires the books of the old
-  shape**, with their feed URLs — one folder is one reading of its audio, never two.
+  shape**, with their feed URLs, so one folder is one reading of its audio and never
+  two. A book is retired only once the new shape is indexed and serving every one of
+  its episodes, so a scan that fails leaves the old books playing.
 
 ## Per-book overrides (`.podspine.toml`)
 
