@@ -272,20 +272,40 @@ impl Index {
         // reclaims the split output of a row it drops; this cannot, because
         // the index does not know the data dir, so the next scan's sweep
         // clears it.
-        Self::collapse_duplicate_sources(conn)?;
-        conn.execute_batch(
-            "CREATE UNIQUE INDEX IF NOT EXISTS book_source_path ON book(source_path);",
-        )?;
+        //
+        // Both steps run in ONE transaction. They are a single change: rows
+        // deleted for an index that then failed to appear would be rows lost
+        // for nothing, and `Index::open` reports the failure, so the operator
+        // would restart into a database that had quietly shed books
+        // (Greptile P2).
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let collapsed = match Self::collapse_and_index_sources(conn) {
+            Ok(removed) => {
+                conn.execute_batch("COMMIT")?;
+                removed
+            }
+            Err(err) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(err);
+            }
+        };
+        // Logged after the commit, so the line only claims what survived.
+        if collapsed > 0 {
+            tracing::warn!(
+                removed = collapsed,
+                "removed book rows that shared a source with an earlier row (one source is one feed)"
+            );
+        }
         Ok(())
     }
 
     /// Delete every book row that shares a `source_path` with an earlier one,
-    /// keeping the earliest-created row of each group. Episodes go with it
-    /// through the foreign key's `ON DELETE CASCADE`.
+    /// then create the unique index. Returns how many rows went. Episodes go
+    /// with their book through the foreign key's `ON DELETE CASCADE`.
     ///
     /// `created_at` is the tie-break the scan uses, and `rowid` breaks a tie
     /// inside one millisecond, so the choice is deterministic.
-    fn collapse_duplicate_sources(conn: &Connection) -> Result<(), IndexError> {
+    fn collapse_and_index_sources(conn: &Connection) -> Result<usize, IndexError> {
         let removed = conn.execute(
             "DELETE FROM book WHERE id IN (
                  SELECT b.id FROM book b
@@ -294,13 +314,10 @@ impl Index {
              )",
             [],
         )?;
-        if removed > 0 {
-            tracing::warn!(
-                removed,
-                "removed book rows that shared a source with an earlier row (one source is one feed)"
-            );
-        }
-        Ok(())
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS book_source_path ON book(source_path);",
+        )?;
+        Ok(removed)
     }
 
     /// Insert or update a book by `id` (idempotent: no duplicate rows).
@@ -924,6 +941,50 @@ mod tests {
             idx.upsert_book(&clash).is_err(),
             "one source is one book is one feed"
         );
+    }
+
+    /// The collapse and the index are one change. If the index cannot be
+    /// created, the rows the collapse would have dropped must still be there:
+    /// `Index::open` reports the failure, and an operator who restarts must
+    /// not find a database that quietly shed books for an index that never
+    /// appeared.
+    #[test]
+    fn a_failed_floor_migration_keeps_the_duplicate_rows() {
+        let dir = scratch("index-floor-rollback");
+        let db = dir.join("old.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE book (
+                    id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, feed_id TEXT NOT NULL UNIQUE,
+                    title TEXT NOT NULL, author TEXT, cover_path TEXT, source_path TEXT NOT NULL,
+                    source_mtime INTEGER NOT NULL);",
+            )
+            .unwrap();
+            for (id, feed) in [("book-2", "cap-established"), ("book", "cap-duplicate")] {
+                conn.execute(
+                    "INSERT INTO book VALUES (?1,?1,?2,'Book',NULL,NULL,'/lib/book.m4b',1)",
+                    params![id, feed],
+                )
+                .unwrap();
+            }
+            // A table under the index's name: `CREATE UNIQUE INDEX IF NOT
+            // EXISTS` fails on a name that belongs to something else, which
+            // is the failure this test needs after the delete has run.
+            conn.execute_batch("CREATE TABLE book_source_path (x);")
+                .unwrap();
+        }
+
+        assert!(
+            Index::open(&db).is_err(),
+            "the migration reports its failure"
+        );
+
+        let conn = Connection::open(&db).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM book", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 2, "the duplicate rows survived the failed migration");
     }
 
     // ---- capability feed ids (v1.5) ----
