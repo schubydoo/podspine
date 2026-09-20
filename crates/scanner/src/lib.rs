@@ -4009,7 +4009,12 @@ mod tests {
             ("b.mp3", b"track\xfe.mp3".as_slice()),
         ] {
             let to = folder.join(std::ffi::OsStr::from_bytes(bytes));
-            std::fs::rename(folder.join(from), to).unwrap();
+            // APFS and HFS+ refuse a name that is not valid UTF-8, so macOS
+            // cannot reach the case at all. Linux can, and that is where this
+            // test does its work.
+            if std::fs::rename(folder.join(from), to).is_err() {
+                skip!("this filesystem refuses non-UTF-8 file names");
+            }
         }
         let index = Index::open_in_memory().unwrap();
 
