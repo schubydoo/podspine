@@ -902,9 +902,11 @@ gates, synthetic-audio generation, scratch-dir guards — never shipped).</p>
   for <code>full</code> vs <code>saver</code>.</li>
 <li><strong>Track folders</strong> (a folder of per-chapter files: several <code>.mp3</code>, or several
   <code>.ogg</code>/<code>.opus</code>/<code>.flac</code>) are treated as one episode per file, ordered by track
-  number (falling back to filename order) and <strong>served in place</strong> from the library
-  — no copy, no re-split, no re-encode. A folder of several <code>.m4b</code>/<code>.m4a</code> files is
-  several books instead, unless its <code>.podspine.toml</code> sets <code>folder_is_one_book</code>.</li>
+  number (falling back to filename order) and <strong>served in place</strong> from the library:
+  no copy and no re-split. The one exception is a track whose codec no podcast app
+  plays, which <code>PODSPINE_TRANSCODE</code> re-encodes once at ingest, all tracks or none.
+  A folder of several <code>.m4b</code>/<code>.m4a</code> files is several books instead, unless its
+  <code>.podspine.toml</code> sets <code>folder_is_one_book</code>.</li>
 <li>A book with no chapters and no sidecar degrades to a single-episode feed with a
   warning; that whole file is also <strong>served in place</strong> (Sprint 6.2).</li>
 </ul>
