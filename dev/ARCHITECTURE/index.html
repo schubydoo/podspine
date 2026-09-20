@@ -1041,11 +1041,17 @@ split the way they are.</p>
 - Every item carries <code>itunes:episode</code>, <code>itunes:duration</code> (<code>HH:MM:SS</code>), and an
   <code>enclosure length</code> read from the <strong>real output file</strong> (never prorated from a
   bitrate).
-- <code>guid = blake3(book.id : idx : source_mtime)</code> — stable across re-scans of an
-  unchanged source, and changes only when the source changes. It is computed once
-  at ingest and stored per episode, along with the <code>pubDate</code>; the feed publishes
-  the stored values rather than re-deriving them, so a book that is waiting for a
-  re-ingest keeps the guids its subscribers already hold.
+- <code>guid = blake3(book.id : idx : source_mtime)</code> for a <strong>chapter</strong> — stable across
+  re-scans of an unchanged source, and changes only when the source changes. A
+  chapter is a sub-range of one container, so its position is what it is.
+- <code>guid = blake3(book.id : file name : mtime)</code> for a <strong>folder track</strong> — identity
+  follows the file. Deleting one track renumbers every track after it while the
+  folder's <code>source_mtime</code> (the newest track's) stays put, so a position-based guid
+  would hand a later track the guid a subscriber already holds, and their app would
+  keep the audio it downloaded under it.
+- Either way the guid is computed once at ingest and stored per episode, along with
+  the <code>pubDate</code>; the feed publishes the stored values rather than re-deriving them,
+  so a book that is waiting for a re-ingest keeps the guids its subscribers hold.
 - A generated feed is rejected by the self-check before it can be served if any of
   the above is violated.</p>
 <p><strong>Audio fidelity:</strong>
