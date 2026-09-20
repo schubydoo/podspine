@@ -9,8 +9,8 @@
 //! - **single-file book** (top-level `Author - Title.m4b`, or a lone file in its
 //!   own folder) → `Author - Title.podspine.toml` beside the audio (mirrors the
 //!   `.cue`/`.ffmeta` convention);
-//! - **MP3-folder book, or that lone-file-in-a-folder** → `.podspine.toml` inside
-//!   the folder;
+//! - **track-folder book, or that lone-file-in-a-folder** → `.podspine.toml`
+//!   inside the folder;
 //! - a top-level file's parent is the library root, so no folder-level file
 //!   applies there (it would wrongly cover every top-level book).
 
@@ -19,6 +19,11 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::StorageMode;
+
+/// The folder-level sidecar's file name. The scanner's watch filter needs it
+/// by name: it is a dotfile, and the filter drops dotfiles unless they are
+/// this one.
+pub const SIDECAR_FILE_NAME: &str = ".podspine.toml";
 
 /// Overrides parsed from a book's `.podspine.toml`. Every field is optional; an
 /// unset field falls back to the resolved server config. Server-global keys are
@@ -38,6 +43,10 @@ pub struct BookOverrides {
     /// Feed-level fallback cover for this book.
     pub default_cover_url: Option<String>,
     // --- troubleshooting-only (no global equivalent) ---
+    /// Treat every audio file in this folder as one book's tracks, whatever
+    /// their extension. Without it, a folder of several `.m4b`/`.m4a` files is
+    /// several single-file books, which is what an author folder usually is.
+    pub folder_is_one_book: Option<bool>,
     /// Skip this book entirely (removed from the index + every surface).
     pub disabled: Option<bool>,
     /// Override the feed/book title.
@@ -85,11 +94,11 @@ impl BookOverrides {
 }
 
 /// The sidecar path for a book whose `source` is a file (single-file book) or a
-/// directory (MP3 folder), or `None` if none exists. Both `source` and
+/// directory (track folder), or `None` if none exists. Both `source` and
 /// `library_root` should be canonical/absolute (the scanner canonicalizes them).
 pub fn sidecar_path(source: &Path, library_root: &Path) -> Option<PathBuf> {
     if source.is_dir() {
-        let p = source.join(".podspine.toml");
+        let p = source.join(SIDECAR_FILE_NAME);
         return p.is_file().then_some(p);
     }
     // Single-file book → the stem sibling first (matches the `.cue` convention).
@@ -101,7 +110,7 @@ pub fn sidecar_path(source: &Path, library_root: &Path) -> Option<PathBuf> {
     // subfolder (never the library root, which every top-level book shares).
     let parent = source.parent()?;
     if parent != library_root {
-        let p = parent.join(".podspine.toml");
+        let p = parent.join(SIDECAR_FILE_NAME);
         if p.is_file() {
             return Some(p);
         }
