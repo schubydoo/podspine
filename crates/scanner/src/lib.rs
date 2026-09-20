@@ -253,6 +253,9 @@ enum IngestKind {
         /// The server's transcode setting. A track whose codec no podcatcher
         /// plays is re-encoded into `<data_dir>` instead of served in place.
         transcode: TranscodeMode,
+        /// The data dir, which holds the staging dir the re-encodes are
+        /// produced into before they are published.
+        data_dir: PathBuf,
     },
 }
 
@@ -507,9 +510,11 @@ fn plan_book(
 fn run_ingest(task: &IngestTask, split_workers: usize) -> Result<PreparedBook, ScanError> {
     match &task.kind {
         IngestKind::Single(single) => ingest_single(task, single, split_workers),
-        IngestKind::TrackFolder { files, transcode } => {
-            ingest_track_folder(task, files, *transcode, split_workers)
-        }
+        IngestKind::TrackFolder {
+            files,
+            transcode,
+            data_dir,
+        } => ingest_track_folder(task, files, *transcode, data_dir, split_workers),
     }
 }
 
@@ -1262,6 +1267,7 @@ fn plan_track_folder(
         kind: IngestKind::TrackFolder {
             files,
             transcode: opts.transcode,
+            data_dir: data_dir.to_path_buf(),
         },
     })))
 }
@@ -1305,37 +1311,83 @@ fn measure_in_place_tracks(tracks: &[FolderTrack]) -> Result<HashMap<usize, u64>
     Ok(lengths)
 }
 
-/// Read those lengths again after the re-encodes, and drop a track that no
-/// longer reads.
+/// Read those lengths again once the re-encodes are staged, before anything
+/// is published.
 ///
 /// A re-encode takes seconds, and a sibling track can be replaced while ffmpeg
 /// runs, so a length measured before it can be stale by the time the row is
 /// written. The row must match the bytes the server will serve (Greptile P1).
 ///
-/// A track that cannot be read now loses its entry, and the caller leaves it
-/// out of the book. Keeping the earlier length would publish a feed that
-/// advertises a file the scan already knows is gone: the audio route answers
-/// 404 for it, and it asks for no repair, because the missing file IS the
-/// source (Greptile P1). The book still commits, which is what covers the
-/// re-encodes this ingest already published.
-fn remeasure_in_place_tracks(tracks: &[FolderTrack], lengths: &mut HashMap<usize, u64>) {
+/// A read that fails aborts the ingest. Nothing has been published at this
+/// point, so the folder keeps serving exactly what it served before, and the
+/// next scan indexes it as it then is. That is also why the episode set is
+/// never compacted here: dropping a track and renumbering its siblings would
+/// hand a later track the guid and the episode number of the one that went
+/// missing, under the same source mtime, and a subscriber would keep the
+/// audio it already has for that guid (Greptile P1).
+fn remeasure_in_place_tracks(
+    tracks: &[FolderTrack],
+    lengths: &mut HashMap<usize, u64>,
+) -> Result<(), ScanError> {
     for (idx, t) in tracks.iter().enumerate() {
         if t.encoding != Encoding::Copy {
             continue;
         }
-        match std::fs::metadata(&t.path) {
-            Ok(meta) => {
-                lengths.insert(idx, meta.len());
-            }
-            Err(err) => {
-                lengths.remove(&idx);
-                tracing::warn!(
-                    error = %err, path = %t.path.display(),
-                    "a track went missing during the ingest — leaving it out of the book"
-                );
-            }
+        let byte_length = std::fs::metadata(&t.path)
+            .map_err(|source| ScanError::Io {
+                path: t.path.clone(),
+                source,
+            })?
+            .len();
+        lengths.insert(idx, byte_length);
+    }
+    Ok(())
+}
+
+/// Move every staged re-encode into the book's live directory.
+///
+/// The staging dir keeps the live one untouched until the whole episode set
+/// is decided, which is what lets a vanished track abort an ingest with the
+/// previous book still serving. Every target is checked before any rename, so
+/// a blocked one cannot leave earlier tracks published over the lengths the
+/// feed still advertises. What remains is the disk fault in the middle of the
+/// renames, which no rename sequence can undo, and which
+/// `split_book_encoded` carries for a chaptered book too.
+fn publish_staged_tracks(
+    staged: Vec<SplitEpisode>,
+    book_out: &Path,
+) -> Result<Vec<SplitEpisode>, ScanError> {
+    std::fs::create_dir_all(book_out).map_err(|source| ScanError::Io {
+        path: book_out.to_path_buf(),
+        source,
+    })?;
+    let targets: Vec<PathBuf> = staged
+        .iter()
+        .map(|ep| match ep.path.file_name() {
+            Some(name) => book_out.join(name),
+            None => book_out.join(format!("{:03}", ep.idx + 1)),
+        })
+        .collect();
+    for target in &targets {
+        if target.is_dir() {
+            return Err(ScanError::Io {
+                path: target.clone(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "a directory is at the episode path",
+                ),
+            });
         }
     }
+    let mut published = Vec::with_capacity(staged.len());
+    for (ep, target) in staged.into_iter().zip(targets) {
+        std::fs::rename(&ep.path, &target).map_err(|source| ScanError::Io {
+            path: target.clone(),
+            source,
+        })?;
+        published.push(SplitEpisode { path: target, ..ep });
+    }
+    Ok(published)
 }
 
 /// Probe a track folder and build its rows: one episode per file, with **no
@@ -1351,6 +1403,7 @@ fn ingest_track_folder(
     task: &IngestTask,
     files: &[PathBuf],
     transcode: TranscodeMode,
+    data_dir: &Path,
     split_workers: usize,
 ) -> Result<PreparedBook, ScanError> {
     let dir = task.input.as_path();
@@ -1441,21 +1494,39 @@ fn ingest_track_folder(
     if let Some(first) = encodes.first() {
         let enc = tracks[first.idx].encoding;
         let split_start = std::time::Instant::now();
-        let produced = transcode_tracks(
+        // Produce into an isolated staging dir, never the live book dir. The
+        // whole episode set is decided before anything is published, so an
+        // in-place track that vanishes while ffmpeg runs aborts this ingest
+        // with the previous book still serving every episode its feed
+        // advertises (Greptile P1). The dir is under `data_dir`, which the
+        // walk skips, and it is not an indexed book id, which eviction skips.
+        let staging = data_dir.join(".scan-tmp").join(id);
+        let _ = std::fs::remove_dir_all(&staging); // a crashed scan may have left one
+        let staged = transcode_tracks(
             &encodes,
-            &task.book_out,
+            &staging,
             episode_ext(None, enc),
             enc,
             split_workers,
         )?;
-        for ep in produced {
-            reencoded.insert(ep.idx, ep);
-        }
         log_stage(id, "split", split_start);
 
         // The second read, now that ffmpeg is done (see the note above the
-        // first one).
-        remeasure_in_place_tracks(&tracks, &mut in_place_lengths);
+        // first one). It runs while the staging dir still holds everything,
+        // so a failure here leaves the live book untouched.
+        if let Err(err) = remeasure_in_place_tracks(&tracks, &mut in_place_lengths) {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(err);
+        }
+
+        for ep in publish_staged_tracks(staged, &task.book_out)? {
+            reencoded.insert(ep.idx, ep);
+        }
+        // Best-effort, like the saver split's: a leftover is cleared by the
+        // next scan.
+        if let Err(err) = std::fs::remove_dir_all(&staging) {
+            tracing::warn!(error = %err, path = %staging.display(), "failed to remove the track staging dir");
+        }
     }
 
     // The names this ingest published under `<data_dir>`, for the sweep.
@@ -1465,33 +1536,13 @@ fn ingest_track_folder(
         .map(str::to_string)
         .collect();
 
-    // The book is what this scan can still serve. A track that went missing
-    // while the re-encodes ran has no length, and it is left out rather than
-    // published as a feed entry that answers 404.
-    let serving: Vec<(usize, &FolderTrack)> = tracks
-        .iter()
-        .enumerate()
-        .filter(|(idx, t)| t.encoding != Encoding::Copy || in_place_lengths.contains_key(idx))
-        .collect();
-    if serving.len() != n {
-        tracing::warn!(
-            id = %id,
-            dropped = n - serving.len(),
-            "some tracks went missing during the ingest; the book is indexed without them"
-        );
-    }
-    let n = serving.len();
-    if n == 0 {
-        return Err(ScanError::EmptyFolder(dir.to_path_buf()));
-    }
-
     let mut episodes = Vec::with_capacity(n);
-    for (idx, (original_idx, t)) in serving.into_iter().enumerate() {
+    for (idx, t) in tracks.iter().enumerate() {
         // A re-encoded track is served from `<data_dir>` and carries no
         // `source_path`, which is how the serve layer knows not to look in
         // the library, and how nothing tries to rebuild it: a re-encode is
         // not byte-reproducible.
-        let (file_path, source_path, byte_length) = match reencoded.remove(&original_idx) {
+        let (file_path, source_path, byte_length) = match reencoded.remove(&idx) {
             Some(ep) => (
                 ep.path.to_string_lossy().into_owned(),
                 String::new(),
@@ -1499,8 +1550,8 @@ fn ingest_track_folder(
             ),
             None => {
                 let byte_length = in_place_lengths
-                    .remove(&original_idx)
-                    .expect("a track without a length was filtered out above");
+                    .remove(&idx)
+                    .expect("every track is either re-encoded or measured above");
                 let path = t.path.to_string_lossy().into_owned();
                 (path.clone(), path, byte_length)
             }
@@ -3801,12 +3852,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The second measurement decides what the book can still serve: a track
-    /// whose file changed size is recorded at its new size, and one that went
-    /// missing while ffmpeg ran loses its entry, so the caller leaves it out
-    /// of the feed rather than publishing an entry that answers 404.
+    /// The second measurement is what the rows carry, and it runs while the
+    /// re-encodes are still staged. A track whose file changed size is
+    /// recorded at its new size; one that went missing aborts the ingest,
+    /// which leaves the previous book serving rather than renumbering its
+    /// episodes under guids their subscribers already hold.
     #[test]
-    fn a_track_that_goes_missing_during_an_ingest_loses_its_length() {
+    fn remeasuring_tracks_re_reads_them_and_fails_on_one_that_went_missing() {
         let dir = scratch("remeasure");
         let here = dir.join("01.mp3");
         std::fs::write(&here, b"0123456789").unwrap();
@@ -3819,14 +3871,19 @@ mod tests {
             title: "t".to_string(),
             encoding: Encoding::Copy,
         };
-        let tracks = [track(&here), track(&gone)];
         // The lengths as the ingest measured them before the re-encodes.
+        let mut lengths: HashMap<usize, u64> = HashMap::from([(0, 4)]);
+        remeasure_in_place_tracks(&[track(&here)], &mut lengths).expect("the track is there");
+        assert_eq!(
+            lengths.get(&0),
+            Some(&10),
+            "the row carries the size it has now"
+        );
+
         let mut lengths: HashMap<usize, u64> = HashMap::from([(0, 4), (1, 7)]);
-
-        remeasure_in_place_tracks(&tracks, &mut lengths);
-
-        assert_eq!(lengths.get(&0), Some(&10), "the present track is re-read");
-        assert_eq!(lengths.get(&1), None, "the missing track is dropped");
+        let err = remeasure_in_place_tracks(&[track(&here), track(&gone)], &mut lengths)
+            .expect_err("a track that went missing must abort the ingest");
+        assert!(matches!(err, ScanError::Io { .. }), "{err:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
