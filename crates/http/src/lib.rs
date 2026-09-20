@@ -977,6 +977,8 @@ fn build_feed_xml(state: &AppState, feed_id: &str) -> Result<String, AppError> {
             .iter()
             .map(|e| FeedEpisode {
                 idx: e.idx as usize,
+                guid: e.guid.clone(),
+                pubdate_epoch: e.pubdate_epoch,
                 title: e.title.clone(),
                 audio_url: format!("{base}/audio/{feed_id}/{}", e.idx + 1),
                 byte_length: e.byte_length as u64,

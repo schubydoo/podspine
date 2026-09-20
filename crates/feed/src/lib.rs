@@ -34,6 +34,11 @@ const PUBDATE_STEP_SECS: i64 = 60;
 pub struct FeedEpisode {
     /// Zero-based chapter index (episode number in the feed is `idx + 1`).
     pub idx: usize,
+    /// The guid recorded at ingest. The feed publishes it as it stands, so
+    /// that a client keeps the episode it already downloaded.
+    pub guid: String,
+    /// The pubDate epoch recorded at ingest, in seconds.
+    pub pubdate_epoch: i64,
     /// Episode title.
     pub title: String,
     /// Absolute URL to the audio file (the `<enclosure>` url).
@@ -49,7 +54,7 @@ pub struct FeedEpisode {
 /// One book's inputs to the feed.
 #[derive(Debug, Clone)]
 pub struct FeedBook {
-    /// Opaque, stable book id: part of each episode guid.
+    /// Opaque, stable book id.
     pub id: String,
     /// Feed/channel title.
     pub title: String,
@@ -59,8 +64,9 @@ pub struct FeedBook {
     pub description: Option<String>,
     /// Cover image URL (`itunes:image`, per-item and channel-level).
     pub cover_url: Option<String>,
-    /// Source file mtime (epoch seconds): the pubDate anchor and guid
-    /// material.
+    /// Source file mtime (epoch seconds). The scanner anchors the stored
+    /// episode pubDates on it at ingest. The feed itself reads it only as the
+    /// channel date of a book with no episodes.
     pub source_mtime: i64,
     /// The feed's own URL (channel `<link>`).
     pub self_url: String,
@@ -114,16 +120,21 @@ fn format_rfc2822(epoch: i64) -> String {
 /// Build the RSS [`Channel`] for a book. Items are emitted in chapter order
 /// (oldest first); the ordering guarantees come from pubDate and
 /// `itunes:episode`.
+///
+/// The guid and the pubDate of each item come from the values the scanner
+/// recorded at ingest, and are never re-derived here. The book's
+/// `source_mtime` changes on a re-ingest, and a `Refresh` sets it to a
+/// sentinel until the watcher finishes. A feed that re-derived from it would
+/// publish a new guid for every episode in that window, and a client would
+/// then download the whole book again, twice.
 pub fn build_channel(book: &FeedBook) -> Channel {
-    let n = book.episodes.len();
-
     let items = book
         .episodes
         .iter()
         .map(|ep| {
             let mut item = Item::default();
             item.set_title(ep.title.clone());
-            item.set_pub_date(format_rfc2822(pubdate_epoch(book.source_mtime, ep.idx, n)));
+            item.set_pub_date(format_rfc2822(ep.pubdate_epoch));
 
             item.set_enclosure(Enclosure {
                 url: ep.audio_url.clone(),
@@ -131,7 +142,7 @@ pub fn build_channel(book: &FeedBook) -> Channel {
                 mime_type: ep.mime_type.clone(),
             });
             item.set_guid(Guid {
-                value: episode_guid(&book.id, ep.idx, book.source_mtime),
+                value: ep.guid.clone(),
                 permalink: false,
             });
 
@@ -156,8 +167,16 @@ pub fn build_channel(book: &FeedBook) -> Channel {
             .unwrap_or_else(|| book.title.clone()),
     );
     channel.set_language("en".to_string());
-    channel.set_last_build_date(format_rfc2822(book.source_mtime));
-    channel.set_pub_date(format_rfc2822(book.source_mtime));
+    // The newest episode date, so the channel agrees with the items it
+    // carries. `source_mtime` is the fallback for a book with no episodes.
+    let channel_date = book
+        .episodes
+        .iter()
+        .map(|ep| ep.pubdate_epoch)
+        .max()
+        .unwrap_or(book.source_mtime);
+    channel.set_last_build_date(format_rfc2822(channel_date));
+    channel.set_pub_date(format_rfc2822(channel_date));
 
     let mut ch_it = ITunesChannelExtension::default();
     ch_it.set_author(book.author.clone());
@@ -196,9 +215,13 @@ pub fn render_checked(book: &FeedBook) -> Result<String, Vec<selfcheck::SelfChec
 /// `selfcheck`'s (the one duplicate-prone literal in the crate).
 #[cfg(test)]
 pub(crate) fn sample_book(n: usize, mtime: i64) -> FeedBook {
+    const ID: &str = "book-1";
+    // The scanner's own values, so a fixture cannot drift from an ingest.
     let episodes = (0..n)
         .map(|idx| FeedEpisode {
             idx,
+            guid: episode_guid(ID, idx, mtime),
+            pubdate_epoch: pubdate_epoch(mtime, idx, n),
             title: format!("Chapter {}", idx + 1),
             audio_url: format!("http://host/audio/book/{:03}.m4a", idx + 1),
             byte_length: 1000 + idx as u64,
@@ -207,7 +230,7 @@ pub(crate) fn sample_book(n: usize, mtime: i64) -> FeedBook {
         })
         .collect();
     FeedBook {
-        id: "book-1".to_string(),
+        id: ID.to_string(),
         title: "A Test Book".to_string(),
         author: Some("An Author".to_string()),
         description: Some("A description".to_string()),
@@ -258,6 +281,36 @@ mod tests {
             epochs.iter().all(|&e| e <= anchor),
             "all pubDates <= anchor (past)"
         );
+    }
+
+    #[test]
+    fn items_publish_the_stored_guid_and_pubdate() {
+        // A refreshed book: `source_mtime` holds the re-ingest sentinel, and
+        // the episodes still carry what the last ingest recorded. The feed
+        // must publish the recorded values, so that a client keeps the
+        // episodes it already has.
+        let mut book = sample_book(3, 1_700_000_000);
+        let stored: Vec<(String, i64)> = book
+            .episodes
+            .iter()
+            .map(|ep| (ep.guid.clone(), ep.pubdate_epoch))
+            .collect();
+        book.source_mtime = -1;
+
+        let channel = build_channel(&book);
+        for (item, (guid, epoch)) in channel.items().iter().zip(&stored) {
+            assert_eq!(item.guid().expect("guid present").value(), guid);
+            assert_eq!(item.pub_date(), Some(format_rfc2822(*epoch)).as_deref());
+        }
+        // The channel date follows the items, not the sentinel.
+        let newest = stored.last().expect("three episodes").1;
+        assert_eq!(channel.pub_date(), Some(format_rfc2822(newest)).as_deref());
+        assert_eq!(
+            channel.last_build_date(),
+            Some(format_rfc2822(newest)).as_deref()
+        );
+        // And the feed still passes the self-check with the sentinel in place.
+        render_checked(&book).expect("a refreshed book still renders a valid feed");
     }
 
     #[test]

@@ -1780,6 +1780,54 @@ async fn a_feed_failing_the_self_check_is_a_500_not_a_broken_feed() {
     );
 }
 
+/// A Refresh sets `book.source_mtime` to a sentinel until the watcher
+/// re-ingests the book. The feed must keep publishing the guids and pubDates
+/// that the last ingest recorded. A feed that re-derived them from
+/// `source_mtime` would hand every subscriber a new episode set for the
+/// length of that window, and the book would download twice: once under the
+/// sentinel, and again when the real mtime came back.
+#[tokio::test]
+async fn a_refreshed_book_keeps_its_stored_guids_and_pubdates() {
+    let dir = scratch("http-feed-stored-guids");
+    let data = dir.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+
+    let index = Index::open_in_memory().unwrap();
+    let feed_id = "capabilityidforstoredguid";
+    let mut book = book_row("refreshed-book", feed_id);
+    book.source_mtime = -1; // what `mark_book_for_reingest` writes
+    index.upsert_book(&book).unwrap();
+    for idx in 0..3 {
+        index
+            .upsert_episode(&episode_row(&book.id, idx, 1_000 + idx))
+            .unwrap();
+    }
+
+    let resp = router(test_state(index, &data, &dir))
+        .oneshot(
+            Request::get(format!("/feed/{feed_id}.xml"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let xml = String::from_utf8(body_bytes(resp).await).unwrap();
+    for idx in 0..3 {
+        let stored = format!("{}-{idx}", book.id);
+        assert!(
+            xml.contains(&format!(">{stored}</guid>")),
+            "the feed publishes the stored guid {stored}\n{xml}"
+        );
+    }
+    // The sentinel is an epoch of -1. A date derived from it lands in 1969.
+    assert!(
+        !xml.contains("1969") && !xml.contains("1970"),
+        "no date is derived from the sentinel mtime\n{xml}"
+    );
+}
+
 /// The saver-mode regen arm re-splits from `book.source_path`, an opaque DB
 /// value that reaches ffmpeg. A poisoned row that points outside the library
 /// root must 404; it must not hand ffmpeg an arbitrary file. This is the same
