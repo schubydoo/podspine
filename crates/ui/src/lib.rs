@@ -340,7 +340,12 @@ pub fn index_page(books: &[BookCard], theme: Theme) -> Markup {
 /// becomes the normal book list on its own once the scan finishes. It reuses the
 /// page shell but needs its own `<head>` (the refresh directive and a distinct
 /// title), so it is built directly rather than through [`page`].
-pub fn scanning_page(theme: Theme) -> Markup {
+///
+/// `progress` is `(books finished, books found)` once the scan knows its book
+/// list. The page shows the pair, so a long first scan shows movement on each
+/// refresh. `None` means the scan is still walking the library, and the page
+/// then says only that a scan is running.
+pub fn scanning_page(theme: Theme, progress: Option<(usize, usize)>) -> Markup {
     html! {
         (DOCTYPE)
         html lang="en" data-theme=[theme.attr()] {
@@ -358,6 +363,9 @@ pub fn scanning_page(theme: Theme) -> Markup {
                 }
                 main {
                     p.empty { "Scanning your library…" }
+                    @if let Some((done, total)) = progress {
+                        p.empty { (format!("Indexed {done} of {total} books.")) }
+                    }
                     p.empty {
                         "This can take a minute on first start while episodes are prepared. "
                         "This page refreshes on its own — your books will appear here when it's done."
@@ -672,7 +680,7 @@ mod tests {
 
     #[test]
     fn scanning_page_holds_and_self_refreshes() {
-        let html = scanning_page(Theme::System).into_string();
+        let html = scanning_page(Theme::System, None).into_string();
         // A clear scanning state, not an empty book grid...
         assert!(html.contains("Scanning your library…"));
         assert!(!html.contains("No audiobooks found"));
@@ -683,6 +691,18 @@ mod tests {
             html.contains("themepicker"),
             "scanning page carries the picker"
         );
+    }
+
+    #[test]
+    fn scanning_page_counts_the_books_it_has_finished() {
+        // A long first scan must show movement. Without a count, the page says
+        // the same sentence for minutes and reads as a hang.
+        let counted = scanning_page(Theme::System, Some((7, 19))).into_string();
+        assert!(counted.contains("Indexed 7 of 19 books."));
+        // Before the scan knows its book list there is nothing honest to show.
+        let plain = scanning_page(Theme::System, None).into_string();
+        assert!(!plain.contains("Indexed"), "no count without progress");
+        assert!(plain.contains("Scanning your library…"));
     }
 
     #[test]
@@ -700,7 +720,7 @@ mod tests {
             home.contains(&expected),
             "home page footer names the version"
         );
-        let scanning = scanning_page(Theme::System).into_string();
+        let scanning = scanning_page(Theme::System, None).into_string();
         assert!(
             scanning.contains(&expected),
             "scanning page footer names the version"

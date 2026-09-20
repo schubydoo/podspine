@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use podspine_config::Config;
 use podspine_http::{AppState, serve};
 use podspine_index::Index;
-use podspine_scanner::{ScanOptions, WatchSignal, spawn_library_watcher};
+use podspine_scanner::{ScanOptions, ScanProgress, WatchSignal, spawn_library_watcher};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
@@ -92,6 +92,14 @@ async fn main() -> Result<()> {
     )
     .context("canonicalizing the data dir / library root")?;
 
+    // One counter, written by the watcher's scan and read by the "Scanning…"
+    // page, so a long first scan reports how many books it has finished.
+    let progress = Arc::new(ScanProgress::default());
+    let state = state.with_scan_progress({
+        let progress = Arc::clone(&progress);
+        Arc::new(move || progress.snapshot())
+    });
+
     // First-run UX (issue 159): do not hold the HTTP port down behind the
     // initial reconcile. A large first scan takes minutes to split, and
     // anything in front of the server (a reverse proxy, a Funnel) returns 502
@@ -117,6 +125,7 @@ async fn main() -> Result<()> {
             scan_opts,
             watch_tx,
             watch_rx,
+            progress,
             move || state.set_ready(true),
         );
     }

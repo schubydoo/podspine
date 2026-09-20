@@ -35,6 +35,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::UNIX_EPOCH;
 
@@ -75,6 +76,44 @@ pub struct ScanOptions {
     /// Podspine is copy-first. Podspine never re-encodes MP3/AAC sources,
     /// independent of this setting.
     pub transcode: TranscodeMode,
+}
+
+/// Live progress of a library scan, for the server's "Scanning…" page.
+///
+/// A scan publishes the number of books it is about to work through, then one
+/// count per book that finishes, whether that book was ingested or skipped.
+/// The server reads the pair while the first scan runs, so that a long scan
+/// shows movement instead of the same sentence for several minutes (deferred
+/// from issue 159).
+///
+/// The counts are atomics rather than a lock, so a page request never waits on
+/// the scan thread, and the scan never waits on a reader.
+#[derive(Debug, Default)]
+pub struct ScanProgress {
+    done: AtomicUsize,
+    total: AtomicUsize,
+}
+
+impl ScanProgress {
+    /// Start a scan of `total` books. The finished count resets, so a later
+    /// reconcile reports its own numbers and not the sum of every scan.
+    fn begin(&self, total: usize) {
+        self.done.store(0, Ordering::Relaxed);
+        self.total.store(total, Ordering::Release);
+    }
+
+    /// Record one finished book.
+    fn book_done(&self) {
+        self.done.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `(finished, total)` once a scan knows its book list, and `None` before
+    /// that. A scan spends its first moments walking the library, and a count
+    /// of `0 / 0` would say less than the plain holding page does.
+    pub fn snapshot(&self) -> Option<(usize, usize)> {
+        let total = self.total.load(Ordering::Acquire);
+        (total > 0).then(|| (self.done.load(Ordering::Relaxed).min(total), total))
+    }
 }
 
 /// Failure modes of a single-book scan.
@@ -485,13 +524,19 @@ fn run_ingest(task: &IngestTask, split_workers: usize) -> Result<PreparedBook, S
 /// share of that same budget for its book's chapter split. Two nested pools
 /// therefore spawn about one thread per CPU in total, not one per CPU per book
 /// (Greptile P2), and the gate still bounds the ffmpeg children themselves.
-fn ingest_and_commit(tasks: &[IngestTask], index: &Index, summary: &mut ScanSummary) {
+fn ingest_and_commit(
+    tasks: &[IngestTask],
+    index: &Index,
+    summary: &mut ScanSummary,
+    progress: &ScanProgress,
+) {
     // One book (the usual watcher rescan) does not need a thread, and it gets
     // the whole split budget.
     if tasks.len() < 2 {
         for task in tasks {
             let prepared = run_ingest(task, ffmpeg_parallelism());
             commit_scanned_book(task, prepared, index, summary);
+            progress.book_done();
         }
         return;
     }
@@ -519,6 +564,7 @@ fn ingest_and_commit(tasks: &[IngestTask], index: &Index, summary: &mut ScanSumm
         drop(tx);
         for (i, prepared) in rx {
             commit_scanned_book(&tasks[i], prepared, index, summary);
+            progress.book_done();
         }
     });
 }
@@ -1542,6 +1588,19 @@ pub fn scan_library(
     index: &Index,
     opts: ScanOptions,
 ) -> ScanSummary {
+    scan_library_with_progress(library, data_dir, index, opts, &ScanProgress::default())
+}
+
+/// [`scan_library`], publishing its book counts to `progress` as it goes. The
+/// server passes the counter it shows on the "Scanning…" page. Every other
+/// caller wants [`scan_library`], which throws the counts away.
+fn scan_library_with_progress(
+    library: &Path,
+    data_dir: &Path,
+    index: &Index,
+    opts: ScanOptions,
+    progress: &ScanProgress,
+) -> ScanSummary {
     // Whole-scan wall-clock (debug only). Started FIRST so it includes discovery
     // and the reuse-map setup below, not just the per-book loop. Compared against
     // the summed per-book `book_total` by the profiling harness to expose
@@ -1555,6 +1614,10 @@ pub fn scan_library(
         .canonicalize()
         .unwrap_or_else(|_| library.to_path_buf());
     let sources = discover(&library_root, data_dir);
+    // The denominator the "Scanning…" page shows. It counts every discovered
+    // book, including the ones that turn out to be up to date, because that is
+    // the number of books this scan reports on below.
+    progress.begin(sources.len());
 
     // Enforce one row per source BEFORE this scan reads the reuse map, so that
     // the map cannot inherit a duplicate (invariant A; see the function's doc).
@@ -1587,6 +1650,11 @@ pub fn scan_library(
     // Phase 1, serial: assign each id and read the index. Slug assignment is
     // order-dependent (it mutates `seen` and asks the index who owns an id), so
     // it stays in discovery order on this thread, and so does every index read.
+    //
+    // Progress rule for both phases: every path that finishes with a book calls
+    // `progress.book_done()` exactly once. Here that is the disabled book, the
+    // up-to-date book, and the failed plan. A book that reaches `tasks` is
+    // counted in phase 2 instead, when its commit returns.
     let mut tasks: Vec<IngestTask> = Vec::new();
     for source in sources {
         let source_path = source.path();
@@ -1633,6 +1701,7 @@ pub fn scan_library(
             }
             tracing::info!(slug = %slug, "book disabled by .podspine.toml — skipped");
             summary.skipped += 1;
+            progress.book_done();
             continue;
         }
         let folder = matches!(source, BookSource::Mp3Folder(_));
@@ -1648,11 +1717,13 @@ pub fn scan_library(
             // it did when one call did the check and the work together.
             Ok(BookPlan::UpToDate(book)) => {
                 summary.indexed += 1;
+                progress.book_done();
                 log_indexed(&book, folder);
             }
             Ok(BookPlan::Ingest(task)) => tasks.push(*task),
             Err(err) => {
                 summary.skipped += 1;
+                progress.book_done();
                 tracing::warn!(error = %err, path = %source.path().display(), "skipped");
             }
         }
@@ -1663,7 +1734,7 @@ pub fn scan_library(
     // task holds an index handle, so a worker cannot touch the database. Each
     // book is committed here on the scan thread as soon as its own ingest
     // finishes, so a book's files and its rows land together.
-    ingest_and_commit(&tasks, index, &mut summary);
+    ingest_and_commit(&tasks, index, &mut summary, progress);
     tracing::info!(
         indexed = summary.indexed,
         skipped = summary.skipped,
@@ -1797,7 +1868,20 @@ fn folder_holds_content(entries: std::fs::ReadDir) -> bool {
 /// this after each debounced batch of changes. The server also runs it at
 /// startup, so that it cleans up a book deleted while the server was down.
 pub fn reconcile(library: &Path, data_dir: &Path, index: &Index, opts: ScanOptions) -> ScanSummary {
-    let mut summary = scan_library(library, data_dir, index, opts);
+    reconcile_with_progress(library, data_dir, index, opts, &ScanProgress::default())
+}
+
+/// [`reconcile`], publishing its book counts to `progress`. The watcher passes
+/// the counter that the server shows on its "Scanning…" page, so a long first
+/// scan reports how far it has come.
+pub fn reconcile_with_progress(
+    library: &Path,
+    data_dir: &Path,
+    index: &Index,
+    opts: ScanOptions,
+    progress: &ScanProgress,
+) -> ScanSummary {
+    let mut summary = scan_library_with_progress(library, data_dir, index, opts, progress);
     summary.pruned = prune_orphans(library, data_dir, index).unwrap_or_else(|err| {
         tracing::warn!(error = %err, "orphan prune failed");
         0
@@ -1849,6 +1933,11 @@ pub enum WatchSignal {
 /// lifetime. The thread logs a setup failure (or the end of the watch) and
 /// simply disables auto-refresh; the server keeps serving what is already
 /// indexed. (Task 4.3 / PRD C2.)
+// The watcher takes the whole scan setup as flat values: three paths, the scan
+// options, both channel ends, the progress counter, and the readiness
+// callback. A parameter struct here would only rename the same eight values at
+// the one call site that builds them.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_library_watcher(
     library: PathBuf,
     data_dir: PathBuf,
@@ -1856,6 +1945,7 @@ pub fn spawn_library_watcher(
     opts: ScanOptions,
     watch_tx: std::sync::mpsc::Sender<WatchSignal>,
     watch_rx: std::sync::mpsc::Receiver<WatchSignal>,
+    progress: Arc<ScanProgress>,
     on_initial_scan: impl FnOnce() + Send + 'static,
 ) {
     std::thread::spawn(move || {
@@ -1866,6 +1956,7 @@ pub fn spawn_library_watcher(
             opts,
             watch_tx,
             watch_rx,
+            &progress,
             on_initial_scan,
         ) {
             tracing::error!(error = %err, "library watcher stopped — auto-refresh disabled");
@@ -1873,6 +1964,7 @@ pub fn spawn_library_watcher(
     });
 }
 
+#[allow(clippy::too_many_arguments)] // mirrors `spawn_library_watcher` above
 fn watch_loop(
     library: &Path,
     data_dir: &Path,
@@ -1880,6 +1972,7 @@ fn watch_loop(
     opts: ScanOptions,
     watch_tx: std::sync::mpsc::Sender<WatchSignal>,
     watch_rx: std::sync::mpsc::Receiver<WatchSignal>,
+    progress: &ScanProgress,
     on_initial_scan: impl FnOnce(),
 ) -> Result<(), Box<dyn std::error::Error>> {
     use notify::{RecursiveMode, Watcher};
@@ -1948,7 +2041,7 @@ fn watch_loop(
     // Initial reconcile: index new/changed books, and prune books removed
     // while the server was down. It runs after the watch is live, so no
     // in-window change is lost.
-    let s = reconcile(library, data_dir, &index, opts);
+    let s = reconcile_with_progress(library, data_dir, &index, opts, progress);
     tracing::info!(
         indexed = s.indexed,
         skipped = s.skipped,
@@ -1976,7 +2069,7 @@ fn watch_loop(
             signals += 1;
         }
         tracing::info!(signals, "reconciling the library");
-        let s = reconcile(library, data_dir, &index, opts);
+        let s = reconcile_with_progress(library, data_dir, &index, opts, progress);
         tracing::info!(
             indexed = s.indexed,
             skipped = s.skipped,
@@ -5180,6 +5273,7 @@ mod tests {
             ScanOptions::default(),
             tx,
             rx,
+            &ScanProgress::default(),
             || fired.set(true),
         );
         assert!(res.is_err(), "the DB failure is surfaced");
@@ -5204,6 +5298,7 @@ mod tests {
             ScanOptions::default(),
             tx,
             rx,
+            &ScanProgress::default(),
             || fired.set(true),
         );
         assert!(res.is_ok(), "watch failure is degradation, not an error");
@@ -5359,6 +5454,7 @@ mod tests {
             ScanOptions::default(),
             tx,
             rx,
+            Arc::new(ScanProgress::default()),
             || {},
         );
         // Let the watcher establish its filesystem watch before the test adds
@@ -5905,6 +6001,71 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn a_scan_reports_its_book_counts() {
+        skip_unless_ffmpeg!();
+        let (root, data, index) = two_book_library("progress");
+        let progress = ScanProgress::default();
+        assert_eq!(progress.snapshot(), None, "no count before a scan");
+
+        let summary =
+            scan_library_with_progress(&root, &data, &index, ScanOptions::default(), &progress);
+
+        assert_eq!(summary.indexed, 2);
+        assert_eq!(
+            progress.snapshot(),
+            Some((2, 2)),
+            "every discovered book is counted"
+        );
+
+        // A second scan finds both books up to date. It reports its own
+        // numbers, and the counts do not accumulate across scans.
+        scan_library_with_progress(&root, &data, &index, ScanOptions::default(), &progress);
+        assert_eq!(
+            progress.snapshot(),
+            Some((2, 2)),
+            "an up-to-date book counts"
+        );
+
+        // A book disabled by its sidecar never reaches an ingest. It is still
+        // a book this scan finished with, so the page must not wait on it
+        // (Greptile P2).
+        std::fs::write(root.join("alpha.podspine.toml"), b"disabled = true").unwrap();
+        let summary =
+            scan_library_with_progress(&root, &data, &index, ScanOptions::default(), &progress);
+        assert_eq!(summary.skipped, 1, "the disabled book is skipped");
+        assert_eq!(
+            progress.snapshot(),
+            Some((2, 2)),
+            "a disabled book counts as finished"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn scan_progress_starts_each_scan_at_zero() {
+        // `snapshot` clamps `done` to `total`, so a scan that lost its reset
+        // would still read as complete through the scan-level test above.
+        // Check the counter itself (Greptile P2).
+        let progress = ScanProgress::default();
+        progress.begin(2);
+        assert_eq!(progress.snapshot(), Some((0, 2)), "a scan starts at zero");
+
+        progress.book_done();
+        assert_eq!(progress.snapshot(), Some((1, 2)));
+        progress.book_done();
+        assert_eq!(progress.snapshot(), Some((2, 2)));
+
+        progress.begin(2);
+        assert_eq!(
+            progress.snapshot(),
+            Some((0, 2)),
+            "the next scan starts at zero again, not at the last total"
+        );
     }
 
     #[test]

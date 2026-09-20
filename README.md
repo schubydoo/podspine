@@ -59,10 +59,11 @@ Then open <http://localhost:8080> to browse your books and copy feed URLs.
 > **The first scan can take a while.** On first start Podspine processes your whole
 > library — **chaptered** books are split into per-chapter episodes (whole-file books,
 > like MP3 folders, stream in place), so a large chaptered library can take minutes.
-> While it runs, the browse page shows a self-refreshing **"Scanning…"** message (not
-> an error — it becomes your book grid when the scan finishes) and feed/audio requests
-> answer `503` with `Retry-After` so podcatchers retry. A restart with an
-> already-populated `/data` volume is fast — it only processes what's new or changed.
+> While it runs, the browse page shows a self-refreshing **"Scanning…"** message with
+> the count of books finished so far (not an error — it becomes your book grid when the
+> scan finishes) and feed/audio requests answer `503` with `Retry-After` so podcatchers
+> retry. A restart with an already-populated `/data` volume is fast — it only processes
+> what's new or changed.
 
 > **Set `PODSPINE_BASE_URL`** to the address podcast apps will actually reach
 > (your LAN IP or public hostname). It defaults to `http://localhost:8080`, which
