@@ -9,8 +9,8 @@
 //! - **single-file book** (top-level `Author - Title.m4b`, or a lone file in its
 //!   own folder) → `Author - Title.podspine.toml` beside the audio (mirrors the
 //!   `.cue`/`.ffmeta` convention);
-//! - **MP3-folder book, or that lone-file-in-a-folder** → `.podspine.toml` inside
-//!   the folder;
+//! - **track-folder book, or that lone-file-in-a-folder** → `.podspine.toml`
+//!   inside the folder;
 //! - a top-level file's parent is the library root, so no folder-level file
 //!   applies there (it would wrongly cover every top-level book).
 
@@ -38,6 +38,10 @@ pub struct BookOverrides {
     /// Feed-level fallback cover for this book.
     pub default_cover_url: Option<String>,
     // --- troubleshooting-only (no global equivalent) ---
+    /// Treat every audio file in this folder as one book's tracks, whatever
+    /// their extension. Without it, a folder of several `.m4b`/`.m4a` files is
+    /// several single-file books, which is what an author folder usually is.
+    pub folder_is_one_book: Option<bool>,
     /// Skip this book entirely (removed from the index + every surface).
     pub disabled: Option<bool>,
     /// Override the feed/book title.
@@ -85,7 +89,7 @@ impl BookOverrides {
 }
 
 /// The sidecar path for a book whose `source` is a file (single-file book) or a
-/// directory (MP3 folder), or `None` if none exists. Both `source` and
+/// directory (track folder), or `None` if none exists. Both `source` and
 /// `library_root` should be canonical/absolute (the scanner canonicalizes them).
 pub fn sidecar_path(source: &Path, library_root: &Path) -> Option<PathBuf> {
     if source.is_dir() {

@@ -195,9 +195,14 @@ library/
   episode whose file resolves outside the library root — indexing it would publish
   a feed whose audio 404s. A link that stays inside the library is fine, and the
   same book reached two ways is indexed once.
-- Several `.ogg`/`.opus`/`.flac` files in one folder are **skipped with a warning**
-  — only `.mp3` folders are read as one book's tracks. Give each such book its own
-  folder, or add a `.cue`.
+- **Several `.ogg`/`.opus`/`.flac` files in one folder are one book's tracks**, the
+  same rule `.mp3` folders have always had. With `PODSPINE_TRANSCODE` on, each such
+  track is re-encoded once at ingest, because most podcast apps do not play those
+  formats; with it off they are served as they are.
+- **A folder of several `.m4b`/`.m4a` files stays several books.** That is what an
+  author folder usually is, and each file keeps its own feed URL. If the folder is
+  really one book split by disc, put `folder_is_one_book = true` in a
+  `.podspine.toml` inside it.
 
 ## Per-book overrides (`.podspine.toml`)
 
@@ -211,8 +216,8 @@ env → global config file → default.**
 - **A single file** — name it after the file: `Author - Title.podspine.toml`
   beside `Author - Title.m4b` (same as a `.cue` sidecar). Works whether the file
   is at the top level or in its own folder.
-- **A multi-file (MP3-folder) book, or a lone file kept in its own folder** — drop
-  a `.podspine.toml` **inside that folder**.
+- **A multi-track folder book, or a lone file kept in its own folder** — drop a
+  `.podspine.toml` **inside that folder**.
 
 **Keys you can set:**
 
@@ -223,6 +228,7 @@ env → global config file → default.**
 | `remux_non_faststart` | Remux this book to faststart if it's a non-faststart mp4. |
 | `default_cover_url` | Feed cover fallback for this book. |
 | `title` / `author` | Override the feed title/author (fix metadata without renaming files). |
+| `folder_is_one_book` | `true` makes every audio file in this folder one book's tracks, whatever their extension. |
 | `disabled` | `true` removes this book from the index and every feed/page. |
 | `force_reingest` | `true` re-processes the book on every scan (drop it once you're done). |
 

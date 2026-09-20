@@ -17,9 +17,12 @@
 //! independent book. Books have two shapes:
 //! - A single-file book (`.m4b`/`.m4a`, or a lone `.mp3`). The scanner splits
 //!   it by chapters.
-//! - A multi-track **MP3 folder** (Task 3.3): a folder of per-chapter MP3s.
-//!   The scanner ingests one episode per file, with **no split and no
-//!   re-encode**. Track number sets the order; filename order is the fallback.
+//! - A multi-track **track folder** (Task 3.3): a folder of per-chapter files,
+//!   either several `.mp3` or several Ogg/Opus/FLAC. The scanner ingests one
+//!   episode per file, with **no split**. Track number sets the order;
+//!   filename order is the fallback. A folder of several `.m4b`/`.m4a` is
+//!   several books instead, unless its `.podspine.toml` sets
+//!   `folder_is_one_book`.
 //!
 //! The scanner assigns collision-free slugs deterministically. One bad book
 //! never aborts the whole scan. The scanner stream-copies Tier-2 inputs
@@ -27,11 +30,12 @@
 //! inputs (AAX/AAXC/`.aa`/`.odm`) and logs a notice (PRD W5).
 //!
 //! **The server serves whole-file episodes in place (Sprint 6.2).** An episode
-//! can be a whole source file: every MP3-folder track, and each chapterless
-//! single file. The server streams such an episode directly from the read-only
+//! can be a whole source file: every folder track, and each chapterless single
+//! file. The server streams such an episode directly from the read-only
 //! library, and the scanner records its `source_path`. The scanner copies
-//! nothing under `<data_dir>`. Only chaptered books are extracted
-//! (`full`/`saver`), because their episodes are sub-ranges of one container.
+//! nothing under `<data_dir>`. Chaptered books are extracted there
+//! (`full`/`saver`), because their episodes are sub-ranges of one container,
+//! and so is any file that `PODSPINE_TRANSCODE` re-encodes (Task 5.2).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -133,7 +137,7 @@ pub enum ScanError {
         /// I/O error.
         source: std::io::Error,
     },
-    /// An MP3 folder held no ingestable (probeable) audio.
+    /// A track folder held no ingestable (probeable) audio.
     #[error("no ingestable audio in folder: {0}")]
     EmptyFolder(PathBuf),
     /// A filesystem operation (stat, mkdir, or split-file delete) failed during ingest.
@@ -199,7 +203,7 @@ pub fn scan_book_as(
 }
 
 /// What one book needs from a scan, decided by the index reads in
-/// [`plan_book`] and [`plan_mp3_folder`].
+/// [`plan_book`] and [`plan_track_folder`].
 enum BookPlan {
     /// Already indexed at this mtime, with every file the storage mode needs
     /// present: nothing to probe, split, or write.
@@ -217,7 +221,7 @@ enum BookPlan {
 /// into index reads ([`plan_book`]), index-free work ([`run_ingest`]), and
 /// index writes ([`commit_book`]).
 struct IngestTask {
-    /// The canonical source: an audio file, or an MP3 folder.
+    /// The canonical source: an audio file, or a track folder.
     input: PathBuf,
     /// The book id, which is also its slug.
     id: String,
@@ -240,9 +244,15 @@ enum IngestKind {
     /// A single audiobook file: probe, resolve chapters, then split, transcode,
     /// or serve in place.
     Single(Box<SingleIngest>),
-    /// A folder of per-chapter MP3s served in place (Task 3.3, Sprint 6.2),
-    /// holding the track paths [`plan_mp3_folder`] collected.
-    Mp3Folder(Vec<PathBuf>),
+    /// A folder of per-chapter tracks served in place (Task 3.3, Sprint 6.2),
+    /// holding the track paths [`plan_track_folder`] collected.
+    TrackFolder {
+        /// The track paths, in the order [`plan_track_folder`] collected them.
+        files: Vec<PathBuf>,
+        /// The server's transcode setting. A track whose codec no podcatcher
+        /// plays is re-encoded into `<data_dir>` instead of served in place.
+        transcode: TranscodeMode,
+    },
 }
 
 /// The settings a single-file ingest needs, after a `.podspine.toml` refines
@@ -496,7 +506,9 @@ fn plan_book(
 fn run_ingest(task: &IngestTask, split_workers: usize) -> Result<PreparedBook, ScanError> {
     match &task.kind {
         IngestKind::Single(single) => ingest_single(task, single, split_workers),
-        IngestKind::Mp3Folder(files) => ingest_mp3_folder(task, files),
+        IngestKind::TrackFolder { files, transcode } => {
+            ingest_track_folder(task, files, *transcode)
+        }
     }
 }
 
@@ -580,7 +592,7 @@ fn commit_scanned_book(
     match prepared.and_then(|p| commit_book(index, p)) {
         Ok(book) => {
             summary.indexed += 1;
-            log_indexed(&book, matches!(task.kind, IngestKind::Mp3Folder(_)));
+            log_indexed(&book, matches!(task.kind, IngestKind::TrackFolder { .. }));
         }
         Err(err) => {
             summary.skipped += 1;
@@ -622,7 +634,7 @@ fn remove_measured_file(path: &Path) -> Result<(), ScanError> {
 /// Log one indexed book, naming the shape the scan ingested.
 fn log_indexed(book: &BookRow, folder: bool) {
     if folder {
-        tracing::info!(slug = %book.slug, title = %book.title, "indexed MP3-folder book");
+        tracing::info!(slug = %book.slug, title = %book.title, "indexed track-folder book");
     } else {
         tracing::info!(slug = %book.slug, title = %book.title, "indexed book");
     }
@@ -1123,9 +1135,9 @@ fn is_episode_stem(path: &Path) -> bool {
         .is_some_and(podspine_splitter::is_episode_stem)
 }
 
-/// One per-chapter MP3 track discovered in a folder, with the metadata needed to
-/// order and index it.
-struct Mp3Track {
+/// One track discovered in a folder book, with the metadata needed to order
+/// and index it.
+struct FolderTrack {
     /// Source path in the library.
     path: PathBuf,
     /// Duration in seconds (from ffprobe).
@@ -1134,25 +1146,32 @@ struct Mp3Track {
     track: Option<u32>,
     /// Episode title (ID3 `title` tag, else the file stem).
     title: String,
+    /// Audio codec of the source (from ffprobe), which picks the output
+    /// container when the track is re-encoded.
+    codec: Option<String>,
+    /// How this track becomes an episode: [`Encoding::Copy`] streams the
+    /// source in place, anything else re-encodes it into `<data_dir>`.
+    encoding: Encoding,
 }
 
-/// Read an MP3 folder's index state and decide what the scan owes it.
+/// Read a track folder's index state and decide what the scan owes it.
 ///
-/// A folder of per-chapter MP3s becomes one book under `id`: one episode per
-/// file, with **no split, no re-encode, and no copy**. The server serves each
-/// track in place from the library (Sprint 6.2). Track number sets the file
-/// order when every track number is present and distinct. Otherwise filename
-/// order applies and the scan logs a warning. The scan is idempotent on an
-/// unchanged folder.
+/// A folder of per-chapter tracks becomes one book under `id`: one episode per
+/// file, with **no split and no copy**. The server serves each track in place
+/// from the library (Sprint 6.2), except a track that `PODSPINE_TRANSCODE`
+/// re-encodes into `<data_dir>`. Track number sets the file order when every
+/// track number is present and distinct. Otherwise filename order applies and
+/// the scan logs a warning. The scan is idempotent on an unchanged folder.
 ///
 /// These are the folder's only index reads before [`commit_book`], so
 /// [`scan_library`] runs them serially and hands the probing in
-/// [`ingest_mp3_folder`] to a worker pool.
-fn plan_mp3_folder(
+/// [`ingest_track_folder`] to a worker pool.
+fn plan_track_folder(
     dir: &Path,
     id: &str,
     data_dir: &Path,
     index: &Index,
+    opts: ScanOptions,
     overrides: &BookOverrides,
     library_root: &Path,
 ) -> Result<BookPlan, ScanError> {
@@ -1161,7 +1180,8 @@ fn plan_mp3_folder(
     // server's cwd.
     let dir_canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     let dir = dir_canonical.as_path();
-    let files = collect_mp3s(dir, library_root);
+    let one_book = overrides.folder_is_one_book == Some(true);
+    let files = collect_tracks(dir, library_root, one_book);
     if files.is_empty() {
         return Err(ScanError::EmptyFolder(dir.to_path_buf()));
     }
@@ -1179,8 +1199,8 @@ fn plan_mp3_folder(
 
     // Compute the effective per-book metadata (override → default) up here to
     // detect a `.podspine.toml` edit; the `BookRow` build below reuses it.
-    // `storage_mode`/`remux`/`force_embedded` are no-ops for MP3 folders, so
-    // only title/author/cover apply.
+    // `storage_mode`/`remux`/`force_embedded` are no-ops for a track folder,
+    // so only title/author/cover apply.
     let eff_title = overrides.title.clone().unwrap_or_else(|| dir_name(dir));
     let eff_author = overrides.author.clone();
     let eff_cover = overrides.default_cover_url.clone();
@@ -1191,13 +1211,22 @@ fn plan_mp3_folder(
     // `source_path`). The book then flips to in-place serving, and the sweep
     // reclaims its copies. The metadata checks re-ingest on a `.podspine.toml`
     // edit that did not change the folder mtime (Greptile P1).
+    let stored_transcode_ok = |existing: &BookRow| {
+        // Transcode toggle guard, as in `plan_book`: a `PODSPINE_TRANSCODE`
+        // flip changes a track's container and its recorded `byte_length`,
+        // and touches no source mtime.
+        let stored = existing.transcode.unwrap_or(TranscodeMode::Off);
+        folder_transcode(&files, opts.transcode).is_none_or(|expected| stored == expected)
+    };
     if overrides.force_reingest != Some(true)
         && let Some(existing) = index.get_book(id)?
         && existing.source_mtime == source_mtime
         && existing.title == eff_title
         && existing.author == eff_author
         && existing.default_cover_url == eff_cover
+        && stored_transcode_ok(&existing)
     {
+        let stored_transcoded = existing.transcode.is_some_and(TranscodeMode::is_on);
         let eps = index.episodes_for_book(id)?;
         // Every track is served in place, so each one must still be the file
         // whose length the feed publishes. The folder's `source_mtime` is the
@@ -1205,10 +1234,20 @@ fn plan_mp3_folder(
         // original timestamp changes no mtime the scan can see. The length
         // does change, and the serve layer refuses such a track, so this check
         // is what gets it re-ingested.
+        //
+        // A transcoded track is the exception: it lives under `<data_dir>`
+        // with no `source_path`, and nothing regenerates it, so its own file
+        // is what must still match. An episode with no `source_path` in a book
+        // that is NOT transcoded is a pre-6.2 verbatim copy, and the empty
+        // `source_path` is what forces its one-time re-ingest to in-place
+        // serving.
         if !eps.is_empty()
-            && eps.iter().all(|e| {
-                !e.source_path.is_empty() && file_has_length(&e.source_path, e.byte_length)
-            })
+            && eps
+                .iter()
+                .all(|e| stored_transcoded || !e.source_path.is_empty())
+            && eps
+                .iter()
+                .all(|e| file_has_length(&e.file_path, e.byte_length))
         {
             return Ok(BookPlan::UpToDate(Box::new(existing)));
         }
@@ -1222,14 +1261,42 @@ fn plan_mp3_folder(
         title: eff_title,
         author: eff_author,
         cover_url: eff_cover,
-        kind: IngestKind::Mp3Folder(files),
+        kind: IngestKind::TrackFolder {
+            files,
+            transcode: opts.transcode,
+        },
     })))
 }
 
-/// Probe an MP3 folder's tracks and build its rows: one episode per file, with
-/// **no split, no re-encode, and no copy**. Touches no index (see
-/// [`IngestTask`]).
-fn ingest_mp3_folder(task: &IngestTask, files: &[PathBuf]) -> Result<PreparedBook, ScanError> {
+/// What `book.transcode` a folder of `files` should carry, read from the track
+/// extensions alone (no probe). `Some(mode)` when the answer is certain: the
+/// re-encode mode of the first track that needs one, else `Off` when no track
+/// does. `None` when an extension does not say, and only the probe in the
+/// ingest can decide.
+fn folder_transcode(files: &[PathBuf], mode: TranscodeMode) -> Option<TranscodeMode> {
+    let mut every_track_known = true;
+    for file in files {
+        match expected_transcode(file, mode) {
+            Some(m) if m.is_on() => return Some(m),
+            Some(_) => {}
+            None => every_track_known = false,
+        }
+    }
+    every_track_known.then_some(TranscodeMode::Off)
+}
+
+/// Probe a track folder and build its rows: one episode per file, with **no
+/// split and no copy**. Touches no index (see [`IngestTask`]).
+///
+/// A track whose codec no podcatcher plays (FLAC, Vorbis, Opus, ALAC) is
+/// re-encoded into `<data_dir>/books/<id>/` when `transcode` is on, exactly as
+/// a chapterless single file is. Every other track streams in place from the
+/// read-only library. A folder can hold both.
+fn ingest_track_folder(
+    task: &IngestTask,
+    files: &[PathBuf],
+    transcode: TranscodeMode,
+) -> Result<PreparedBook, ScanError> {
     let dir = task.input.as_path();
     let id = task.id.as_str();
 
@@ -1240,31 +1307,33 @@ fn ingest_mp3_folder(task: &IngestTask, files: &[PathBuf]) -> Result<PreparedBoo
     // Probe each track for duration/track/title. The scan skips a corrupt
     // file; it is not fatal to the book.
     let probe_start = std::time::Instant::now();
-    let mut tracks: Vec<Mp3Track> = Vec::new();
+    let mut tracks: Vec<FolderTrack> = Vec::new();
     for path in files {
         match probe(path) {
-            Ok(p) => tracks.push(Mp3Track {
+            Ok(p) => tracks.push(FolderTrack {
                 duration_sec: p.duration_sec,
                 track: p.track,
                 title: p.title.unwrap_or_else(|| file_stem(path)),
+                encoding: encoding_for(p.audio_codec.as_deref(), transcode),
+                codec: p.audio_codec,
                 path: path.clone(),
             }),
             Err(err) => {
-                tracing::warn!(error = %err, path = %path.display(), "skipping unprobeable mp3")
+                tracing::warn!(error = %err, path = %path.display(), "skipping unprobeable track")
             }
         }
     }
     if tracks.is_empty() {
         return Err(ScanError::EmptyFolder(dir.to_path_buf()));
     }
-    order_mp3_tracks(&mut tracks, dir);
+    order_tracks(&mut tracks, dir);
     log_stage(id, "probe", probe_start);
 
     let book = BookRow {
         id: id.to_string(),
         slug: id.to_string(),
         feed_id: podspine_index::capability::generate(),
-        // Per-book overrides (Sprint 6.4). `plan_mp3_folder` computes them, and
+        // Per-book overrides (Sprint 6.4). `plan_track_folder` computes them, and
         // its idempotency guard re-checks them, so a sidecar edit re-persists
         // them. `storage_mode`/`remux`/`force_embedded` are no-ops for MP3
         // folders (the server serves tracks in place), so persist no
@@ -1276,31 +1345,64 @@ fn ingest_mp3_folder(task: &IngestTask, files: &[PathBuf]) -> Result<PreparedBoo
         source_mtime: task.source_mtime,
         storage_mode: None,
         default_cover_url: task.cover_url.clone(),
-        // An MP3 folder has no chapters, so `force_embedded` never applies.
+        // A track folder has no chapters, so `force_embedded` never applies.
         force_embedded: false,
-        // MP3 is podcast-safe: the scan never re-encodes an MP3 folder
-        // (Task 5.2).
-        transcode: Some(TranscodeMode::Off),
+        // `Off` unless a track was re-encoded. The serve and evict layers read
+        // this: a transcoded book is never regenerated and never evicted,
+        // because a re-encode is not byte-reproducible (Task 5.2).
+        transcode: Some(if tracks.iter().any(|t| t.encoding != Encoding::Copy) {
+            transcode
+        } else {
+            TranscodeMode::Off
+        }),
     };
 
     let n = tracks.len();
     let mut episodes = Vec::with_capacity(n);
+    let mut written: HashSet<String> = HashSet::new();
+    let split_start = std::time::Instant::now();
     for (idx, t) in tracks.iter().enumerate() {
-        let byte_length = std::fs::metadata(&t.path)
-            .map_err(|source| ScanError::Io {
-                path: t.path.clone(),
-                source,
-            })?
-            .len();
+        // A re-encoded track lands under `<data_dir>` and is served from
+        // there. It carries no `source_path`, which is how the serve layer
+        // knows not to look in the library, and how nothing tries to
+        // regenerate it: a re-encode is not byte-reproducible.
+        let (file_path, source_path, byte_length) = if t.encoding == Encoding::Copy {
+            let byte_length = std::fs::metadata(&t.path)
+                .map_err(|source| ScanError::Io {
+                    path: t.path.clone(),
+                    source,
+                })?
+                .len();
+            let path = t.path.to_string_lossy().into_owned();
+            (path.clone(), path, byte_length)
+        } else {
+            let out_ext = episode_ext(t.codec.as_deref(), t.encoding);
+            let ep = transcode_whole(
+                &t.path,
+                &task.book_out,
+                idx,
+                out_ext,
+                t.duration_sec,
+                t.encoding,
+            )?;
+            if let Some(name) = ep.path.file_name().and_then(|n| n.to_str()) {
+                written.insert(name.to_string());
+            }
+            (
+                ep.path.to_string_lossy().into_owned(),
+                String::new(),
+                ep.byte_length,
+            )
+        };
         episodes.push(EpisodeRow {
             guid: episode_guid(id, idx, task.source_mtime),
             book_id: id.to_string(),
             idx: idx as i64,
             title: t.title.clone(),
-            file_path: t.path.to_string_lossy().into_owned(),
-            // A folder track IS a whole source file. Stream it in place.
-            source_path: t.path.to_string_lossy().into_owned(),
-            // MP3 has no `moov` atom, so faststart never applies.
+            file_path,
+            source_path,
+            // A track is a whole file, and a re-encode writes its `moov`
+            // first, so faststart never applies either way.
             needs_faststart: false,
             byte_length: byte_length as i64,
             duration_sec: t.duration_sec,
@@ -1310,24 +1412,36 @@ fn ingest_mp3_folder(task: &IngestTask, files: &[PathBuf]) -> Result<PreparedBoo
             pubdate_epoch: pubdate_epoch(task.source_mtime, idx, n),
         });
     }
+    if !written.is_empty() {
+        log_stage(id, "split", split_start);
+    }
 
     Ok(PreparedBook {
         book,
         episodes,
-        // Each track is a whole file that the server streams in place from the
-        // library, with no copy. Any verbatim copy a pre-6.2 ingest wrote under
-        // `<data_dir>` is dead weight, but ONLY once the new rows point into
-        // the library. A pre-6.2 book's live rows still name those copies, so
-        // deleting them before the commit would 404 that book until the commit
-        // landed (Greptile P1).
-        sweep: Sweep::InPlace(task.book_out.clone()),
+        // A track that streams in place from the library leaves nothing under
+        // `<data_dir>`. Any verbatim copy a pre-6.2 ingest wrote there is dead
+        // weight, but ONLY once the new rows point into the library. A pre-6.2
+        // book's live rows still name those copies, so deleting them before
+        // the commit would 404 that book until the commit landed (Greptile
+        // P1). A folder with re-encoded tracks keeps exactly the files this
+        // ingest wrote, and drops the rest, which is what retires the output
+        // of a previous transcode setting.
+        sweep: if written.is_empty() {
+            Sweep::InPlace(task.book_out.clone())
+        } else {
+            Sweep::Files {
+                book_out: task.book_out.clone(),
+                keep: written,
+            }
+        },
         book_start,
     })
 }
 
 /// Order tracks by track number when every number is present and distinct.
 /// Otherwise fall back to a case-insensitive filename sort and log a warning.
-fn order_mp3_tracks(tracks: &mut [Mp3Track], dir: &Path) {
+fn order_tracks(tracks: &mut [FolderTrack], dir: &Path) {
     let numbers: Option<Vec<u32>> = tracks.iter().map(|t| t.track).collect();
     let usable = numbers.as_ref().is_some_and(|v| {
         let distinct: HashSet<u32> = v.iter().copied().collect();
@@ -1338,7 +1452,7 @@ fn order_mp3_tracks(tracks: &mut [Mp3Track], dir: &Path) {
     } else {
         tracing::warn!(
             path = %dir.display(),
-            "MP3 folder has missing or duplicate track numbers; ordering by filename"
+            "track folder has missing or duplicate track numbers; ordering by filename"
         );
         tracks.sort_by_key(|t| {
             t.path
@@ -1349,15 +1463,22 @@ fn order_mp3_tracks(tracks: &mut [Mp3Track], dir: &Path) {
     }
 }
 
-/// Collect the top-level `.mp3` files in `dir` (unordered; the caller sorts).
-fn collect_mp3s(dir: &Path, library_root: &Path) -> Vec<PathBuf> {
+/// Collect the top-level audio files in `dir` (unordered; the caller sorts).
+///
+/// A folder that holds `.mp3` tracks keeps exactly those, unless `one_book`
+/// says otherwise. That is the classic MP3 folder, and a stray `.flac` beside
+/// its tracks would otherwise become a new episode and renumber every episode
+/// after it, in a feed subscribers already hold. `one_book` comes from the
+/// folder's `folder_is_one_book` sidecar key, where the operator has said what
+/// the folder is.
+fn collect_tracks(dir: &Path, library_root: &Path, one_book: bool) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
-    entries
+    let files: Vec<PathBuf> = entries
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.is_file() && ext_lower(p).as_deref() == Some("mp3"))
+        .filter(|p| p.is_file() && is_audio(p))
         // A track can itself be a symlink out of the library even when its
         // folder is inside it: `source_is_inside` only vetted the folder. Such
         // a track would land in the feed and then 404 at serve time, because
@@ -1365,10 +1486,18 @@ fn collect_mp3s(dir: &Path, library_root: &Path) -> Vec<PathBuf> {
         // outside the library root. Drop it here, loudly (Greptile):
         // [`resolve_inside`] warns.
         .filter(|p| resolve_inside(p, library_root).is_some())
-        .collect()
+        .collect();
+
+    if !one_book && files.iter().any(|p| ext_lower(p).as_deref() == Some("mp3")) {
+        return files
+            .into_iter()
+            .filter(|p| ext_lower(p).as_deref() == Some("mp3"))
+            .collect();
+    }
+    files
 }
 
-/// A directory's own name (fallback `"book"`), used as an MP3-folder book title.
+/// A directory's own name (fallback `"book"`), used as a folder-book title.
 fn dir_name(dir: &Path) -> String {
     dir.file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -1382,7 +1511,7 @@ fn dir_name(dir: &Path) -> String {
 pub struct ScanSummary {
     /// Books successfully indexed.
     pub indexed: usize,
-    /// Sources skipped: bad/DRM'd files, or MP3 folders pending Task 3.3.
+    /// Sources skipped: bad or DRM-protected files.
     pub skipped: usize,
     /// Orphaned books pruned (set by [`reconcile`]; `scan_library` leaves it 0).
     pub pruned: usize,
@@ -1394,15 +1523,15 @@ enum BookSource {
     /// A single splittable audio file (`.m4b`/`.m4a`, or a lone `.mp3`).
     File(PathBuf),
     /// A folder of per-track MP3s (recognized in v1, ingested since Task 3.3).
-    Mp3Folder(PathBuf),
+    TrackFolder(PathBuf),
 }
 
 impl BookSource {
-    /// The source's filesystem path: the audio file, or the MP3 folder.
+    /// The source's filesystem path: the audio file, or the track folder.
     fn path(&self) -> &Path {
         match self {
             BookSource::File(p) => p,
-            BookSource::Mp3Folder(d) => d,
+            BookSource::TrackFolder(d) => d,
         }
     }
 
@@ -1429,7 +1558,7 @@ impl BookSource {
                 Some(name) => name,
                 None => file_stem(p),
             },
-            BookSource::Mp3Folder(d) => match nested_prefix(Some(d), library_root) {
+            BookSource::TrackFolder(d) => match nested_prefix(Some(d), library_root) {
                 Some(name) => name,
                 // A folder name has no extension to strip; use it whole.
                 None => d
@@ -1453,7 +1582,7 @@ impl BookSource {
 /// a subscriber by accident. A `.podspine.toml` `title` still wins over this.
 fn nested_title(source: &BookSource, library_root: &Path) -> Option<String> {
     let BookSource::File(path) = source else {
-        // An MP3-folder book is already titled by its folder.
+        // A folder book is already titled by its folder.
         return None;
     };
     let dir = path.parent()?;
@@ -1704,11 +1833,11 @@ fn scan_library_with_progress(
             progress.book_done();
             continue;
         }
-        let folder = matches!(source, BookSource::Mp3Folder(_));
+        let folder = matches!(source, BookSource::TrackFolder(_));
         let plan = match &source {
             BookSource::File(path) => plan_book(path, &slug, data_dir, index, opts, &overrides),
-            BookSource::Mp3Folder(dir) => {
-                plan_mp3_folder(dir, &slug, data_dir, index, &overrides, &library_root)
+            BookSource::TrackFolder(dir) => {
+                plan_track_folder(dir, &slug, data_dir, index, opts, &overrides, &library_root)
             }
         };
         match plan {
@@ -2274,7 +2403,7 @@ fn walk_library(
     // another book. The documented cost: a mixed `Author/{loose.m4b, Title/…}`
     // yields only `loose.m4b`.
     if depth > 0 {
-        let books: Vec<BookSource> = classify_dir(dir)
+        let books: Vec<BookSource> = classify_dir(dir, library_root)
             .into_iter()
             .filter(|src| source_is_inside(src, library_root))
             .collect();
@@ -2330,7 +2459,7 @@ fn source_is_inside(src: &BookSource, library_root: &Path) -> bool {
 
 /// Canonicalize `path` and keep it only if it resolves inside `root`. This is
 /// the symlink-containment rule shared by the walk, source vetting, and
-/// MP3-track collection. The serve layer canonicalizes every source and
+/// folder-track collection. The serve layer canonicalizes every source and
 /// refuses anything outside the library root (TAD §7), so an indexed escapee
 /// would publish audio that 404s. The check drops, with a warning, a path that
 /// resolves outside the root or cannot be resolved at all. A book missing from
@@ -2372,19 +2501,24 @@ fn is_ignored_name(name: &str) -> bool {
 }
 
 /// Classify a per-book subfolder. Prefer a splittable `.m4b`/`.m4a`. A lone
-/// `.mp3` is a single-file book. Several `.mp3`s are a multi-track folder
-/// (Task 3.3). A folder with no audio yields nothing.
-fn classify_dir(dir: &Path) -> Vec<BookSource> {
+/// audio file is a single-file book. Several `.mp3`s, or several Ogg/Opus/FLAC
+/// files, are one multi-track folder book. A folder with no audio yields
+/// nothing.
+///
+/// `folder_is_one_book` in the folder's `.podspine.toml` overrides all of it:
+/// every audio file in the folder is then one book's tracks, whatever the mix.
+/// That key exists for the one case the rules above cannot read: a folder of
+/// several `.m4b` files is usually an author folder of whole audiobooks, and
+/// sometimes one book split by disc.
+fn classify_dir(dir: &Path, library_root: &Path) -> Vec<BookSource> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
     let mut m4x = Vec::new();
     let mut mp3 = Vec::new();
     // Tier-2 containers (Ogg/Opus/FLAC): a lone one is a book in its own
-    // folder, exactly as it would be at the library root. A folder that holds
-    // several is not a Tier-2 equivalent of an MP3 folder (that path only
-    // reads `.mp3` tracks). So it stays unclassified; a half-ingest would be
-    // worse.
+    // folder, exactly as it would be at the library root, and several of them
+    // are one book's tracks, like several `.mp3`.
     let mut tier2 = Vec::new();
     for path in entries.flatten().map(|e| e.path()) {
         if !path.is_file() {
@@ -2413,6 +2547,17 @@ fn classify_dir(dir: &Path) -> Vec<BookSource> {
     mp3.sort();
     tier2.sort();
 
+    // The sidecar speaks first: this folder is one book, and every audio file
+    // in it is a track.
+    if folder_is_one_book(dir, library_root) {
+        let any_audio = !m4x.is_empty() || !mp3.is_empty() || !tier2.is_empty();
+        return if any_audio {
+            vec![BookSource::TrackFolder(dir.to_path_buf())]
+        } else {
+            Vec::new()
+        };
+    }
+
     if !m4x.is_empty() {
         // One `.m4b`/`.m4a` is one whole book, so a folder that holds several
         // holds several books: typically an author folder of single-file
@@ -2422,19 +2567,21 @@ fn classify_dir(dir: &Path) -> Vec<BookSource> {
     } else if mp3.len() == 1 {
         vec![BookSource::File(mp3.into_iter().next().unwrap())]
     } else if !mp3.is_empty() {
-        vec![BookSource::Mp3Folder(dir.to_path_buf())]
+        vec![BookSource::TrackFolder(dir.to_path_buf())]
     } else if tier2.len() == 1 {
         vec![BookSource::File(tier2.into_iter().next().unwrap())]
+    } else if !tier2.is_empty() {
+        vec![BookSource::TrackFolder(dir.to_path_buf())]
     } else {
-        if tier2.len() > 1 {
-            tracing::warn!(
-                dir = %dir.display(),
-                count = tier2.len(),
-                "several Ogg/Opus/FLAC files in one folder — skipped (only .mp3 folders are ingested as a book's tracks); give each book its own folder, or add a .cue"
-            );
-        }
         Vec::new()
     }
+}
+
+/// Whether this folder's `.podspine.toml` says the folder is one book. A
+/// missing or unreadable sidecar answers `false`, which is the classification
+/// every library had before the key existed.
+fn folder_is_one_book(dir: &Path, library_root: &Path) -> bool {
+    resolve_book_overrides(dir, library_root).folder_is_one_book == Some(true)
 }
 
 /// Choose this source's slug, which becomes its `book.id`: reserve `base` if
@@ -2683,11 +2830,12 @@ mod tests {
         let index = Index::open_in_memory().unwrap();
         let data = dir.join("data");
 
-        let err = plan_mp3_folder(
+        let err = plan_track_folder(
             &dir,
             "book-id",
             &data,
             &index,
+            ScanOptions::default(),
             &BookOverrides::default(),
             &dir,
         )
@@ -3269,6 +3417,101 @@ mod tests {
             std::fs::metadata(&e.file_path).unwrap().len() as i64
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A folder of FLAC tracks is one book, and with transcoding on, every
+    /// track is re-encoded into the data dir. Streaming FLAC in place would
+    /// publish a feed that most podcast apps refuse to play.
+    #[test]
+    fn a_flac_track_folder_transcodes_every_track_into_the_data_dir() {
+        skip_unless_ffmpeg!();
+        let root = scratch("flac-folder-transcode");
+        let folder = root.join("A FLAC Book");
+        if synth_encoded(&folder, "01.flac", &["-c:a", "flac"], 4).is_none()
+            || synth_encoded(&folder, "02.flac", &["-c:a", "flac"], 4).is_none()
+        {
+            skip!("no flac encoder");
+        }
+        let data = root.join("data");
+        let index = Index::open_in_memory().unwrap();
+        let opts = ScanOptions {
+            transcode: TranscodeMode::Aac,
+            ..Default::default()
+        };
+
+        let summary = scan_library(&root, &data, &index, opts);
+        assert_eq!(summary.indexed, 1, "the folder is one book");
+        let books = index.list_books().unwrap();
+        assert_eq!(books[0].transcode, Some(TranscodeMode::Aac));
+        let eps = index.episodes_for_book(&books[0].id).unwrap();
+        assert_eq!(eps.len(), 2, "one episode per track");
+        for e in &eps {
+            assert!(
+                e.source_path.is_empty(),
+                "a re-encoded track is not served in place"
+            );
+            assert!(e.file_path.ends_with(".m4a"), "{}", e.file_path);
+            assert!(e.file_path.starts_with(data.to_str().unwrap()));
+            assert_eq!(
+                e.byte_length,
+                std::fs::metadata(&e.file_path).unwrap().len() as i64,
+                "the enclosure length is the real output size"
+            );
+        }
+
+        // A second scan must not re-encode: the work is done and the lengths
+        // the feed publishes must not move. Mark the output, rescan, and read
+        // the mark back. The mark keeps the file's length, so the scan's own
+        // length check cannot be what saves it.
+        let marked = eps[0].file_path.clone();
+        let mut bytes = std::fs::read(&marked).unwrap();
+        bytes[0] ^= 0xff;
+        std::fs::write(&marked, &bytes).unwrap();
+        let summary = scan_library(&root, &data, &index, opts);
+        assert_eq!(summary.indexed, 1);
+        assert_eq!(
+            std::fs::read(&marked).unwrap()[0],
+            bytes[0],
+            "the second scan re-encoded a track it already had"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// MP3 is podcast-safe, so a transcode setting must leave an MP3 folder
+    /// alone: its tracks still stream in place from the library.
+    #[test]
+    fn an_mp3_track_folder_is_never_re_encoded() {
+        skip_unless_ffmpeg!();
+        let root = scratch("mp3-folder-transcode");
+        let folder = root.join("A Folder Book");
+        if synth_mp3(&folder, "01.mp3", Some(1), 3).is_none()
+            || synth_mp3(&folder, "02.mp3", Some(2), 3).is_none()
+        {
+            skip!("no libmp3lame encoder");
+        }
+        let data = root.join("data");
+        let index = Index::open_in_memory().unwrap();
+
+        scan_library(
+            &root,
+            &data,
+            &index,
+            ScanOptions {
+                transcode: TranscodeMode::Aac,
+                ..Default::default()
+            },
+        );
+        let books = index.list_books().unwrap();
+        assert_eq!(books.len(), 1);
+        assert_eq!(books[0].transcode, Some(TranscodeMode::Off));
+        let eps = index.episodes_for_book(&books[0].id).unwrap();
+        assert_eq!(eps.len(), 2);
+        for e in &eps {
+            assert_eq!(e.file_path, e.source_path, "still streamed in place");
+            assert!(e.file_path.ends_with(".mp3"), "{}", e.file_path);
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The MP3 fallback target, for clients that still do not play AAC. The
@@ -4112,7 +4355,7 @@ mod tests {
                 BookSource::File(root.join(
                     "Jules Verne/The Mysterious Island/Jules Verne - The Mysterious Island.m4b"
                 )),
-                BookSource::Mp3Folder(root.join("Mary Shelley/Frankenstein")),
+                BookSource::TrackFolder(root.join("Mary Shelley/Frankenstein")),
                 BookSource::File(root.join("Shelf/Homer/The Epic Cycle/The Odyssey/odyssey.m4b")),
             ]
         );
@@ -4399,7 +4642,7 @@ mod tests {
         std::os::unix::fs::symlink(outside.join("external.mp3"), folder.join("02.mp3")).unwrap();
 
         let real_root = root.canonicalize().unwrap();
-        let tracks = collect_mp3s(&folder.canonicalize().unwrap(), &real_root);
+        let tracks = collect_tracks(&folder.canonicalize().unwrap(), &real_root, false);
         let names: Vec<String> = tracks
             .iter()
             .map(|t| t.file_name().unwrap().to_string_lossy().into_owned())
@@ -4587,7 +4830,7 @@ mod tests {
         );
         // An MP3-folder book is already named by its folder.
         assert_eq!(
-            nested_title(&BookSource::Mp3Folder(root.join("Author/Tracks")), &root),
+            nested_title(&BookSource::TrackFolder(root.join("Author/Tracks")), &root),
             None
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -4687,12 +4930,12 @@ mod tests {
     }
 
     #[test]
-    fn a_lone_tier2_file_in_its_own_folder_is_a_book() {
+    fn a_lone_tier2_file_is_a_book_and_several_are_one_track_folder() {
         let root = scratch("discover-tier2");
         touch(&root.join("Author/A FLAC Book/book.flac"));
         touch(&root.join("Author/An Opus Book/book.opus"));
-        // Several Tier-2 files are NOT an MP3-folder equivalent: that path
-        // reads only `.mp3`. A half-ingest would be worse than a skip.
+        // Several Tier-2 files in one folder are that book's tracks, the same
+        // rule `.mp3` has always had.
         touch(&root.join("Author/Multi FLAC/01.flac"));
         touch(&root.join("Author/Multi FLAC/02.flac"));
 
@@ -4702,7 +4945,73 @@ mod tests {
             vec![
                 BookSource::File(root.join("Author/A FLAC Book/book.flac")),
                 BookSource::File(root.join("Author/An Opus Book/book.opus")),
+                BookSource::TrackFolder(root.join("Author/Multi FLAC")),
             ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn several_m4b_stay_separate_books_until_the_sidecar_says_otherwise() {
+        // A folder of several `.m4b` is an author folder by default: each file
+        // is a whole audiobook with its own feed. Changing that by itself
+        // would retire every one of those feed URLs, so it takes the sidecar.
+        let root = scratch("discover-one-book");
+        let folder = root.join("Author/A Long Book");
+        touch(&folder.join("Disc 1.m4b"));
+        touch(&folder.join("Disc 2.m4b"));
+
+        let found = discover(&root, &root.join("data"));
+        assert_eq!(
+            found,
+            vec![
+                BookSource::File(folder.join("Disc 1.m4b")),
+                BookSource::File(folder.join("Disc 2.m4b")),
+            ],
+            "no sidecar: two books"
+        );
+
+        std::fs::write(folder.join(".podspine.toml"), b"folder_is_one_book = true").unwrap();
+        let found = discover(&root, &root.join("data"));
+        assert_eq!(
+            found,
+            vec![BookSource::TrackFolder(folder.clone())],
+            "the sidecar makes the folder one book"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_mp3_folder_keeps_its_mp3_tracks_when_another_format_appears() {
+        // An established MP3-folder book must not gain an episode because a
+        // `.flac` landed beside its tracks: that would renumber every episode
+        // after it in a feed people already hold.
+        let root = scratch("tracks-mixed");
+        let folder = root.join("A Folder Book");
+        touch(&folder.join("01.mp3"));
+        touch(&folder.join("02.mp3"));
+        touch(&folder.join("bonus.flac"));
+
+        let real_root = root.canonicalize().unwrap();
+        let folder = folder.canonicalize().unwrap();
+        let names = |tracks: Vec<PathBuf>| -> Vec<String> {
+            let mut names: Vec<String> = tracks
+                .iter()
+                .map(|t| t.file_name().unwrap().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+
+        assert_eq!(
+            names(collect_tracks(&folder, &real_root, false)),
+            vec!["01.mp3", "02.mp3"],
+            "the mp3 tracks stay the book"
+        );
+        assert_eq!(
+            names(collect_tracks(&folder, &real_root, true)),
+            vec!["01.mp3", "02.mp3", "bonus.flac"],
+            "the sidecar takes every audio file"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -4740,7 +5049,7 @@ mod tests {
             vec![
                 BookSource::File(root.join("Top Book.m4b")),
                 BookSource::File(root.join("a-m4b-book/book.m4b")),
-                BookSource::Mp3Folder(root.join("mp3-multi")),
+                BookSource::TrackFolder(root.join("mp3-multi")),
                 BookSource::File(root.join("mp3-single/only.mp3")),
             ]
         );
