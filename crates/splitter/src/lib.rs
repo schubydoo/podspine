@@ -901,8 +901,18 @@ pub struct TrackEncode<'a> {
 /// [`split_book_encoded`] does for a chaptered book, and for the same reason:
 /// a folder's episodes are already being served under the lengths its feed
 /// published, so one failed track must not leave a sibling's new bytes in
-/// place of the old ones. A failure deletes every part and touches no
-/// published episode.
+/// place of the old ones. A failure to produce, or a directory sitting at a
+/// target, deletes every part and touches no published episode.
+///
+/// The publishing renames themselves are the one window that no rename
+/// sequence can close, and [`split_book_encoded`] has it too: POSIX has no
+/// transaction across files, so a rename that fails after an earlier one
+/// succeeded (a disk that filled, a volume that went read-only) leaves those
+/// earlier tracks replaced. The scan then reports the book as skipped, the
+/// serve layer refuses a file whose size is not the published length, and the
+/// next scan re-ingests the book because that same length check fails. The
+/// pre-rename target check above removes the only failure here that is not a
+/// disk fault.
 ///
 /// `enc` must be a re-encode mode, and every track shares it: the mode comes
 /// from the server setting, not from a single file.

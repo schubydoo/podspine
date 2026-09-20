@@ -1359,6 +1359,26 @@ fn ingest_track_folder(
     };
 
     let n = tracks.len();
+    // Measure every in-place track BEFORE anything is published. A track that
+    // vanishes mid-scan fails this read, and failing here aborts the ingest
+    // while the folder's published episodes are still the old ones. Reading
+    // it after the re-encodes would leave those new bytes over rows that
+    // still advertise the old lengths, and the serve layer would refuse them
+    // until another scan (Greptile P1).
+    let mut in_place_lengths: HashMap<usize, u64> = HashMap::new();
+    for (idx, t) in tracks.iter().enumerate() {
+        if t.encoding != Encoding::Copy {
+            continue;
+        }
+        let byte_length = std::fs::metadata(&t.path)
+            .map_err(|source| ScanError::Io {
+                path: t.path.clone(),
+                source,
+            })?
+            .len();
+        in_place_lengths.insert(idx, byte_length);
+    }
+
     // Re-encode every track that needs one, in a single all-or-nothing call.
     // A folder's episodes are already served under the lengths its feed
     // published, so a failed track must not leave a sibling's new bytes in
@@ -1410,12 +1430,9 @@ fn ingest_track_folder(
                 ep.byte_length,
             ),
             None => {
-                let byte_length = std::fs::metadata(&t.path)
-                    .map_err(|source| ScanError::Io {
-                        path: t.path.clone(),
-                        source,
-                    })?
-                    .len();
+                let byte_length = in_place_lengths
+                    .remove(&idx)
+                    .expect("every track is either re-encoded or measured above");
                 let path = t.path.to_string_lossy().into_owned();
                 (path.clone(), path, byte_length)
             }
