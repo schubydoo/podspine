@@ -19,8 +19,7 @@
 //!   it by chapters.
 //! - A multi-track **track folder** (Task 3.3): a folder of per-chapter files,
 //!   either several `.mp3` or several Ogg/Opus/FLAC. The scanner ingests one
-//!   episode per file, with **no split and no re-encode**. Track number sets
-//!   the order;
+//!   episode per file, with **no split**. Track number sets the order;
 //!   filename order is the fallback. A folder of several `.m4b`/`.m4a` is
 //!   several books instead, unless its `.podspine.toml` sets
 //!   `folder_is_one_book`.
@@ -53,8 +52,9 @@ use podspine_feed::{episode_guid, pubdate_epoch};
 use podspine_index::{BookRow, EpisodeRow, Index, IndexError};
 use podspine_prober::{ProbeError, needs_faststart, probe};
 use podspine_splitter::{
-    ChapterCut, Encoding, SplitEpisode, SplitError, cover_thumb_path, extract_cover,
-    extract_cover_thumb, ffmpeg_parallelism, remux_faststart, split_book_encoded, transcode_whole,
+    ChapterCut, Encoding, SplitEpisode, SplitError, TrackEncode, cover_thumb_path, extract_cover,
+    extract_cover_thumb, ffmpeg_parallelism, remux_faststart, split_book_encoded, transcode_tracks,
+    transcode_whole,
 };
 
 /// DRM extensions that the scanner refuses to ingest. The match ignores case.
@@ -245,9 +245,15 @@ enum IngestKind {
     /// A single audiobook file: probe, resolve chapters, then split, transcode,
     /// or serve in place.
     Single(Box<SingleIngest>),
-    /// A folder of per-chapter tracks served in place (Task 3.3, Sprint 6.2),
-    /// holding the track paths [`plan_track_folder`] collected.
-    TrackFolder(Vec<PathBuf>),
+    /// A folder of per-chapter tracks (Task 3.3, Sprint 6.2), holding the
+    /// track paths [`plan_track_folder`] collected.
+    TrackFolder {
+        /// The track paths, in the order [`plan_track_folder`] collected them.
+        files: Vec<PathBuf>,
+        /// The server's transcode setting. A track whose codec no podcatcher
+        /// plays is re-encoded into `<data_dir>` instead of served in place.
+        transcode: TranscodeMode,
+    },
 }
 
 /// The settings a single-file ingest needs, after a `.podspine.toml` refines
@@ -501,7 +507,9 @@ fn plan_book(
 fn run_ingest(task: &IngestTask, split_workers: usize) -> Result<PreparedBook, ScanError> {
     match &task.kind {
         IngestKind::Single(single) => ingest_single(task, single, split_workers),
-        IngestKind::TrackFolder(files) => ingest_track_folder(task, files),
+        IngestKind::TrackFolder { files, transcode } => {
+            ingest_track_folder(task, files, *transcode, split_workers)
+        }
     }
 }
 
@@ -585,7 +593,7 @@ fn commit_scanned_book(
     match prepared.and_then(|p| commit_book(index, p)) {
         Ok(book) => {
             summary.indexed += 1;
-            log_indexed(&book, matches!(task.kind, IngestKind::TrackFolder(_)));
+            log_indexed(&book, matches!(task.kind, IngestKind::TrackFolder { .. }));
         }
         Err(err) => {
             summary.skipped += 1;
@@ -1139,6 +1147,9 @@ struct FolderTrack {
     track: Option<u32>,
     /// Episode title (ID3 `title` tag, else the file stem).
     title: String,
+    /// How this track becomes an episode: [`Encoding::Copy`] streams the
+    /// source in place, anything else re-encodes it into `<data_dir>`.
+    encoding: Encoding,
 }
 
 /// Read a track folder's index state and decide what the scan owes it.
@@ -1158,6 +1169,7 @@ fn plan_track_folder(
     id: &str,
     data_dir: &Path,
     index: &Index,
+    opts: ScanOptions,
     overrides: &BookOverrides,
     library_root: &Path,
 ) -> Result<BookPlan, ScanError> {
@@ -1197,13 +1209,22 @@ fn plan_track_folder(
     // `source_path`). The book then flips to in-place serving, and the sweep
     // reclaims its copies. The metadata checks re-ingest on a `.podspine.toml`
     // edit that did not change the folder mtime (Greptile P1).
+    // Transcode toggle guard, as in `plan_book`: a `PODSPINE_TRANSCODE` flip
+    // changes a track's container and its recorded `byte_length`, and touches
+    // no source mtime.
+    let stored_transcode_ok = |existing: &BookRow| {
+        let stored = existing.transcode.unwrap_or(TranscodeMode::Off);
+        folder_transcode(&files, opts.transcode).is_none_or(|expected| stored == expected)
+    };
     if overrides.force_reingest != Some(true)
         && let Some(existing) = index.get_book(id)?
         && existing.source_mtime == source_mtime
         && existing.title == eff_title
         && existing.author == eff_author
         && existing.default_cover_url == eff_cover
+        && stored_transcode_ok(&existing)
     {
+        let stored_transcoded = existing.transcode.is_some_and(TranscodeMode::is_on);
         let eps = index.episodes_for_book(id)?;
         // Every track is served in place, so each one must still be the file
         // whose length the feed publishes. The folder's `source_mtime` is the
@@ -1211,10 +1232,20 @@ fn plan_track_folder(
         // original timestamp changes no mtime the scan can see. The length
         // does change, and the serve layer refuses such a track, so this check
         // is what gets it re-ingested.
+        //
+        // A re-encoded track is the exception: it lives under `<data_dir>`
+        // with no `source_path`, and nothing regenerates it, so its own file
+        // is what must still match. An episode with no `source_path` in a book
+        // that is NOT transcoded is a pre-6.2 verbatim copy, and that empty
+        // `source_path` is what forces its one-time re-ingest to in-place
+        // serving.
         if !eps.is_empty()
-            && eps.iter().all(|e| {
-                !e.source_path.is_empty() && file_has_length(&e.source_path, e.byte_length)
-            })
+            && eps
+                .iter()
+                .all(|e| stored_transcoded || !e.source_path.is_empty())
+            && eps
+                .iter()
+                .all(|e| file_has_length(&e.file_path, e.byte_length))
         {
             return Ok(BookPlan::UpToDate(Box::new(existing)));
         }
@@ -1228,13 +1259,46 @@ fn plan_track_folder(
         title: eff_title,
         author: eff_author,
         cover_url: eff_cover,
-        kind: IngestKind::TrackFolder(files),
+        kind: IngestKind::TrackFolder {
+            files,
+            transcode: opts.transcode,
+        },
     })))
 }
 
+/// What `book.transcode` a folder of `files` should carry, read from the track
+/// extensions alone (no probe). `Some(mode)` when the answer is certain: the
+/// re-encode mode of the first track that needs one, else `Off` when no track
+/// does. `None` when an extension does not say, and only the probe in the
+/// ingest can decide. The caller then leaves the stored value alone, exactly
+/// as `plan_book` does for a single file.
+fn folder_transcode(files: &[PathBuf], mode: TranscodeMode) -> Option<TranscodeMode> {
+    let mut every_track_known = true;
+    for file in files {
+        match expected_transcode(file, mode) {
+            Some(m) if m.is_on() => return Some(m),
+            Some(_) => {}
+            None => every_track_known = false,
+        }
+    }
+    every_track_known.then_some(TranscodeMode::Off)
+}
+
 /// Probe a track folder and build its rows: one episode per file, with **no
-/// split, no re-encode, and no copy**. Touches no index (see [`IngestTask`]).
-fn ingest_track_folder(task: &IngestTask, files: &[PathBuf]) -> Result<PreparedBook, ScanError> {
+/// split and no copy**. Touches no index (see [`IngestTask`]).
+///
+/// A track whose codec no podcatcher plays (FLAC, Vorbis, Opus, ALAC) is
+/// re-encoded into `<data_dir>/books/<id>/` when `transcode` is on, exactly as
+/// a chapterless single file is. Every other track streams in place from the
+/// read-only library, and a folder can hold both. The re-encodes go through
+/// one all-or-nothing [`transcode_tracks`] call, so a track that fails leaves
+/// every currently served episode where it was.
+fn ingest_track_folder(
+    task: &IngestTask,
+    files: &[PathBuf],
+    transcode: TranscodeMode,
+    split_workers: usize,
+) -> Result<PreparedBook, ScanError> {
     let dir = task.input.as_path();
     let id = task.id.as_str();
 
@@ -1252,6 +1316,7 @@ fn ingest_track_folder(task: &IngestTask, files: &[PathBuf]) -> Result<PreparedB
                 duration_sec: p.duration_sec,
                 track: p.track,
                 title: p.title.unwrap_or_else(|| file_stem(path)),
+                encoding: encoding_for(p.audio_codec.as_deref(), transcode),
                 path: path.clone(),
             }),
             Err(err) => {
@@ -1283,30 +1348,87 @@ fn ingest_track_folder(task: &IngestTask, files: &[PathBuf]) -> Result<PreparedB
         default_cover_url: task.cover_url.clone(),
         // A track folder has no chapters, so `force_embedded` never applies.
         force_embedded: false,
-        // A track folder is served in place, so nothing is re-encoded here
-        // (Task 5.2).
-        transcode: Some(TranscodeMode::Off),
+        // `Off` unless a track was re-encoded. The serve and evict layers read
+        // this: a transcoded book is never regenerated and never evicted,
+        // because a re-encode is not byte-reproducible (Task 5.2).
+        transcode: Some(if tracks.iter().any(|t| t.encoding != Encoding::Copy) {
+            transcode
+        } else {
+            TranscodeMode::Off
+        }),
     };
 
     let n = tracks.len();
+    // Re-encode every track that needs one, in a single all-or-nothing call.
+    // A folder's episodes are already served under the lengths its feed
+    // published, so a failed track must not leave a sibling's new bytes in
+    // place of the old ones (Greptile P1).
+    let encodes: Vec<TrackEncode<'_>> = tracks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.encoding != Encoding::Copy)
+        .map(|(idx, t)| TrackEncode {
+            idx,
+            input: t.path.as_path(),
+            duration_sec: t.duration_sec,
+        })
+        .collect();
+    let mut reencoded: HashMap<usize, SplitEpisode> = HashMap::new();
+    if let Some(first) = encodes.first() {
+        let enc = tracks[first.idx].encoding;
+        let split_start = std::time::Instant::now();
+        let produced = transcode_tracks(
+            &encodes,
+            &task.book_out,
+            episode_ext(None, enc),
+            enc,
+            split_workers,
+        )?;
+        for ep in produced {
+            reencoded.insert(ep.idx, ep);
+        }
+        log_stage(id, "split", split_start);
+    }
+
+    // The names this ingest published under `<data_dir>`, for the sweep.
+    let kept_files: HashSet<String> = reencoded
+        .values()
+        .filter_map(|ep| ep.path.file_name().and_then(|n| n.to_str()))
+        .map(str::to_string)
+        .collect();
+
     let mut episodes = Vec::with_capacity(n);
     for (idx, t) in tracks.iter().enumerate() {
-        let byte_length = std::fs::metadata(&t.path)
-            .map_err(|source| ScanError::Io {
-                path: t.path.clone(),
-                source,
-            })?
-            .len();
+        // A re-encoded track is served from `<data_dir>` and carries no
+        // `source_path`, which is how the serve layer knows not to look in
+        // the library, and how nothing tries to rebuild it: a re-encode is
+        // not byte-reproducible.
+        let (file_path, source_path, byte_length) = match reencoded.remove(&idx) {
+            Some(ep) => (
+                ep.path.to_string_lossy().into_owned(),
+                String::new(),
+                ep.byte_length,
+            ),
+            None => {
+                let byte_length = std::fs::metadata(&t.path)
+                    .map_err(|source| ScanError::Io {
+                        path: t.path.clone(),
+                        source,
+                    })?
+                    .len();
+                let path = t.path.to_string_lossy().into_owned();
+                (path.clone(), path, byte_length)
+            }
+        };
         episodes.push(EpisodeRow {
             guid: episode_guid(id, idx, task.source_mtime),
             book_id: id.to_string(),
             idx: idx as i64,
             title: t.title.clone(),
-            file_path: t.path.to_string_lossy().into_owned(),
-            // A folder track IS a whole source file. Stream it in place.
-            source_path: t.path.to_string_lossy().into_owned(),
-            // A track is a whole file with no `moov` relocation to make, so
-            // faststart never applies.
+            file_path,
+            source_path,
+            // A track is a whole file, and a re-encode writes its `moov`
+            // first, so faststart never applies either way.
             needs_faststart: false,
             byte_length: byte_length as i64,
             duration_sec: t.duration_sec,
@@ -1320,13 +1442,22 @@ fn ingest_track_folder(task: &IngestTask, files: &[PathBuf]) -> Result<PreparedB
     Ok(PreparedBook {
         book,
         episodes,
-        // Each track is a whole file that the server streams in place from the
-        // library, with no copy. Any verbatim copy a pre-6.2 ingest wrote under
-        // `<data_dir>` is dead weight, but ONLY once the new rows point into
-        // the library. A pre-6.2 book's live rows still name those copies, so
-        // deleting them before the commit would 404 that book until the commit
-        // landed (Greptile P1).
-        sweep: Sweep::InPlace(task.book_out.clone()),
+        // A track that streams in place leaves nothing under `<data_dir>`. Any
+        // verbatim copy a pre-6.2 ingest wrote there is dead weight, but ONLY
+        // once the new rows point into the library. A pre-6.2 book's live rows
+        // still name those copies, so deleting them before the commit would
+        // 404 that book until the commit landed (Greptile P1). A folder with
+        // re-encoded tracks keeps exactly the files this ingest published, and
+        // drops the rest, which retires the output of a previous transcode
+        // setting.
+        sweep: if kept_files.is_empty() {
+            Sweep::InPlace(task.book_out.clone())
+        } else {
+            Sweep::Files {
+                book_out: task.book_out.clone(),
+                keep: kept_files,
+            }
+        },
         book_start,
     })
 }
@@ -1890,7 +2021,7 @@ fn scan_library_with_progress(
         let plan = match &source {
             BookSource::File(path) => plan_book(path, &slug, data_dir, index, opts, &overrides),
             BookSource::TrackFolder(dir) => {
-                plan_track_folder(dir, &slug, data_dir, index, &overrides, &library_root)
+                plan_track_folder(dir, &slug, data_dir, index, opts, &overrides, &library_root)
             }
         };
         match plan {
@@ -2906,6 +3037,7 @@ mod tests {
             "book-id",
             &data,
             &index,
+            ScanOptions::default(),
             &BookOverrides::default(),
             &dir,
         )
@@ -3487,6 +3619,144 @@ mod tests {
             std::fs::metadata(&e.file_path).unwrap().len() as i64
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A folder of FLAC tracks is one book, and with transcoding on, every
+    /// track is re-encoded into the data dir. Streaming FLAC in place would
+    /// publish a feed that most podcast apps refuse to play.
+    #[test]
+    fn a_flac_track_folder_transcodes_every_track_into_the_data_dir() {
+        skip_unless_ffmpeg!();
+        let root = scratch("flac-folder-transcode");
+        let folder = root.join("A FLAC Book");
+        if synth_encoded(&folder, "01.flac", &["-c:a", "flac"], 4).is_none()
+            || synth_encoded(&folder, "02.flac", &["-c:a", "flac"], 4).is_none()
+        {
+            skip!("no flac encoder");
+        }
+        let data = root.join("data");
+        let index = Index::open_in_memory().unwrap();
+        let opts = ScanOptions {
+            transcode: TranscodeMode::Aac,
+            ..Default::default()
+        };
+
+        let summary = scan_library(&root, &data, &index, opts);
+        assert_eq!(summary.indexed, 1, "the folder is one book");
+        let books = index.list_books().unwrap();
+        assert_eq!(books[0].transcode, Some(TranscodeMode::Aac));
+        let eps = index.episodes_for_book(&books[0].id).unwrap();
+        assert_eq!(eps.len(), 2, "one episode per track");
+        for e in &eps {
+            assert!(
+                e.source_path.is_empty(),
+                "a re-encoded track is not served in place"
+            );
+            assert!(e.file_path.ends_with(".m4a"), "{}", e.file_path);
+            assert!(e.file_path.starts_with(data.to_str().unwrap()));
+            assert_eq!(
+                e.byte_length,
+                std::fs::metadata(&e.file_path).unwrap().len() as i64,
+                "the enclosure length is the real output size"
+            );
+        }
+
+        // A second scan must not re-encode: the work is done and the lengths
+        // the feed publishes must not move. Mark the output, rescan, and read
+        // the mark back. The mark keeps the file's length, so the scan's own
+        // length check cannot be what saves it.
+        let marked = eps[0].file_path.clone();
+        let mut bytes = std::fs::read(&marked).unwrap();
+        bytes[0] ^= 0xff;
+        std::fs::write(&marked, &bytes).unwrap();
+        let summary = scan_library(&root, &data, &index, opts);
+        assert_eq!(summary.indexed, 1);
+        assert_eq!(
+            std::fs::read(&marked).unwrap()[0],
+            bytes[0],
+            "the second scan re-encoded a track it already had"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// MP3 is podcast-safe, so a transcode setting must leave an MP3 folder
+    /// alone: its tracks still stream in place from the library.
+    #[test]
+    fn an_mp3_track_folder_is_never_re_encoded() {
+        skip_unless_ffmpeg!();
+        let root = scratch("mp3-folder-transcode");
+        let folder = root.join("A Folder Book");
+        if synth_mp3(&folder, "01.mp3", Some(1), 3).is_none()
+            || synth_mp3(&folder, "02.mp3", Some(2), 3).is_none()
+        {
+            skip!("no libmp3lame encoder");
+        }
+        let data = root.join("data");
+        let index = Index::open_in_memory().unwrap();
+
+        scan_library(
+            &root,
+            &data,
+            &index,
+            ScanOptions {
+                transcode: TranscodeMode::Aac,
+                ..Default::default()
+            },
+        );
+        let books = index.list_books().unwrap();
+        assert_eq!(books.len(), 1);
+        assert_eq!(books[0].transcode, Some(TranscodeMode::Off));
+        let eps = index.episodes_for_book(&books[0].id).unwrap();
+        assert_eq!(eps.len(), 2);
+        for e in &eps {
+            assert_eq!(e.file_path, e.source_path, "still streamed in place");
+            assert!(e.file_path.ends_with(".mp3"), "{}", e.file_path);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A folder can hold both kinds at once: the MP3 track streams in place
+    /// and the FLAC one is re-encoded, in one book.
+    #[test]
+    fn a_mixed_track_folder_transcodes_only_what_needs_it() {
+        skip_unless_ffmpeg!();
+        let root = scratch("mixed-folder-transcode");
+        let folder = root.join("A Mixed Book");
+        if synth_mp3(&folder, "01.mp3", Some(1), 3).is_none()
+            || synth_encoded(&folder, "02.flac", &["-c:a", "flac"], 3).is_none()
+        {
+            skip!("no libmp3lame or flac encoder");
+        }
+        // Both formats in one folder, and the sidecar says they are one book.
+        std::fs::write(folder.join(".podspine.toml"), b"folder_is_one_book = true").unwrap();
+        let data = root.join("data");
+        let index = Index::open_in_memory().unwrap();
+
+        scan_library(
+            &root,
+            &data,
+            &index,
+            ScanOptions {
+                transcode: TranscodeMode::Aac,
+                ..Default::default()
+            },
+        );
+        let books = index.list_books().unwrap();
+        assert_eq!(books.len(), 1, "one book");
+        assert_eq!(books[0].transcode, Some(TranscodeMode::Aac));
+        let eps = index.episodes_for_book(&books[0].id).unwrap();
+        assert_eq!(eps.len(), 2, "one episode per track");
+
+        let mp3 = eps.iter().find(|e| e.file_path.ends_with(".mp3")).unwrap();
+        assert_eq!(mp3.file_path, mp3.source_path, "the mp3 stays in place");
+        let aac = eps.iter().find(|e| e.file_path.ends_with(".m4a")).unwrap();
+        assert!(aac.source_path.is_empty(), "the flac was re-encoded");
+        assert_eq!(
+            aac.byte_length,
+            std::fs::metadata(&aac.file_path).unwrap().len() as i64
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The MP3 fallback target, for clients that still do not play AAC. The

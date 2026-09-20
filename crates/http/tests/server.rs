@@ -2014,6 +2014,79 @@ async fn transcoded_flac_book_serves_as_aac_and_is_never_evicted() {
     assert!(xml.contains(&format!("length=\"{recorded_len}\"")), "{xml}");
 }
 
+/// A folder of FLAC tracks is one book, and with transcoding on every track
+/// serves as AAC from the data dir. This is the serve side of the folder
+/// transcode: those rows carry no `source_path`, so the audio handler must
+/// resolve them under the data dir and never try to rebuild them.
+#[tokio::test]
+async fn transcoded_track_folder_serves_every_track_as_aac() {
+    skip_unless_ffmpeg!();
+    let dir = scratch("http-track-folder-transcode");
+    let library = dir.join("library");
+    let folder = library.join("A FLAC Book");
+    std::fs::create_dir_all(&folder).unwrap();
+    let data = dir.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    for name in ["01.flac", "02.flac"] {
+        let ok = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=4",
+                "-c:a",
+                "flac",
+            ])
+            .arg(folder.join(name))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            skip!("no flac encoder");
+        }
+    }
+
+    let index = Index::open_in_memory().unwrap();
+    scan_library(
+        &library,
+        &data,
+        &index,
+        ScanOptions {
+            transcode: TranscodeMode::Aac,
+            ..Default::default()
+        },
+    );
+    let books = index.list_books().unwrap();
+    assert_eq!(books.len(), 1, "the folder is one book");
+    let feed_id = books[0].feed_id.clone();
+    let eps = index.episodes_for_book(&books[0].id).unwrap();
+    assert_eq!(eps.len(), 2, "one episode per track");
+
+    let app = router(test_state(index, &data, &library));
+    for (n, ep) in eps.iter().enumerate() {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/audio/{feed_id}/{}", n + 1))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("content-type").unwrap(), "audio/mp4");
+        let bytes = body_bytes(resp).await;
+        assert_eq!(
+            bytes.len() as i64,
+            ep.byte_length,
+            "the served body is the length the feed publishes"
+        );
+    }
+}
+
 // ---- first-run scan readiness (issue 159): no ffmpeg needed ----
 
 /// A bare state over an empty in-memory index, used to drive the readiness gate

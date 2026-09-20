@@ -881,6 +881,135 @@ pub fn transcode_whole(
     })
 }
 
+/// One whole file to re-encode into its own episode, for
+/// [`transcode_tracks`].
+#[derive(Debug, Clone)]
+pub struct TrackEncode<'a> {
+    /// Episode position, which names the output file (`NNN.<out_ext>`).
+    pub idx: usize,
+    /// The source file, re-encoded whole (no `-ss`/`-t`).
+    pub input: &'a Path,
+    /// The source's probed duration, carried to the enclosure unchanged.
+    pub duration_sec: f64,
+}
+
+/// Re-encode a set of whole files into `out_dir`, **all or none**.
+///
+/// This is [`transcode_whole`] for a folder book, whose episodes are whole
+/// files rather than chapters of one container. It publishes nothing until
+/// every track has been produced and validated, exactly as
+/// [`split_book_encoded`] does for a chaptered book, and for the same reason:
+/// a folder's episodes are already being served under the lengths its feed
+/// published, so one failed track must not leave a sibling's new bytes in
+/// place of the old ones. A failure deletes every part and touches no
+/// published episode.
+///
+/// `enc` must be a re-encode mode, and every track shares it: the mode comes
+/// from the server setting, not from a single file.
+pub fn transcode_tracks(
+    tracks: &[TrackEncode<'_>],
+    out_dir: &Path,
+    out_ext: &str,
+    enc: Encoding,
+    max_workers: usize,
+) -> Result<Vec<SplitEpisode>, SplitError> {
+    fs::create_dir_all(out_dir).map_err(|source| SplitError::CreateDir {
+        path: out_dir.to_path_buf(),
+        source,
+    })?;
+    let n = tracks.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Phase 1: produce every track's `.part`, in parallel under the same
+    // process-wide ffmpeg gate the chapter split uses. Nothing is published
+    // yet, so the currently served episodes stay untouched whatever happens.
+    let out_path_for = |t: &TrackEncode<'_>| out_dir.join(episode_file_name(t.idx, out_ext));
+    let slots: Vec<Mutex<Option<Result<ProducedPart, SplitError>>>> =
+        (0..n).map(|_| Mutex::new(None)).collect();
+    let cursor = AtomicUsize::new(0);
+    let workers = max_workers.max(1).min(n);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let i = cursor.fetch_add(1, Ordering::Relaxed);
+                    if i >= n {
+                        break;
+                    }
+                    let track = &tracks[i];
+                    let result = produce_part(&out_path_for(track), track.idx, enc, |part| {
+                        build_encode_args(track.input, part, None, enc)
+                    });
+                    *slots[i].lock().expect("track slot mutex poisoned") = Some(result);
+                }
+            });
+        }
+    });
+    let produced: Vec<Result<ProducedPart, SplitError>> = slots
+        .into_iter()
+        .map(|m| {
+            m.into_inner()
+                .expect("track slot mutex poisoned")
+                .expect("every track slot was filled by a worker")
+        })
+        .collect();
+
+    // One failure publishes none of them, and the lowest-index error is the
+    // one reported.
+    if produced.iter().any(Result::is_err) {
+        for p in produced.iter().flatten() {
+            let _ = fs::remove_file(&p.part);
+        }
+        return Err(produced
+            .into_iter()
+            .filter_map(Result::err)
+            .next()
+            .expect("a failed result exists in this branch"));
+    }
+
+    // Phase 2: check every target before any rename, then publish in order.
+    // A directory at a target is the one rename failure that is not a disk
+    // fault, and finding it late would leave earlier tracks published over
+    // the lengths the feed still advertises.
+    let parts: Vec<ProducedPart> = produced
+        .into_iter()
+        .map(|r| r.expect("all parts are Ok in this branch"))
+        .collect();
+    let part_paths: Vec<PathBuf> = parts.iter().map(|p| p.part.clone()).collect();
+    for track in tracks {
+        let out_path = out_path_for(track);
+        if out_path.is_dir() {
+            for leftover in &part_paths {
+                let _ = fs::remove_file(leftover);
+            }
+            return Err(SplitError::Publish {
+                idx: track.idx,
+                path: out_path,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "a directory is at the episode path",
+                ),
+            });
+        }
+    }
+
+    let mut episodes = Vec::with_capacity(n);
+    for (i, (track, part)) in tracks.iter().zip(parts).enumerate() {
+        match publish_part(part, out_path_for(track), track.idx, track.duration_sec) {
+            Ok(ep) => episodes.push(ep),
+            Err(err) => {
+                for leftover in &part_paths[i..] {
+                    let _ = fs::remove_file(leftover);
+                }
+                return Err(err);
+            }
+        }
+    }
+    Ok(episodes)
+}
+
 /// argv for a whole-file faststart remux: keep audio only, drop chapters,
 /// copy codecs (no re-encode), relocate `moov`. No `-ss`/`-t`: the remux
 /// covers the whole file. An argument vector, never a shell string (paths are
@@ -1458,6 +1587,100 @@ mod tests {
             leftovers.is_empty(),
             "produced parts must be cleaned up: {leftovers:?}"
         );
+    }
+
+    #[test]
+    fn a_failing_track_publishes_none_of_a_folder_transcode() {
+        skip_unless_ffmpeg!();
+        // The same all-or-nothing rule for a folder book. Its episodes are
+        // already served under the lengths its feed published, so a track that
+        // fails must not leave a sibling's new bytes over the old ones.
+        let dir = scratch("atomic-tracks");
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let good = synth_sine(&dir, "01.m4a", 3.0);
+        let missing = dir.join("02.m4a"); // never created: ffmpeg fails on it
+
+        // Stand-ins for previously-published episodes.
+        let published: Vec<PathBuf> = (1..=2).map(|n| out.join(format!("{n:03}.m4a"))).collect();
+        for (n, p) in published.iter().enumerate() {
+            std::fs::write(p, format!("old track {n}")).unwrap();
+        }
+        let before: Vec<Vec<u8>> = published
+            .iter()
+            .map(|p| std::fs::read(p).unwrap())
+            .collect();
+
+        let tracks = [
+            TrackEncode {
+                idx: 0,
+                input: good.as_path(),
+                duration_sec: 3.0,
+            },
+            TrackEncode {
+                idx: 1,
+                input: missing.as_path(),
+                duration_sec: 3.0,
+            },
+        ];
+        let err = transcode_tracks(&tracks, &out, "m4a", Encoding::Aac, 2)
+            .expect_err("a missing input must fail the whole folder");
+        assert!(!matches!(err, SplitError::CreateDir { .. }), "{err:?}");
+
+        for (p, was) in published.iter().zip(&before) {
+            assert_eq!(
+                &std::fs::read(p).unwrap(),
+                was,
+                "{p:?} must not be overwritten"
+            );
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(&out)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".part"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "produced parts must be cleaned up: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn a_folder_transcode_publishes_every_track_it_produced() {
+        skip_unless_ffmpeg!();
+        let dir = scratch("tracks-ok");
+        let out = dir.join("out");
+        let a = synth_sine(&dir, "a.m4a", 2.0);
+        let b = synth_sine(&dir, "b.m4a", 2.0);
+
+        // Sparse indices: a folder can re-encode only some of its tracks, and
+        // each episode keeps the position it has in the feed.
+        let tracks = [
+            TrackEncode {
+                idx: 0,
+                input: a.as_path(),
+                duration_sec: 2.0,
+            },
+            TrackEncode {
+                idx: 2,
+                input: b.as_path(),
+                duration_sec: 2.0,
+            },
+        ];
+        let episodes = transcode_tracks(&tracks, &out, "m4a", Encoding::Aac, 2).unwrap();
+
+        assert_eq!(episodes.len(), 2);
+        assert_eq!(episodes[0].idx, 0);
+        assert_eq!(episodes[1].idx, 2);
+        for ep in &episodes {
+            assert!(ep.path.exists(), "{:?} is published", ep.path);
+            assert_eq!(
+                ep.byte_length,
+                std::fs::metadata(&ep.path).unwrap().len(),
+                "the enclosure length is the real output size"
+            );
+        }
+        assert_eq!(episodes[1].path, out.join("003.m4a"));
     }
 
     #[test]
