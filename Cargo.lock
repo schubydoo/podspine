@@ -1311,6 +1311,7 @@ dependencies = [
  "podspine-test-support",
  "rusqlite",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]

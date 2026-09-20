@@ -1865,15 +1865,18 @@ fn resolve_book_overrides(source: &Path, library_root: &Path) -> BookOverrides {
 /// the **earliest-created** row (the one whose feed subscribers have held
 /// longest). Delete the rest, together with their extracted output.
 ///
-/// This is the floor that the rest of the identity logic stands on: **one
-/// source, one book row, one feed.** Nothing the current scanner writes
-/// creates a second row for one source; the source→id reuse map in
-/// [`scan_library`] sees to that. But a database written by an earlier build,
-/// or edited by hand, can hold such rows, and neither reuse nor orphan pruning
-/// would ever reconcile it: the map keeps one id arbitrarily, and both rows
-/// survive pruning because their shared source still exists. The book would
-/// stay listed under two capability URLs forever. Running this first makes the
-/// reuse map unambiguous and heals such a database in one reconcile.
+/// **One source, one book row, one feed.** The database enforces that for the
+/// obvious case: `book.source_path` carries a unique index, so a second row
+/// with the same path string is refused, and the migration that added the
+/// index collapsed whatever an older database held.
+///
+/// What is left for this pass is the case a string comparison cannot see: two
+/// rows whose paths DIFFER and resolve to the same file, which a build that
+/// stored the path as given, or a hand edit, can leave behind. Neither reuse
+/// nor orphan pruning would ever reconcile those: the reuse map keeps one id
+/// arbitrarily, and both rows survive pruning because their shared file still
+/// exists. The book would stay listed under two capability URLs forever.
+/// Running this first makes the reuse map unambiguous.
 ///
 /// A row whose source is *gone* is left for [`prune_orphans`]. The collapse
 /// groups only canonicalizable paths, so an unmounted library (every source
@@ -5078,27 +5081,45 @@ mod tests {
     /// a manual edit) must heal to a single row. Otherwise the book stays
     /// under two capability feeds across every future reconcile, because both
     /// rows survive pruning.
+    // Unix only: the duplicate shape this pass heals is two path STRINGS that
+    // resolve to one file, and a Windows canonical path is verbatim
+    // (`\\?\C:\…`), where Rust normalizes `.` away as it is pushed. Both
+    // spellings would collapse into one string, which the database's
+    // `UNIQUE(source_path)` floor then refuses outright — the floor doing its
+    // job, and nothing left for this test to exercise.
+    #[cfg(unix)]
     #[test]
     fn duplicate_source_rows_collapse_to_one() {
         let root = scratch("collapse-dups");
         let data = root.join("data");
         let source = root.join("book.m4b");
         touch(&source);
-        let source_str = source
-            .canonicalize()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
+        let canonical = source.canonicalize().unwrap();
+        // TWO SPELLINGS of one file. The database's `UNIQUE(source_path)`
+        // floor refuses a second row with the same string, so the rows a
+        // collapse still has to heal are the ones whose paths differ and
+        // resolve to the same file: a legacy row written before the scanner
+        // canonicalized, or one edited by hand.
+        let spellings = [
+            canonical.to_string_lossy().into_owned(),
+            canonical
+                .parent()
+                .unwrap()
+                .join(".")
+                .join("book.m4b")
+                .to_string_lossy()
+                .into_owned(),
+        ];
 
         let index = Index::open_in_memory().unwrap();
-        let row = |id: &str, feed: &str| BookRow {
+        let row = |id: &str, feed: &str, source_path: &str| BookRow {
             id: id.into(),
             slug: id.into(),
             feed_id: feed.into(),
             title: "Book".into(),
             author: None,
             cover_path: None,
-            source_path: source_str.clone(),
+            source_path: source_path.to_string(),
             source_mtime: 1,
             storage_mode: None,
             default_cover_url: None,
@@ -5110,9 +5131,13 @@ mod tests {
         // `book`. Age must choose the survivor, not the id: an id sort would
         // delete the very feed subscribers use (Greptile). A few ms between
         // inserts makes `created_at` distinct on any real clock.
-        index.upsert_book(&row("book-2", "cap-book-2")).unwrap();
+        index
+            .upsert_book(&row("book-2", "cap-book-2", &spellings[0]))
+            .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(5));
-        index.upsert_book(&row("book", "cap-book")).unwrap();
+        index
+            .upsert_book(&row("book", "cap-book", &spellings[1]))
+            .unwrap();
         touch(&data.join("books/book-2/001.m4a"));
         touch(&data.join("books/book/001.m4a"));
 
@@ -5143,13 +5168,26 @@ mod tests {
     /// Two rows that share a source whose file is GONE are `prune_orphans`'
     /// job, not this one. And an unmounted library (every source missing)
     /// must collapse nothing, so that a mount blip cannot wipe the index.
+    // Unix only: the duplicate shape this pass heals is two path STRINGS that
+    // resolve to one file, and a Windows canonical path is verbatim
+    // (`\\?\C:\…`), where Rust normalizes `.` away as it is pushed. Both
+    // spellings would collapse into one string, which the database's
+    // `UNIQUE(source_path)` floor then refuses outright — the floor doing its
+    // job, and nothing left for this test to exercise.
+    #[cfg(unix)]
     #[test]
     fn collapse_leaves_gone_sources_for_pruning() {
         let root = scratch("collapse-gone");
         let data = root.join("data");
         let index = Index::open_in_memory().unwrap();
+        // Two spellings again, so the database's floor lets both rows in.
         let missing = root.join("not-here.m4b").to_string_lossy().into_owned();
-        for id in ["book", "book-2"] {
+        let missing_dotted = root
+            .join(".")
+            .join("not-here.m4b")
+            .to_string_lossy()
+            .into_owned();
+        for (id, source_path) in [("book", &missing), ("book-2", &missing_dotted)] {
             index
                 .upsert_book(&BookRow {
                     id: id.into(),
@@ -5158,7 +5196,7 @@ mod tests {
                     title: "Book".into(),
                     author: None,
                     cover_path: None,
-                    source_path: missing.clone(),
+                    source_path: source_path.clone(),
                     source_mtime: 1,
                     storage_mode: None,
                     default_cover_url: None,
@@ -6263,16 +6301,36 @@ mod tests {
     /// still work. The fault injection holds a write lock on a second
     /// connection (WAL keeps reads serving; the delete gets `SQLITE_BUSY`
     /// immediately).
+    // Unix only: the duplicate shape this pass heals is two path STRINGS that
+    // resolve to one file, and a Windows canonical path is verbatim
+    // (`\\?\C:\…`), where Rust normalizes `.` away as it is pushed. Both
+    // spellings would collapse into one string, which the database's
+    // `UNIQUE(source_path)` floor then refuses outright — the floor doing its
+    // job, and nothing left for this test to exercise.
+    #[cfg(unix)]
     #[test]
     fn collapse_survives_a_failing_delete() {
         let root = scratch("collapse-delete-fail");
         let src = root.join("book.m4b");
         std::fs::write(&src, b"").unwrap();
-        let canonical = src.canonicalize().unwrap().to_string_lossy().into_owned();
+        let canonical = src.canonicalize().unwrap();
+        // Two spellings of one file: the database's `UNIQUE(source_path)`
+        // floor refuses two identical strings, so this is the shape a collapse
+        // still has to heal.
+        let spellings = [
+            canonical.to_string_lossy().into_owned(),
+            canonical
+                .parent()
+                .unwrap()
+                .join(".")
+                .join("book.m4b")
+                .to_string_lossy()
+                .into_owned(),
+        ];
 
         let db = root.join("test.db");
         let index = Index::open(&db).unwrap();
-        for id in ["dup", "dup-2"] {
+        for (id, source_path) in [("dup", &spellings[0]), ("dup-2", &spellings[1])] {
             index
                 .upsert_book(&BookRow {
                     id: id.into(),
@@ -6281,7 +6339,7 @@ mod tests {
                     title: "Dup".into(),
                     author: None,
                     cover_path: None,
-                    source_path: canonical.clone(),
+                    source_path: source_path.clone(),
                     source_mtime: 0,
                     storage_mode: None,
                     default_cover_url: None,
