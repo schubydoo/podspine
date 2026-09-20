@@ -196,9 +196,10 @@ library/
   a feed whose audio 404s. A link that stays inside the library is fine, and the
   same book reached two ways is indexed once.
 - **Several `.ogg`/`.opus`/`.flac` files in one folder are one book's tracks**, the
-  same rule `.mp3` folders have always had. Folder tracks are served as they are,
-  so a podcast app that does not play Opus or FLAC will not play such a book yet —
-  `PODSPINE_TRANSCODE` covers single files, not folder tracks.
+  same rule `.mp3` folders have always had. With `PODSPINE_TRANSCODE` on, each such
+  track is re-encoded once at ingest, because most podcast apps do not play those
+  formats; with it off they are served as they are. A folder can hold both kinds: an
+  MP3 track streams in place beside a re-encoded FLAC one.
 - **A folder of several `.m4b`/`.m4a` files stays several books.** That is what an
   author folder usually is, and each file keeps its own feed URL. If the folder is
   really one book split by disc, put `folder_is_one_book = true` in a

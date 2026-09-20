@@ -71,9 +71,11 @@ flowchart TD
   for `full` vs `saver`.
 - **Track folders** (a folder of per-chapter files: several `.mp3`, or several
   `.ogg`/`.opus`/`.flac`) are treated as one episode per file, ordered by track
-  number (falling back to filename order) and **served in place** from the library
-  — no copy, no re-split, no re-encode. A folder of several `.m4b`/`.m4a` files is
-  several books instead, unless its `.podspine.toml` sets `folder_is_one_book`.
+  number (falling back to filename order) and **served in place** from the library:
+  no copy and no re-split. The one exception is a track whose codec no podcast app
+  plays, which `PODSPINE_TRANSCODE` re-encodes once at ingest, all tracks or none.
+  A folder of several `.m4b`/`.m4a` files is several books instead, unless its
+  `.podspine.toml` sets `folder_is_one_book`.
 - A book with no chapters and no sidecar degrades to a single-episode feed with a
   warning; that whole file is also **served in place** (Sprint 6.2).
 
