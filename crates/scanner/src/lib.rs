@@ -1284,6 +1284,53 @@ fn folder_transcode(files: &[PathBuf], mode: TranscodeMode) -> Option<TranscodeM
     every_track_known.then_some(TranscodeMode::Off)
 }
 
+/// The byte length of every track that will be served in place, keyed by
+/// episode index. A read that fails aborts the ingest, which is the point:
+/// this runs before anything is published, so a track that already vanished
+/// stops the scan while the folder's old episodes are still in place.
+fn measure_in_place_tracks(tracks: &[FolderTrack]) -> Result<HashMap<usize, u64>, ScanError> {
+    let mut lengths = HashMap::new();
+    for (idx, t) in tracks.iter().enumerate() {
+        if t.encoding != Encoding::Copy {
+            continue;
+        }
+        let byte_length = std::fs::metadata(&t.path)
+            .map_err(|source| ScanError::Io {
+                path: t.path.clone(),
+                source,
+            })?
+            .len();
+        lengths.insert(idx, byte_length);
+    }
+    Ok(lengths)
+}
+
+/// Read those lengths again after the re-encodes, and keep the newer value.
+///
+/// A re-encode takes seconds, and a sibling track can be replaced while ffmpeg
+/// runs, so a length measured before it can be stale by the time the row is
+/// written. The row must match the bytes the server will serve (Greptile P1).
+///
+/// A read that fails here keeps the earlier value rather than aborting: the
+/// re-encodes are published by now, so the book must commit to cover them, and
+/// the serve layer plus the next scan handle the one track that went missing.
+fn remeasure_in_place_tracks(tracks: &[FolderTrack], lengths: &mut HashMap<usize, u64>) {
+    for (idx, t) in tracks.iter().enumerate() {
+        if t.encoding != Encoding::Copy {
+            continue;
+        }
+        match std::fs::metadata(&t.path) {
+            Ok(meta) => {
+                lengths.insert(idx, meta.len());
+            }
+            Err(err) => tracing::warn!(
+                error = %err, path = %t.path.display(),
+                "could not re-read a track after the re-encodes; keeping the length measured before them"
+            ),
+        }
+    }
+}
+
 /// Probe a track folder and build its rows: one episode per file, with **no
 /// split and no copy**. Touches no index (see [`IngestTask`]).
 ///
@@ -1359,25 +1406,15 @@ fn ingest_track_folder(
     };
 
     let n = tracks.len();
-    // Measure every in-place track BEFORE anything is published. A track that
-    // vanishes mid-scan fails this read, and failing here aborts the ingest
-    // while the folder's published episodes are still the old ones. Reading
-    // it after the re-encodes would leave those new bytes over rows that
-    // still advertise the old lengths, and the serve layer would refuse them
-    // until another scan (Greptile P1).
-    let mut in_place_lengths: HashMap<usize, u64> = HashMap::new();
-    for (idx, t) in tracks.iter().enumerate() {
-        if t.encoding != Encoding::Copy {
-            continue;
-        }
-        let byte_length = std::fs::metadata(&t.path)
-            .map_err(|source| ScanError::Io {
-                path: t.path.clone(),
-                source,
-            })?
-            .len();
-        in_place_lengths.insert(idx, byte_length);
-    }
+    // Measure every in-place track BEFORE anything is published, and again
+    // after the re-encodes below.
+    //
+    // The first read is the guard: a track that has already vanished fails it,
+    // and failing here aborts the ingest while the folder's published episodes
+    // are still the old ones. Reading only after the re-encodes would leave
+    // those new bytes over rows that still advertise the old lengths, and the
+    // serve layer would refuse them until another scan (Greptile P1).
+    let mut in_place_lengths = measure_in_place_tracks(&tracks)?;
 
     // Re-encode every track that needs one, in a single all-or-nothing call.
     // A folder's episodes are already served under the lengths its feed
@@ -1408,6 +1445,10 @@ fn ingest_track_folder(
             reencoded.insert(ep.idx, ep);
         }
         log_stage(id, "split", split_start);
+
+        // The second read, now that ffmpeg is done (see the note above the
+        // first one).
+        remeasure_in_place_tracks(&tracks, &mut in_place_lengths);
     }
 
     // The names this ingest published under `<data_dir>`, for the sweep.
