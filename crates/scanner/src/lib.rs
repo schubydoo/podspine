@@ -5081,6 +5081,13 @@ mod tests {
     /// a manual edit) must heal to a single row. Otherwise the book stays
     /// under two capability feeds across every future reconcile, because both
     /// rows survive pruning.
+    // Unix only: the duplicate shape this pass heals is two path STRINGS that
+    // resolve to one file, and a Windows canonical path is verbatim
+    // (`\\?\C:\…`), where Rust normalizes `.` away as it is pushed. Both
+    // spellings would collapse into one string, which the database's
+    // `UNIQUE(source_path)` floor then refuses outright — the floor doing its
+    // job, and nothing left for this test to exercise.
+    #[cfg(unix)]
     #[test]
     fn duplicate_source_rows_collapse_to_one() {
         let root = scratch("collapse-dups");
@@ -5161,6 +5168,13 @@ mod tests {
     /// Two rows that share a source whose file is GONE are `prune_orphans`'
     /// job, not this one. And an unmounted library (every source missing)
     /// must collapse nothing, so that a mount blip cannot wipe the index.
+    // Unix only: the duplicate shape this pass heals is two path STRINGS that
+    // resolve to one file, and a Windows canonical path is verbatim
+    // (`\\?\C:\…`), where Rust normalizes `.` away as it is pushed. Both
+    // spellings would collapse into one string, which the database's
+    // `UNIQUE(source_path)` floor then refuses outright — the floor doing its
+    // job, and nothing left for this test to exercise.
+    #[cfg(unix)]
     #[test]
     fn collapse_leaves_gone_sources_for_pruning() {
         let root = scratch("collapse-gone");
@@ -6287,6 +6301,13 @@ mod tests {
     /// still work. The fault injection holds a write lock on a second
     /// connection (WAL keeps reads serving; the delete gets `SQLITE_BUSY`
     /// immediately).
+    // Unix only: the duplicate shape this pass heals is two path STRINGS that
+    // resolve to one file, and a Windows canonical path is verbatim
+    // (`\\?\C:\…`), where Rust normalizes `.` away as it is pushed. Both
+    // spellings would collapse into one string, which the database's
+    // `UNIQUE(source_path)` floor then refuses outright — the floor doing its
+    // job, and nothing left for this test to exercise.
+    #[cfg(unix)]
     #[test]
     fn collapse_survives_a_failing_delete() {
         let root = scratch("collapse-delete-fail");
