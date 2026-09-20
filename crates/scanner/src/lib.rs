@@ -1650,6 +1650,11 @@ fn scan_library_with_progress(
     // Phase 1, serial: assign each id and read the index. Slug assignment is
     // order-dependent (it mutates `seen` and asks the index who owns an id), so
     // it stays in discovery order on this thread, and so does every index read.
+    //
+    // Progress rule for both phases: every path that finishes with a book calls
+    // `progress.book_done()` exactly once. Here that is the disabled book, the
+    // up-to-date book, and the failed plan. A book that reaches `tasks` is
+    // counted in phase 2 instead, when its commit returns.
     let mut tasks: Vec<IngestTask> = Vec::new();
     for source in sources {
         let source_path = source.path();
@@ -1696,6 +1701,7 @@ fn scan_library_with_progress(
             }
             tracing::info!(slug = %slug, "book disabled by .podspine.toml — skipped");
             summary.skipped += 1;
+            progress.book_done();
             continue;
         }
         let folder = matches!(source, BookSource::Mp3Folder(_));
@@ -6023,8 +6029,43 @@ mod tests {
             "an up-to-date book counts"
         );
 
+        // A book disabled by its sidecar never reaches an ingest. It is still
+        // a book this scan finished with, so the page must not wait on it
+        // (Greptile P2).
+        std::fs::write(root.join("alpha.podspine.toml"), b"disabled = true").unwrap();
+        let summary =
+            scan_library_with_progress(&root, &data, &index, ScanOptions::default(), &progress);
+        assert_eq!(summary.skipped, 1, "the disabled book is skipped");
+        assert_eq!(
+            progress.snapshot(),
+            Some((2, 2)),
+            "a disabled book counts as finished"
+        );
+
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn scan_progress_starts_each_scan_at_zero() {
+        // `snapshot` clamps `done` to `total`, so a scan that lost its reset
+        // would still read as complete through the scan-level test above.
+        // Check the counter itself (Greptile P2).
+        let progress = ScanProgress::default();
+        progress.begin(2);
+        assert_eq!(progress.snapshot(), Some((0, 2)), "a scan starts at zero");
+
+        progress.book_done();
+        assert_eq!(progress.snapshot(), Some((1, 2)));
+        progress.book_done();
+        assert_eq!(progress.snapshot(), Some((2, 2)));
+
+        progress.begin(2);
+        assert_eq!(
+            progress.snapshot(),
+            Some((0, 2)),
+            "the next scan starts at zero again, not at the last total"
+        );
     }
 
     #[test]
