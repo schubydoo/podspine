@@ -1038,7 +1038,10 @@ split the way they are.</p>
   <code>enclosure length</code> read from the <strong>real output file</strong> (never prorated from a
   bitrate).
 - <code>guid = blake3(book.id : idx : source_mtime)</code> — stable across re-scans of an
-  unchanged source, and changes only when the source changes.
+  unchanged source, and changes only when the source changes. It is computed once
+  at ingest and stored per episode, along with the <code>pubDate</code>; the feed publishes
+  the stored values rather than re-deriving them, so a book that is waiting for a
+  re-ingest keeps the guids its subscribers already hold.
 - A generated feed is rejected by the self-check before it can be served if any of
   the above is violated.</p>
 <p><strong>Audio fidelity:</strong>
