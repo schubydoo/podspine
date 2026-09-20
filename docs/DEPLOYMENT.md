@@ -422,6 +422,21 @@ server {
 }
 ```
 
+### `Permissions-Policy` warnings in the browser console
+
+Seeing `Error with Permissions-Policy header: Unrecognized feature: …` on the browse
+page? **Podspine sends no `Permissions-Policy` header at all** — the only header it
+adds is `X-Robots-Tag` on feeds. The header comes from whatever fronts it (a reverse
+proxy, a tunnel, a CDN), and the warning means that header names a browser feature
+your browser does not know. It affects nothing Podspine serves.
+
+Confirm where it comes from, and fix it there:
+
+```bash
+curl -sI http://127.0.0.1:8080/ | grep -i permissions-policy   # direct: no such header
+curl -sI https://podspine.example.com/ | grep -i permissions-policy   # through the proxy
+```
+
 ## Health checks
 
 `GET /healthz` returns `200 ok`. Use it for container/orchestrator liveness (see the
