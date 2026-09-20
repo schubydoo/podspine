@@ -1344,6 +1344,43 @@ fn remeasure_in_place_tracks(
     Ok(())
 }
 
+/// A staging directory that is removed when it goes out of scope, however the
+/// ingest ends.
+///
+/// The re-encodes are produced here and moved into the live book dir only
+/// once the episode set is settled, so every early return between those two
+/// points would otherwise leave a whole book's worth of audio behind. Nothing
+/// else reclaims it: the prune and the cache eviction both look at
+/// `books/<id>` (Greptile P2). A failed removal is logged and nothing more,
+/// because the next scan clears the dir before it produces into it again.
+struct StagingDir(PathBuf);
+
+impl StagingDir {
+    /// Take the dir for `id` under `data_dir`, clearing anything a crashed
+    /// scan left there.
+    fn new(data_dir: &Path, id: &str) -> Self {
+        let path = data_dir.join(".scan-tmp").join(id);
+        let _ = std::fs::remove_dir_all(&path);
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for StagingDir {
+    fn drop(&mut self) {
+        match std::fs::remove_dir_all(&self.0) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                tracing::warn!(error = %err, path = %self.0.display(), "failed to remove the track staging dir")
+            }
+        }
+    }
+}
+
 /// Move every staged re-encode into the book's live directory.
 ///
 /// The staging dir keeps the live one untouched until the whole episode set
@@ -1500,11 +1537,11 @@ fn ingest_track_folder(
         // with the previous book still serving every episode its feed
         // advertises (Greptile P1). The dir is under `data_dir`, which the
         // walk skips, and it is not an indexed book id, which eviction skips.
-        let staging = data_dir.join(".scan-tmp").join(id);
-        let _ = std::fs::remove_dir_all(&staging); // a crashed scan may have left one
+        // `StagingDir` clears it on every path out of here.
+        let staging = StagingDir::new(data_dir, id);
         let staged = transcode_tracks(
             &encodes,
-            &staging,
+            staging.path(),
             episode_ext(None, enc),
             enc,
             split_workers,
@@ -1514,18 +1551,10 @@ fn ingest_track_folder(
         // The second read, now that ffmpeg is done (see the note above the
         // first one). It runs while the staging dir still holds everything,
         // so a failure here leaves the live book untouched.
-        if let Err(err) = remeasure_in_place_tracks(&tracks, &mut in_place_lengths) {
-            let _ = std::fs::remove_dir_all(&staging);
-            return Err(err);
-        }
+        remeasure_in_place_tracks(&tracks, &mut in_place_lengths)?;
 
         for ep in publish_staged_tracks(staged, &task.book_out)? {
             reencoded.insert(ep.idx, ep);
-        }
-        // Best-effort, like the saver split's: a leftover is cleared by the
-        // next scan.
-        if let Err(err) = std::fs::remove_dir_all(&staging) {
-            tracing::warn!(error = %err, path = %staging.display(), "failed to remove the track staging dir");
         }
     }
 
@@ -3850,6 +3879,29 @@ mod tests {
             assert!(e.file_path.ends_with(".mp3"), "{}", e.file_path);
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The staging dir goes away however the ingest ends, so a failure
+    /// between producing the re-encodes and publishing them cannot leave a
+    /// whole book of audio behind: nothing else reclaims `.scan-tmp`.
+    #[test]
+    fn a_staging_dir_is_removed_when_it_goes_out_of_scope() {
+        let data = scratch("staging-guard");
+        let path = {
+            let staging = StagingDir::new(&data, "a-book");
+            std::fs::create_dir_all(staging.path()).unwrap();
+            std::fs::write(staging.path().join("001.m4a"), b"audio").unwrap();
+            staging.path().to_path_buf()
+        };
+        assert!(!path.exists(), "the guard removed {path:?}");
+
+        // A dir left by a crashed scan is cleared when the next one takes it.
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("leftover.m4a"), b"old").unwrap();
+        let staging = StagingDir::new(&data, "a-book");
+        assert!(!path.join("leftover.m4a").exists(), "the leftover is gone");
+        drop(staging);
+        let _ = std::fs::remove_dir_all(&data);
     }
 
     /// The second measurement is what the rows carry, and it runs while the
