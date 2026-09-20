@@ -1305,15 +1305,19 @@ fn measure_in_place_tracks(tracks: &[FolderTrack]) -> Result<HashMap<usize, u64>
     Ok(lengths)
 }
 
-/// Read those lengths again after the re-encodes, and keep the newer value.
+/// Read those lengths again after the re-encodes, and drop a track that no
+/// longer reads.
 ///
 /// A re-encode takes seconds, and a sibling track can be replaced while ffmpeg
 /// runs, so a length measured before it can be stale by the time the row is
 /// written. The row must match the bytes the server will serve (Greptile P1).
 ///
-/// A read that fails here keeps the earlier value rather than aborting: the
-/// re-encodes are published by now, so the book must commit to cover them, and
-/// the serve layer plus the next scan handle the one track that went missing.
+/// A track that cannot be read now loses its entry, and the caller leaves it
+/// out of the book. Keeping the earlier length would publish a feed that
+/// advertises a file the scan already knows is gone: the audio route answers
+/// 404 for it, and it asks for no repair, because the missing file IS the
+/// source (Greptile P1). The book still commits, which is what covers the
+/// re-encodes this ingest already published.
 fn remeasure_in_place_tracks(tracks: &[FolderTrack], lengths: &mut HashMap<usize, u64>) {
     for (idx, t) in tracks.iter().enumerate() {
         if t.encoding != Encoding::Copy {
@@ -1323,10 +1327,13 @@ fn remeasure_in_place_tracks(tracks: &[FolderTrack], lengths: &mut HashMap<usize
             Ok(meta) => {
                 lengths.insert(idx, meta.len());
             }
-            Err(err) => tracing::warn!(
-                error = %err, path = %t.path.display(),
-                "could not re-read a track after the re-encodes; keeping the length measured before them"
-            ),
+            Err(err) => {
+                lengths.remove(&idx);
+                tracing::warn!(
+                    error = %err, path = %t.path.display(),
+                    "a track went missing during the ingest — leaving it out of the book"
+                );
+            }
         }
     }
 }
@@ -1458,13 +1465,33 @@ fn ingest_track_folder(
         .map(str::to_string)
         .collect();
 
+    // The book is what this scan can still serve. A track that went missing
+    // while the re-encodes ran has no length, and it is left out rather than
+    // published as a feed entry that answers 404.
+    let serving: Vec<(usize, &FolderTrack)> = tracks
+        .iter()
+        .enumerate()
+        .filter(|(idx, t)| t.encoding != Encoding::Copy || in_place_lengths.contains_key(idx))
+        .collect();
+    if serving.len() != n {
+        tracing::warn!(
+            id = %id,
+            dropped = n - serving.len(),
+            "some tracks went missing during the ingest; the book is indexed without them"
+        );
+    }
+    let n = serving.len();
+    if n == 0 {
+        return Err(ScanError::EmptyFolder(dir.to_path_buf()));
+    }
+
     let mut episodes = Vec::with_capacity(n);
-    for (idx, t) in tracks.iter().enumerate() {
+    for (idx, (original_idx, t)) in serving.into_iter().enumerate() {
         // A re-encoded track is served from `<data_dir>` and carries no
         // `source_path`, which is how the serve layer knows not to look in
         // the library, and how nothing tries to rebuild it: a re-encode is
         // not byte-reproducible.
-        let (file_path, source_path, byte_length) = match reencoded.remove(&idx) {
+        let (file_path, source_path, byte_length) = match reencoded.remove(&original_idx) {
             Some(ep) => (
                 ep.path.to_string_lossy().into_owned(),
                 String::new(),
@@ -1472,8 +1499,8 @@ fn ingest_track_folder(
             ),
             None => {
                 let byte_length = in_place_lengths
-                    .remove(&idx)
-                    .expect("every track is either re-encoded or measured above");
+                    .remove(&original_idx)
+                    .expect("a track without a length was filtered out above");
                 let path = t.path.to_string_lossy().into_owned();
                 (path.clone(), path, byte_length)
             }
@@ -3772,6 +3799,35 @@ mod tests {
             assert!(e.file_path.ends_with(".mp3"), "{}", e.file_path);
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The second measurement decides what the book can still serve: a track
+    /// whose file changed size is recorded at its new size, and one that went
+    /// missing while ffmpeg ran loses its entry, so the caller leaves it out
+    /// of the feed rather than publishing an entry that answers 404.
+    #[test]
+    fn a_track_that_goes_missing_during_an_ingest_loses_its_length() {
+        let dir = scratch("remeasure");
+        let here = dir.join("01.mp3");
+        std::fs::write(&here, b"0123456789").unwrap();
+        let gone = dir.join("02.mp3");
+
+        let track = |path: &Path| FolderTrack {
+            path: path.to_path_buf(),
+            duration_sec: 1.0,
+            track: None,
+            title: "t".to_string(),
+            encoding: Encoding::Copy,
+        };
+        let tracks = [track(&here), track(&gone)];
+        // The lengths as the ingest measured them before the re-encodes.
+        let mut lengths: HashMap<usize, u64> = HashMap::from([(0, 4), (1, 7)]);
+
+        remeasure_in_place_tracks(&tracks, &mut lengths);
+
+        assert_eq!(lengths.get(&0), Some(&10), "the present track is re-read");
+        assert_eq!(lengths.get(&1), None, "the missing track is dropped");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A folder can hold both kinds at once: the MP3 track streams in place
