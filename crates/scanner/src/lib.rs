@@ -1347,13 +1347,16 @@ fn remeasure_in_place_tracks(
     Ok(())
 }
 
-/// A file's own name, for a track's guid. The fallback is unreachable for a
-/// discovered track (the walk only yields files), and it keeps two nameless
-/// paths from sharing one identity.
-fn file_name_of(path: &Path) -> String {
+/// A file's own name as the platform's bytes, for a track's guid. Lossy
+/// conversion is not an option here: two Unix filenames can differ only in
+/// bytes no `str` can hold, and `track_guid` would then hand both tracks one
+/// guid, which is the episode table's primary key (Greptile P1). The fallback
+/// is unreachable for a discovered track (the walk only yields files), and it
+/// keeps two nameless paths from sharing one identity.
+fn file_name_bytes(path: &Path) -> &[u8] {
     path.file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+        .unwrap_or(path.as_os_str())
+        .as_encoded_bytes()
 }
 
 /// A staging directory that is removed when it goes out of scope, however the
@@ -1613,7 +1616,7 @@ fn ingest_track_folder(
             // A folder track's identity follows its file, not its position
             // (see `track_guid`). A chaptered book keeps `episode_guid`,
             // because a chapter IS its position in one container.
-            guid: track_guid(id, &file_name_of(&t.path), t.mtime),
+            guid: track_guid(id, file_name_bytes(&t.path), t.mtime),
             book_id: id.to_string(),
             idx: idx as i64,
             title: t.title.clone(),
@@ -3977,6 +3980,45 @@ mod tests {
                 "{file} kept the guid its subscribers hold"
             );
         }
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// Two tracks whose names differ only in bytes no `str` can hold must
+    /// stay two episodes. A lossy name would give them one guid, which is the
+    /// episode table's primary key, so one would overwrite the other and
+    /// disappear from the feed (Greptile, PR 272).
+    #[cfg(unix)]
+    #[test]
+    fn tracks_named_outside_utf8_stay_separate_episodes() {
+        use std::os::unix::ffi::OsStrExt;
+        skip_unless_ffmpeg!();
+        let root = scratch("track-guid-bytes");
+        let data = scratch("track-guid-bytes-data");
+        let folder = root.join("A Folder Book");
+        if synth_mp3(&folder, "a.mp3", Some(1), 3).is_none()
+            || synth_mp3(&folder, "b.mp3", Some(2), 3).is_none()
+        {
+            skip!("no libmp3lame encoder");
+        }
+        // `track\xff.mp3` and `track\xfe.mp3`: one string after a lossy
+        // conversion, two different files on disk.
+        for (from, bytes) in [
+            ("a.mp3", b"track\xff.mp3".as_slice()),
+            ("b.mp3", b"track\xfe.mp3".as_slice()),
+        ] {
+            let to = folder.join(std::ffi::OsStr::from_bytes(bytes));
+            std::fs::rename(folder.join(from), to).unwrap();
+        }
+        let index = Index::open_in_memory().unwrap();
+
+        scan_library(&root, &data, &index, ScanOptions::default());
+        let book = index.list_books().unwrap().remove(0);
+        let eps = index.episodes_for_book(&book.id).unwrap();
+
+        assert_eq!(eps.len(), 2, "both tracks are episodes");
+        assert_ne!(eps[0].guid, eps[1].guid, "and they have their own guids");
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&data);
