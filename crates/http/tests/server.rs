@@ -2064,6 +2064,24 @@ async fn scanning_state_holds_the_browse_ui_and_503s_the_capability_routes() {
     }
 }
 
+/// The holding page shows the scan's book counts when the binary wires them
+/// in. Without them a large first scan shows one unchanging sentence for
+/// minutes, which reads as a hang (deferred from issue 159).
+#[tokio::test]
+async fn the_scanning_page_shows_the_scan_counts() {
+    let state = empty_state().with_scan_progress(std::sync::Arc::new(|| Some((3, 10))));
+    state.set_ready(false);
+
+    let resp = router(state)
+        .oneshot(Request::get("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = String::from_utf8(body_bytes(resp).await).unwrap();
+    assert!(html.contains("Indexed 3 of 10 books."), "{html}");
+}
+
 #[tokio::test]
 async fn once_ready_the_browse_ui_serves_normally() {
     let state = empty_state();

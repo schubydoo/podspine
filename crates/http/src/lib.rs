@@ -206,6 +206,12 @@ pub struct AppState {
     /// When a repair reconcile was last requested, for the rate limit in
     /// [`request_repair`]. `None` means never.
     last_repair: Arc<Mutex<Option<Instant>>>,
+    /// Read the running scan's `(books finished, books found)`, for the
+    /// "Scanning…" page. The default reports `None`, which prints no count.
+    /// The binary wires this to the scanner's counter. Kept as an opaque
+    /// callback for the same reason as `reconcile`: this crate does not depend
+    /// on the scanner.
+    scan_progress: Arc<dyn Fn() -> Option<(usize, usize)> + Send + Sync>,
 }
 
 impl AppState {
@@ -251,7 +257,21 @@ impl AppState {
             ready: Arc::new(AtomicBool::new(true)),
             reconcile,
             last_repair: Arc::new(Mutex::new(None)),
+            scan_progress: Arc::new(|| None),
         })
+    }
+
+    /// Wire the "Scanning…" page to the scanner's progress counter. The server
+    /// binary calls this once, with a closure that reads the counter it also
+    /// hands to the watcher. A state without it shows the holding page with no
+    /// count, which is what every test wants.
+    #[must_use]
+    pub fn with_scan_progress(
+        mut self,
+        progress: Arc<dyn Fn() -> Option<(usize, usize)> + Send + Sync>,
+    ) -> Self {
+        self.scan_progress = progress;
+        self
     }
 
     /// Flip the "initial scan finished" flag. The server binary sets it
@@ -424,7 +444,9 @@ async fn index(
     // Until the initial scan finishes, hold on a "Scanning…" page. An empty
     // grid would read as "no books / broken" (issue 159).
     if !state.is_ready() {
-        return Ok(Html(scanning_page(theme).into_string()));
+        return Ok(Html(
+            scanning_page(theme, (state.scan_progress)()).into_string(),
+        ));
     }
     let books = {
         let index = state.index.lock().map_err(AppError::internal)?;
