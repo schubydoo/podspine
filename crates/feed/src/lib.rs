@@ -75,9 +75,45 @@ pub struct FeedBook {
 }
 
 /// Stable episode guid: `blake3(book.id : idx : source_mtime)` as hex.
+///
+/// This is the identity of a chapter, which is a sub-range of one container:
+/// the position IS what the chapter is, and the whole book re-splits whenever
+/// its source changes. A folder book is the other shape, and it uses
+/// [`track_guid`].
 pub fn episode_guid(book_id: &str, idx: usize, source_mtime: i64) -> String {
     let material = format!("{book_id}:{idx}:{source_mtime}");
     blake3::hash(material.as_bytes()).to_hex().to_string()
+}
+
+/// Stable episode guid for one track of a folder book:
+/// `blake3(book.id : file name : mtime)` as hex.
+///
+/// A folder track is a file of its own, so its identity follows that file and
+/// not its position. Position cannot work here: deleting one track renumbers
+/// every track after it, while the folder's `source_mtime` (the newest track
+/// mtime) does not move, so a position-based guid would hand a later track the
+/// guid a subscriber already holds for the one that went, and a podcast app
+/// would keep the audio it already downloaded under that guid.
+///
+/// `file_name` is the track's own name inside the folder, which is unique
+/// there, and `mtime` is that file's own timestamp, so replacing one track
+/// leaves every other guid alone.
+///
+/// The name arrives as the platform's own **bytes**
+/// (`OsStr::as_encoded_bytes`), never as a lossy string. A Unix filename is
+/// any byte sequence, and two names that differ only in bytes no `str` can
+/// hold would otherwise hash the same: the guid is the episode table's
+/// primary key, so one track would overwrite the other and vanish from the
+/// feed (Greptile P1). A name that IS valid UTF-8 hashes exactly
+/// `book_id:name:mtime`, so such a guid does not move.
+pub fn track_guid(book_id: &str, file_name: &[u8], mtime: i64) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(book_id.as_bytes());
+    hasher.update(b":");
+    hasher.update(file_name);
+    hasher.update(b":");
+    hasher.update(mtime.to_string().as_bytes());
+    hasher.finalize().to_hex().to_string()
 }
 
 /// Format a duration as `HH:MM:SS` for `<itunes:duration>`.
@@ -251,6 +287,38 @@ mod tests {
         assert_ne!(episode_guid("b", 0, 100), episode_guid("b", 0, 101));
         assert_ne!(episode_guid("b", 0, 100), episode_guid("b", 1, 100));
         assert_ne!(episode_guid("a", 0, 100), episode_guid("b", 0, 100));
+    }
+
+    #[test]
+    fn track_guids_separate_names_that_differ_outside_utf8() {
+        // Two Unix filenames that a lossy conversion maps to one string. The
+        // guid is the episode table's primary key, so sharing one would make
+        // a track overwrite its sibling and vanish from the feed.
+        let odd_a: &[u8] = b"track\xff.mp3";
+        let odd_b: &[u8] = b"track\xfe.mp3";
+        assert_ne!(track_guid("book", odd_a, 7), track_guid("book", odd_b, 7));
+
+        // The file and its own mtime are what the identity follows.
+        assert_eq!(
+            track_guid("book", b"01.mp3", 7),
+            track_guid("book", b"01.mp3", 7)
+        );
+        assert_ne!(
+            track_guid("book", b"01.mp3", 7),
+            track_guid("book", b"01.mp3", 8)
+        );
+        assert_ne!(
+            track_guid("book", b"01.mp3", 7),
+            track_guid("book", b"02.mp3", 7)
+        );
+        assert_ne!(track_guid("a", b"01.mp3", 7), track_guid("b", b"01.mp3", 7));
+
+        // A name that is valid UTF-8 hashes exactly `book_id:name:mtime`, so
+        // moving to bytes moved nobody's guid.
+        assert_eq!(
+            track_guid("book", b"01.mp3", 7),
+            blake3::hash(b"book:01.mp3:7").to_hex().to_string()
+        );
     }
 
     #[test]

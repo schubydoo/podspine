@@ -22,7 +22,7 @@
   "rules": [
     {
       "id": "feed-ordering",
-      "rule": "Feed items must have strictly sequential pubDates (oldest = chapter 1), plus itunes:episode and itunes:duration, and an enclosure length read from the real output file (fs::metadata().len()) — NEVER prorated from a bitrate. The self-check must reject a feed that violates these. Flag any regression to feed ordering, the itunes tags, the real-size enclosure length, or guid stability (blake3(book.id:idx:source_mtime)).",
+      "rule": "Feed items must have strictly sequential pubDates (oldest = chapter 1), plus itunes:episode and itunes:duration, and an enclosure length read from the real output file (fs::metadata().len()) — NEVER prorated from a bitrate. The self-check must reject a feed that violates these. Flag any regression to feed ordering, the itunes tags, the real-size enclosure length, or guid stability. A guid is computed once at ingest and stored per episode: blake3(book.id:idx:source_mtime) for a CHAPTER of one container, and blake3(book.id:track file name bytes:track mtime) for a TRACK of a folder book, whose identity follows its file because deleting a track renumbers its siblings.",
       "scope": ["crates/feed/**", "crates/scanner/**"]
     },
     {

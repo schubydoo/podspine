@@ -19,7 +19,11 @@ Cargo workspace, one crate per pipeline stage: `scanner` (watch/classify by form
 - ffmpeg split: `-ss <start>` BEFORE `-i`, `-t <duration>` (NEVER `-to` after `-i` — makes a 2× file), plus `-map 0:a:0 -map_chapters -1 -c copy -movflags +faststart`.
 - **Pass ffmpeg args as an argv vector, NEVER a shell string** — chapter titles are untrusted (command injection).
 - Treat book/chapter ids as opaque index keys; canonicalize and assert the path stays under the library root; 404 on reject. NEVER `format!("{root}/{user_input}")`.
-- `guid = blake3(book.id : idx : source_mtime)` — keeps episodes stable across rescans.
+- `guid = blake3(book.id : idx : source_mtime)` for a **chapter**, and
+  `guid = blake3(book.id : track file name bytes : track mtime)` for a **folder
+  track** — a track's identity follows its file, because deleting one renumbers
+  its siblings. Either way the guid is computed at ingest and STORED; the feed
+  publishes the stored value.
 - **NEVER add DRM circumvention** (Audible AAX/AAXC/.aa, OverDrive, WMA-DRM); DRM-free input only. Keep ffmpeg out-of-process (GPL boundary).
 - FLAC: prefer a `.cue` sidecar (embedded FLAC chapters lack titles).
 - License is AGPL-3.0.
