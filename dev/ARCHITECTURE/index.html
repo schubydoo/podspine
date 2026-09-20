@@ -843,7 +843,7 @@ restart.</p>
 </tr>
 <tr>
 <td><code>scanner</code></td>
-<td>Walk the library, classify each book (single audio file, per-book subfolder, or multi-track MP3 folder), and orchestrate probe → chapters → split → cover → index. Assigns collision-free slugs; one bad book never aborts the scan. Also hosts the background watcher that debounces filesystem changes and re-reconciles the index while the server runs.</td>
+<td>Walk the library, classify each book (single audio file, per-book subfolder, or multi-track folder), and orchestrate probe → chapters → split → cover → index. Assigns collision-free slugs; one bad book never aborts the scan. Also hosts the background watcher that debounces filesystem changes and re-reconciles the index while the server runs.</td>
 </tr>
 <tr>
 <td><code>prober</code></td>
@@ -900,9 +900,11 @@ gates, synthetic-audio generation, scratch-dir guards — never shipped).</p>
   with chapters) are split by chapter via stream copy into a container matching
   the source codec (<code>m4a</code>/<code>mp3</code>/<code>flac</code>/<code>ogg</code>/<code>opus</code>) — see the storage model below
   for <code>full</code> vs <code>saver</code>.</li>
-<li><strong>MP3 folders</strong> (per-chapter tracks) are treated as one episode per file, ordered
-  by track number (falling back to filename order) and <strong>served in place</strong> from the
-  library — no copy, no re-split, no re-encode.</li>
+<li><strong>Track folders</strong> (a folder of per-chapter files: several <code>.mp3</code>, or several
+  <code>.ogg</code>/<code>.opus</code>/<code>.flac</code>) are treated as one episode per file, ordered by track
+  number (falling back to filename order) and <strong>served in place</strong> from the library
+  — no copy, no re-split, no re-encode. A folder of several <code>.m4b</code>/<code>.m4a</code> files is
+  several books instead, unless its <code>.podspine.toml</code> sets <code>folder_is_one_book</code>.</li>
 <li>A book with no chapters and no sidecar degrades to a single-episode feed with a
   warning; that whole file is also <strong>served in place</strong> (Sprint 6.2).</li>
 </ul>

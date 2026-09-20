@@ -1310,9 +1310,17 @@ flag exists so a library you'd rather not touch still plays.</p>
   episode whose file resolves outside the library root — indexing it would publish
   a feed whose audio 404s. A link that stays inside the library is fine, and the
   same book reached two ways is indexed once.</li>
-<li>Several <code>.ogg</code>/<code>.opus</code>/<code>.flac</code> files in one folder are <strong>skipped with a warning</strong>
-  — only <code>.mp3</code> folders are read as one book's tracks. Give each such book its own
-  folder, or add a <code>.cue</code>.</li>
+<li><strong>Several <code>.ogg</code>/<code>.opus</code>/<code>.flac</code> files in one folder are one book's tracks</strong>, the
+  same rule <code>.mp3</code> folders have always had. Folder tracks are served as they are,
+  so a podcast app that does not play Opus or FLAC will not play such a book yet —
+  <code>PODSPINE_TRANSCODE</code> covers single files, not folder tracks.</li>
+<li><strong>A folder of several <code>.m4b</code>/<code>.m4a</code> files stays several books.</strong> That is what an
+  author folder usually is, and each file keeps its own feed URL. If the folder is
+  really one book split by disc, put <code>folder_is_one_book = true</code> in a
+  <code>.podspine.toml</code> inside it. Flipping that key <strong>retires the books of the old
+  shape</strong>, with their feed URLs, so one folder is one reading of its audio and never
+  two. A book is retired only once the new shape is indexed and serving every one of
+  its episodes, so a scan that fails leaves the old books playing.</li>
 </ul>
 <h2 id="per-book-overrides-podspinetoml">Per-book overrides (<code>.podspine.toml</code>)<a class="headerlink" href="#per-book-overrides-podspinetoml" title="Permanent link">&para;</a></h2>
 <p>Any of the per-book-meaningful settings above can be overridden for <strong>one book</strong>
@@ -1324,8 +1332,8 @@ env → global config file → default.</strong></p>
 <li><strong>A single file</strong> — name it after the file: <code>Author - Title.podspine.toml</code>
   beside <code>Author - Title.m4b</code> (same as a <code>.cue</code> sidecar). Works whether the file
   is at the top level or in its own folder.</li>
-<li><strong>A multi-file (MP3-folder) book, or a lone file kept in its own folder</strong> — drop
-  a <code>.podspine.toml</code> <strong>inside that folder</strong>.</li>
+<li><strong>A multi-track folder book, or a lone file kept in its own folder</strong> — drop a
+  <code>.podspine.toml</code> <strong>inside that folder</strong>.</li>
 </ul>
 <p><strong>Keys you can set:</strong></p>
 <table>
@@ -1357,6 +1365,10 @@ env → global config file → default.</strong></p>
 <td>Override the feed title/author (fix metadata without renaming files).</td>
 </tr>
 <tr>
+<td><code>folder_is_one_book</code></td>
+<td><code>true</code> makes every audio file in this folder one book's tracks, whatever their extension.</td>
+</tr>
+<tr>
 <td><code>disabled</code></td>
 <td><code>true</code> removes this book from the index and every feed/page.</td>
 </tr>
@@ -1370,6 +1382,8 @@ env → global config file → default.</strong></p>
 <a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="n">storage_mode</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"saver"</span>
 <a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="n">title</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"The Correct Title"</span>
 </code></pre></div>
+<p>Editing a <code>.podspine.toml</code> starts a reconcile on its own, like any other library
+change, so an edit takes effect within a couple of seconds.</p>
 <p>Server-wide keys (<code>bind</code>, <code>base_url</code>, <code>library</code>, <code>data_dir</code>, <code>cache_size</code>,
 <code>cache_ttl</code>, <code>transcode</code>, …) are <strong>ignored with a log warning</strong> if they appear in a
 per-book file — they only make sense server-wide. (<code>transcode</code> is server-wide for
