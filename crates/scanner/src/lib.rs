@@ -48,7 +48,7 @@ use std::time::UNIX_EPOCH;
 // of [`ScanOptions`].
 use podspine_config::book_overrides;
 pub use podspine_config::{BookOverrides, StorageMode, TranscodeMode};
-use podspine_feed::{episode_guid, pubdate_epoch};
+use podspine_feed::{episode_guid, pubdate_epoch, track_guid};
 use podspine_index::{BookRow, EpisodeRow, Index, IndexError};
 use podspine_prober::{ProbeError, needs_faststart, probe};
 use podspine_splitter::{
@@ -1152,6 +1152,9 @@ struct FolderTrack {
     track: Option<u32>,
     /// Episode title (ID3 `title` tag, else the file stem).
     title: String,
+    /// The track's own mtime. It is part of the track's guid, so identity
+    /// follows this file and not its position in the folder.
+    mtime: i64,
     /// How this track becomes an episode: [`Encoding::Copy`] streams the
     /// source in place, anything else re-encodes it into `<data_dir>`.
     encoding: Encoding,
@@ -1344,6 +1347,15 @@ fn remeasure_in_place_tracks(
     Ok(())
 }
 
+/// A file's own name, for a track's guid. The fallback is unreachable for a
+/// discovered track (the walk only yields files), and it keeps two nameless
+/// paths from sharing one identity.
+fn file_name_of(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
 /// A staging directory that is removed when it goes out of scope, however the
 /// ingest ends.
 ///
@@ -1455,11 +1467,23 @@ fn ingest_track_folder(
     let probe_start = std::time::Instant::now();
     let mut tracks: Vec<FolderTrack> = Vec::new();
     for path in files {
+        // The track's own mtime, for its guid. A track whose timestamp cannot
+        // be read is skipped like an unprobeable one: without it the track has
+        // no stable identity, and guessing one would hand a podcast app the
+        // wrong audio under a guid it already holds.
+        let mtime = match mtime_epoch(path) {
+            Ok(mtime) => mtime,
+            Err(err) => {
+                tracing::warn!(error = %err, path = %path.display(), "skipping a track with no readable mtime");
+                continue;
+            }
+        };
         match probe(path) {
             Ok(p) => tracks.push(FolderTrack {
                 duration_sec: p.duration_sec,
                 track: p.track,
                 title: p.title.unwrap_or_else(|| file_stem(path)),
+                mtime,
                 encoding: encoding_for(p.audio_codec.as_deref(), transcode),
                 path: path.clone(),
             }),
@@ -1586,7 +1610,10 @@ fn ingest_track_folder(
             }
         };
         episodes.push(EpisodeRow {
-            guid: episode_guid(id, idx, task.source_mtime),
+            // A folder track's identity follows its file, not its position
+            // (see `track_guid`). A chaptered book keeps `episode_guid`,
+            // because a chapter IS its position in one container.
+            guid: track_guid(id, &file_name_of(&t.path), t.mtime),
             book_id: id.to_string(),
             idx: idx as i64,
             title: t.title.clone(),
@@ -3881,6 +3908,125 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Every episode of a folder book, keyed by the file it serves.
+    fn track_guids_by_file(index: &Index) -> HashMap<String, (i64, String)> {
+        let book = index.list_books().unwrap().remove(0);
+        index
+            .episodes_for_book(&book.id)
+            .unwrap()
+            .into_iter()
+            .map(|e| {
+                let file = Path::new(&e.file_path)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                (file, (e.idx, e.guid))
+            })
+            .collect()
+    }
+
+    /// A folder track's guid follows its file. Adding a track renumbers every
+    /// episode after it, and the guids of those episodes must not move with
+    /// them: a podcast app keys what it has downloaded on the guid.
+    #[test]
+    fn folder_track_guids_follow_the_file_not_the_position() {
+        skip_unless_ffmpeg!();
+        let root = scratch("track-guid-add");
+        let data = scratch("track-guid-add-data");
+        let folder = root.join("A Folder Book");
+        if synth_mp3(&folder, "01.mp3", Some(1), 3).is_none()
+            || synth_mp3(&folder, "02.mp3", Some(2), 3).is_none()
+        {
+            skip!("no libmp3lame encoder");
+        }
+        let index = Index::open_in_memory().unwrap();
+
+        scan_library(&root, &data, &index, ScanOptions::default());
+        let before = track_guids_by_file(&index);
+        assert_eq!(before.len(), 2);
+
+        // A new FIRST track: every later episode moves up one position. Its
+        // mtime is pushed forward, because a folder's `source_mtime` is the
+        // newest track's, and whole seconds are its resolution: a file written
+        // inside the same second as its siblings would not re-ingest the book
+        // at all.
+        if synth_mp3(&folder, "00.mp3", Some(0), 3).is_none() {
+            skip!("no libmp3lame encoder");
+        }
+        let added = folder.join("00.mp3");
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(&added)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(later))
+            .unwrap();
+        scan_library(&root, &data, &index, ScanOptions::default());
+        let after = track_guids_by_file(&index);
+
+        assert_eq!(after.len(), 3, "the new track is indexed");
+        assert_eq!(
+            (before["01.mp3"].0, after["01.mp3"].0),
+            (0, 1),
+            "the first track really did move position"
+        );
+        for file in ["01.mp3", "02.mp3"] {
+            assert_eq!(
+                after[file].1, before[file].1,
+                "{file} kept the guid its subscribers hold"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// Deleting a track must not hand its guid to the track that takes its
+    /// place. The folder's `source_mtime` is the newest track's, so deleting
+    /// an older one does not move it, and a position-based guid would be
+    /// reused for different audio (Greptile, PR 271).
+    #[test]
+    fn deleting_a_folder_track_never_reuses_its_guid() {
+        skip_unless_ffmpeg!();
+        let root = scratch("track-guid-delete");
+        let data = scratch("track-guid-delete-data");
+        let folder = root.join("A Folder Book");
+        for (name, n) in [("01.mp3", 1), ("02.mp3", 2), ("03.mp3", 3)] {
+            if synth_mp3(&folder, name, Some(n), 3).is_none() {
+                skip!("no libmp3lame encoder");
+            }
+        }
+        let index = Index::open_in_memory().unwrap();
+
+        scan_library(&root, &data, &index, ScanOptions::default());
+        let before = track_guids_by_file(&index);
+        assert_eq!(before.len(), 3);
+        let deleted_guid = before["02.mp3"].1.clone();
+
+        std::fs::remove_file(folder.join("02.mp3")).unwrap();
+        scan_library(&root, &data, &index, ScanOptions::default());
+        let after = track_guids_by_file(&index);
+
+        assert_eq!(after.len(), 2, "the deleted track is gone from the feed");
+        assert_eq!(
+            (before["03.mp3"].0, after["03.mp3"].0),
+            (2, 1),
+            "the last track really did take the deleted one's position"
+        );
+        assert!(
+            !after.values().any(|(_, guid)| guid == &deleted_guid),
+            "no survivor took the deleted track's guid"
+        );
+        assert_eq!(
+            after["03.mp3"].1, before["03.mp3"].1,
+            "the survivor kept its own guid"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
     /// The staging dir goes away however the ingest ends, so a failure
     /// between producing the re-encodes and publishing them cannot leave a
     /// whole book of audio behind: nothing else reclaims `.scan-tmp`.
@@ -3921,6 +4067,7 @@ mod tests {
             duration_sec: 1.0,
             track: None,
             title: "t".to_string(),
+            mtime: 1,
             encoding: Encoding::Copy,
         };
         // The lengths as the ingest measured them before the re-encodes.

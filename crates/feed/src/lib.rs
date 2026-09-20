@@ -75,8 +75,31 @@ pub struct FeedBook {
 }
 
 /// Stable episode guid: `blake3(book.id : idx : source_mtime)` as hex.
+///
+/// This is the identity of a chapter, which is a sub-range of one container:
+/// the position IS what the chapter is, and the whole book re-splits whenever
+/// its source changes. A folder book is the other shape, and it uses
+/// [`track_guid`].
 pub fn episode_guid(book_id: &str, idx: usize, source_mtime: i64) -> String {
     let material = format!("{book_id}:{idx}:{source_mtime}");
+    blake3::hash(material.as_bytes()).to_hex().to_string()
+}
+
+/// Stable episode guid for one track of a folder book:
+/// `blake3(book.id : file name : mtime)` as hex.
+///
+/// A folder track is a file of its own, so its identity follows that file and
+/// not its position. Position cannot work here: deleting one track renumbers
+/// every track after it, while the folder's `source_mtime` (the newest track
+/// mtime) does not move, so a position-based guid would hand a later track the
+/// guid a subscriber already holds for the one that went, and a podcast app
+/// would keep the audio it already downloaded under that guid.
+///
+/// `file_name` is the track's own name inside the folder, which is unique
+/// there, and `mtime` is that file's own timestamp, so replacing one track
+/// leaves every other guid alone.
+pub fn track_guid(book_id: &str, file_name: &str, mtime: i64) -> String {
+    let material = format!("{book_id}:{file_name}:{mtime}");
     blake3::hash(material.as_bytes()).to_hex().to_string()
 }
 
