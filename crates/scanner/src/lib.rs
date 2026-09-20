@@ -1682,18 +1682,36 @@ pub fn scan_library(
 /// with their split output under `<data_dir>/books/<id>/`. Return the count of
 /// pruned books.
 ///
-/// **Empty-root guard:** if the library root is missing, unreadable, or empty,
-/// the prune removes nothing. A transiently unmounted library looks like
+/// **Empty-root guard:** if the library root is missing, unreadable, or holds
+/// nothing but ignored housekeeping names, the prune removes nothing. A
+/// transiently unmounted library looks like
 /// "every source vanished"; without this guard, an unmount would wipe the
 /// whole index. The cost: when you genuinely delete your *last* book, it stays
 /// indexed until another book is present. That is a safe trade.
+///
+/// **Per-book guard:** the same reasoning applies one level down. A library
+/// root that holds several shares stays populated when one share goes away.
+/// The root guard does not fire, and every book of that share looks deleted.
+/// A prune deletes the book row and its `feed_id` with it, so a remount mints
+/// a new feed URL and breaks every subscription to that book. The prune
+/// therefore keeps a book whose nearest surviving folder holds no content of
+/// its own (see [`source_folder_is_live`] and [`folder_holds_content`]). The
+/// cost: a book you delete from a folder that is now empty stays indexed until
+/// you remove that folder.
 pub fn prune_orphans(library: &Path, data_dir: &Path, index: &Index) -> Result<usize, ScanError> {
-    let root_has_entries = std::fs::read_dir(library)
-        .map(|mut rd| rd.next().is_some())
-        .unwrap_or(false);
+    // A stored `source_path` is canonical, so the containment check below needs
+    // a canonical root to compare it against. A library given as a relative
+    // path, or through a symlink (`/var` on macOS, `/library` bind-mounted
+    // somewhere else), would otherwise fail the check for every book, and the
+    // guard would pass them all through to the prune (Greptile P1).
+    let library_root = library
+        .canonicalize()
+        .unwrap_or_else(|_| library.to_path_buf());
+
+    let root_has_entries = std::fs::read_dir(&library_root).is_ok_and(folder_holds_content);
     if !root_has_entries {
         tracing::warn!(
-            library = %library.display(),
+            library = %library_root.display(),
             "library root empty or unreadable — skipping orphan prune (unmount guard)"
         );
         return Ok(0);
@@ -1701,7 +1719,16 @@ pub fn prune_orphans(library: &Path, data_dir: &Path, index: &Index) -> Result<u
 
     let mut pruned = 0;
     for book in index.list_books()? {
-        if Path::new(&book.source_path).exists() {
+        let source = Path::new(&book.source_path);
+        if source.exists() {
+            continue;
+        }
+        if !source_folder_is_live(&library_root, source) {
+            tracing::warn!(
+                slug = %book.slug,
+                source = %book.source_path,
+                "source gone from a folder that is empty or unreadable — keeping the book (unmount guard)"
+            );
             continue;
         }
         let book_out = data_dir.join("books").join(&book.id);
@@ -1716,6 +1743,53 @@ pub fn prune_orphans(library: &Path, data_dir: &Path, index: &Index) -> Result<u
         tracing::info!(slug = %book.slug, "pruned orphaned book (source gone)");
     }
     Ok(pruned)
+}
+
+/// Tell "this one book was deleted" apart from "the share that held it went
+/// away". Walk up from a missing source to the nearest folder that reads, and
+/// stop at `library_root`, which must be canonical.
+///
+/// An unmount leaves the mount point behind as an empty directory, and a
+/// stale network handle leaves it unreadable. Both answer `false`, so the
+/// caller keeps the book. A real delete leaves the surrounding folder
+/// populated, or takes that folder with it, and the walk then reaches a
+/// populated ancestor and answers `true`.
+fn source_folder_is_live(library_root: &Path, source: &Path) -> bool {
+    let mut candidate = source.parent();
+    while let Some(dir) = candidate {
+        // A source outside the library root is not this guard's business.
+        if !dir.starts_with(library_root) {
+            return true;
+        }
+        match std::fs::read_dir(dir) {
+            Ok(entries) => return folder_holds_content(entries),
+            // This folder went with the book. Try the one above it.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            // Unreadable is not proof of a delete.
+            Err(_) => return false,
+        }
+        candidate = dir.parent();
+    }
+    true
+}
+
+/// Whether a directory listing proves that the storage behind it is here.
+///
+/// An entry that fails to read answers `false`: a stale network handle fails
+/// part way through its listing, and a half-read share is not proof of a
+/// delete. The names the walk ignores ([`is_ignored_name`]: dotfiles,
+/// `@eaDir`, `lost+found`) answer `false` on their own, because an unmounted
+/// mount point keeps such housekeeping entries while every book under it is
+/// gone (Greptile P1). A name that is not valid UTF-8 is a real entry, not an
+/// ignored one.
+fn folder_holds_content(entries: std::fs::ReadDir) -> bool {
+    for entry in entries {
+        let Ok(entry) = entry else { return false };
+        if !entry.file_name().to_str().is_some_and(is_ignored_name) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Reconcile the index with the library: [`scan_library`] (add/update), then
@@ -5710,6 +5784,124 @@ mod tests {
             2,
             "books preserved despite missing sources (unmount guard)"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    // One library root, two shares mounted under it, one book in each. The
+    // root stays populated when a share goes away, so the empty-root guard
+    // cannot help there.
+    fn two_share_library(tag: &str) -> (ScratchDir, ScratchDir, Index) {
+        let root = scratch(&format!("{tag}-lib"));
+        let data = scratch(&format!("{tag}-data"));
+        for (share, name) in [("share-a", "alpha.m4a"), ("share-b", "beta.m4a")] {
+            let dir = root.join(share);
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = synth(&dir, false);
+            std::fs::rename(&file, dir.join(name)).unwrap();
+        }
+        let index = Index::open_in_memory().unwrap();
+        (root, data, index)
+    }
+
+    #[test]
+    fn prune_orphans_keeps_a_book_whose_share_went_away() {
+        skip_unless_ffmpeg!();
+        let (root, data, index) = two_share_library("prune-share");
+        scan_library(&root, &data, &index, ScanOptions::default());
+        let before = index.list_books().unwrap();
+        assert_eq!(before.len(), 2);
+
+        // Simulate an unmount of share-a: its sources vanish and the mount
+        // point stays behind as an empty folder. share-b keeps the root
+        // populated, so the empty-root guard does not fire.
+        std::fs::remove_file(root.join("share-a").join("alpha.m4a")).unwrap();
+        let pruned = prune_orphans(&root, &data, &index).unwrap();
+
+        assert_eq!(pruned, 0, "an empty share folder must not prune its books");
+        let after = index.list_books().unwrap();
+        assert_eq!(after.len(), 2, "books preserved (per-book unmount guard)");
+        // The point of the guard: a remount keeps every subscription working.
+        let feed_ids = |books: &[BookRow]| {
+            let mut ids: Vec<String> = books.iter().map(|b| b.feed_id.clone()).collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(feed_ids(&before), feed_ids(&after), "feed ids survive");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn prune_orphans_keeps_a_book_whose_share_left_only_housekeeping_files() {
+        skip_unless_ffmpeg!();
+        // A mount point rarely comes back bare. A file manager, a NAS, or a
+        // sync client leaves a dotfile or a `@eaDir` behind, and the walk
+        // ignores exactly those names. They must not read as "the share is
+        // here" (Greptile P1).
+        let (root, data, index) = two_share_library("prune-share-junk");
+        scan_library(&root, &data, &index, ScanOptions::default());
+        assert_eq!(index.list_books().unwrap().len(), 2);
+
+        let share_a = root.join("share-a");
+        std::fs::remove_file(share_a.join("alpha.m4a")).unwrap();
+        std::fs::write(share_a.join(".DS_Store"), b"junk").unwrap();
+        std::fs::create_dir_all(share_a.join("@eaDir")).unwrap();
+        let pruned = prune_orphans(&root, &data, &index).unwrap();
+
+        assert_eq!(pruned, 0, "ignored names are not proof of a live share");
+        assert_eq!(index.list_books().unwrap().len(), 2);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// The library root reaches the guard exactly as the operator wrote it,
+    /// while every stored `source_path` is canonical. On macOS the scratch
+    /// root is already such a pair (`/var` links to `/private/var`), and a
+    /// bind-mounted `/library` is the same shape on Linux. Without a
+    /// canonical root the containment check fails for every book, and the
+    /// guard passes them all to the prune (Greptile P1).
+    #[cfg(unix)]
+    #[test]
+    fn prune_orphans_guards_a_library_reached_through_a_symlink() {
+        skip_unless_ffmpeg!();
+        let (root, data, index) = two_share_library("prune-share-symlink");
+        scan_library(&root, &data, &index, ScanOptions::default());
+        assert_eq!(index.list_books().unwrap().len(), 2);
+
+        let alias = scratch("prune-share-alias");
+        let linked_root = alias.join("library");
+        std::os::unix::fs::symlink(root.as_ref() as &Path, &linked_root).unwrap();
+
+        std::fs::remove_file(root.join("share-a").join("alpha.m4a")).unwrap();
+        let pruned = prune_orphans(&linked_root, &data, &index).unwrap();
+
+        assert_eq!(pruned, 0, "the guard holds through a symlinked root");
+        assert_eq!(index.list_books().unwrap().len(), 2);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&alias);
+    }
+
+    #[test]
+    fn prune_orphans_removes_a_book_whose_folder_was_deleted() {
+        skip_unless_ffmpeg!();
+        // The guard must not block a real delete. Removing the folder as well
+        // as the file leaves share-b as the nearest folder that reads, and it
+        // is populated, so the book is genuinely gone.
+        let (root, data, index) = two_share_library("prune-deleted-folder");
+        scan_library(&root, &data, &index, ScanOptions::default());
+        assert_eq!(index.list_books().unwrap().len(), 2);
+
+        std::fs::remove_dir_all(root.join("share-a")).unwrap();
+        let pruned = prune_orphans(&root, &data, &index).unwrap();
+
+        assert_eq!(pruned, 1, "a deleted folder is still pruned");
+        assert_eq!(index.list_books().unwrap().len(), 1);
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&data);
