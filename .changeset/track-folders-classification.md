@@ -1,5 +1,0 @@
----
-default: minor
----
-
-Read a folder of Ogg, Opus, or FLAC tracks as one book, the same rule a folder of `.mp3` tracks has always had. Such a folder was skipped with a warning before, so those books never appeared. Folder tracks are served exactly as they are, so a podcast app that does not play Opus or FLAC still cannot play such a book. A folder of several `.m4b`/`.m4a` files is still several books, one per file, because that is what an author folder usually is and every one of those books keeps its feed URL. Set `folder_is_one_book = true` in a folder's `.podspine.toml` when it is really one book split by disc: every audio file in it then becomes one track of one book, and the books of the old shape are retired on the next scan, which does retire their feed URLs. An MP3 folder keeps exactly its `.mp3` tracks, so a stray file of another format cannot renumber a feed that subscribers already hold. An edit to a `.podspine.toml` now starts a scan by itself, instead of waiting for another change or a restart.
