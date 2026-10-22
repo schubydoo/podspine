@@ -10,7 +10,7 @@
 # Alpine's ffmpeg keeps the image ~1/3 the size of debian-slim (the TAD
 # sanctions this "if size matters", and it does: the ≤180MB target rules out
 # debian's full ffmpeg).
-FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+FROM alpine:3.24@sha256:71e9b7bae160ba167fa17414401b94cbcdaf3c32feeab9298bd794a2a0614c35
 
 # Upgrade the base packages first. openssl (libcrypto3/libssl3) ships inside the
 # base image, so `apk add` alone keeps the digest-pinned version and never picks
