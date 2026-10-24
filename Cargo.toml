@@ -41,7 +41,7 @@ tokio = { version = "1.52", features = ["full"] }
 rss = "2.1.0"
 time = { version = "0.3.47", features = ["formatting", "parsing"] } # >=0.3.47: RUSTSEC-2026-0009
 # index / storage (bundled SQLite compiles into the static binary)
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 # ui
 maud = "0.27"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
