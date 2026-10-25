@@ -41,6 +41,8 @@ built-in player. Just a feed URL.
 > capability-URL feeds (with one-click regenerate), a one-tap **subscribe page**
 > with per-app deep links + QR, and security hardening. See [CHANGELOG](CHANGELOG.md).
 
+Pass `--pilot-retry-limit <n>` to retry a failed step up to `n` times before the run exits.
+
 ## Quick start
 
 ### Docker (recommended)
