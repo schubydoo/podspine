@@ -21,8 +21,16 @@ jobs:
       issues: write
       id-token: write
       actions: read
-    uses: schubydoo/shared-workflows/.github/workflows/claude-review.yml@6b10fb0269119a5a84ab7cc563bfbf98ee59be17 # main
+    uses: schubydoo/shared-workflows/.github/workflows/claude-review.yml@3fc0ad0721781f418a5745a22c9438f3d0806fbd # main
     with:
+      # The api path: `claude -p` on the plan's API credits, signed in with Workload Identity
+      # Federation, posting as this repo's CI App. These four are identifiers, not credentials.
+      # Set `auth: oauth` (or drop these five lines) to go back to claude-code-action.
+      auth: api
+      anthropic-federation-rule-id: ${{ vars.ANTHROPIC_FEDERATION_RULE_ID }}
+      anthropic-organization-id: ${{ vars.ANTHROPIC_ORG_ID }}
+      anthropic-service-account-id: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+      anthropic-workspace-id: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
       output-style: simple-english:simple-english
     secrets:
       app-client-id: ${{ secrets.PODSPINE_CI_APP_CLIENT_ID }}
