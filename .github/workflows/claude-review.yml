@@ -1,12 +1,10 @@
 name: Claude review
 
-# On-demand PR review. The job lives in schubydoo/shared-workflows; this file only calls it.
-# See that repo's README for the inputs and secrets. Project rules for the review live in
-# .github/claude-review-instructions.md; the central workflow carries the posting recipe.
+# On-demand PR review: comment "@claude review" on a pull request.
+# The job and all its settings live in schubydoo/shared-workflows. This file only calls it.
 
 on:
-  # The review is requested by a comment, so this trigger is required. The hardening lives
-  # in the called workflow: an exact-command allow list, a guard hook, and a pin to the head SHA.
+  # A comment starts the review, so this trigger is required.
   issue_comment: # zizmor: ignore[dangerous-triggers]
     types: [created]
 
@@ -14,25 +12,16 @@ permissions: {}
 
 jobs:
   review:
-    # A called workflow cannot hold more permissions than the caller grants.
+    # A called workflow gets no more permissions than the caller grants.
     permissions:
       contents: read
       pull-requests: write
       issues: write
       id-token: write
       actions: read
-    uses: schubydoo/shared-workflows/.github/workflows/claude-review.yml@3fc0ad0721781f418a5745a22c9438f3d0806fbd # main
-    with:
-      # The api path: `claude -p` on the plan's API credits, signed in with Workload Identity
-      # Federation, posting as this repo's CI App. These four are identifiers, not credentials.
-      # Set `auth: oauth` (or drop these five lines) to go back to claude-code-action.
-      auth: api
-      anthropic-federation-rule-id: ${{ vars.ANTHROPIC_FEDERATION_RULE_ID }}
-      anthropic-organization-id: ${{ vars.ANTHROPIC_ORG_ID }}
-      anthropic-service-account-id: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
-      anthropic-workspace-id: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
-      output-style: simple-english:simple-english
+    uses: schubydoo/shared-workflows/.github/workflows/claude-review.yml@5694fba47f216f67c9f46b08ff8ed2a3da24f4de # main
     secrets:
       app-client-id: ${{ secrets.PODSPINE_CI_APP_CLIENT_ID }}
       app-private-key: ${{ secrets.PODSPINE_CI_APP_PRIVATE_KEY }}
+      # Only for the `auth: oauth` fallback.
       claude-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
