@@ -19,7 +19,7 @@ jobs:
       issues: write
       id-token: write
       actions: read
-    uses: schubydoo/shared-workflows/.github/workflows/claude-review.yml@5bc35fff48e6f31898052b407628ca3634f9fa1e # main
+    uses: schubydoo/shared-workflows/.github/workflows/claude-review.yml@58a0d700861a045b8b343d131f9b17fb2a8391c4 # main
     secrets:
       app-client-id: ${{ secrets.PODSPINE_CI_APP_CLIENT_ID }}
       app-private-key: ${{ secrets.PODSPINE_CI_APP_PRIVATE_KEY }}
