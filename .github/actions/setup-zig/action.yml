@@ -10,14 +10,15 @@ runs:
     - name: Download and verify Zig
       shell: bash
       env:
-        # ZIG_VERSION is bumped by Renovate (custom manager, github-releases
-        # ziglang/zig). ZIG_URL and ZIG_SHA256 are derived from it and refreshed
-        # together in-branch by the postUpgradeTask `scripts/update_zig_pin.py --fix`,
-        # so version, URL, and digest land in one commit. The URL is pinned rather
+        # ZIG_VERSION is bumped by Renovate (custom manager, forgejo-tags
+        # ziglang/zig on codeberg.org, because the GitHub repository moved to
+        # Codeberg and stopped at 0.15.1). ZIG_URL and ZIG_SHA256 are derived
+        # from it and refreshed together in-branch by the postUpgradeTask
+        # `scripts/update_zig_pin.py --fix`, so version, URL, and digest land in one commit. The URL is pinned rather
         # than templated because Zig changed its tarball filename convention at 0.14
         # (`zig-linux-x86_64-…` to `zig-x86_64-linux-…`). The `sha256sum --check`
         # below is the fail-closed backstop if the task cannot run.
-        # renovate: datasource=github-releases depName=ziglang/zig versioning=semver
+        # renovate: datasource=forgejo-tags depName=ziglang/zig registryUrl=https://codeberg.org versioning=semver
         ZIG_VERSION: "0.15.1"
         ZIG_URL: "https://ziglang.org/download/0.15.1/zig-x86_64-linux-0.15.1.tar.xz"
         ZIG_SHA256: "c61c5da6edeea14ca51ecd5e4520c6f4189ef5250383db33d01848293bfafe05"
