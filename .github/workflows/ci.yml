@@ -33,7 +33,7 @@ jobs:
       # Spell-check all text in the repository (code comments included).
       # False positives go in `typos.toml` at the repository root.
       - name: Typos
-        uses: crate-ci/typos@2611abd15acb0c2e317fb9e45855aabb8b35a414 # v1.52.1
+        uses: crate-ci/typos@276087d9a4f06398b3e04825487805e2d7375888 # v1.52.2
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           components: rustfmt, clippy
