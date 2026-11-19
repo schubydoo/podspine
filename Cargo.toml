@@ -44,7 +44,7 @@ time = { version = "0.3.47", features = ["formatting", "parsing"] } # >=0.3.47: 
 rusqlite = { version = "0.43", features = ["bundled"] }
 # ui
 maud = "0.27"
-qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+qrcode = { version = "0.15", default-features = false, features = ["svg"] }
 # tokens (v1.5)
 getrandom = "0.4"
 base64 = "0.23"
