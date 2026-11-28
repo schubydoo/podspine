@@ -2,7 +2,7 @@
 # toolchain + cargo-fuzz + the sanitizer runtimes; this file only adds the
 # source and the build script.
 # https://google.github.io/clusterfuzzlite/build-integration/rust/
-FROM gcr.io/oss-fuzz-base/base-builder-rust@sha256:8d2315aeda612bc4176bf20057a72db2a7f61cdf4a8699829c147ab5af02d234
+FROM gcr.io/oss-fuzz-base/base-builder-rust@sha256:53035c6f510f5f949828ab2cb70f551c3c37e43d94c26579228c9f1fa5fc6a1e
 
 # ffmpeg/ffprobe are NOT needed here: the harnesses fuzz pure parsers
 # (crates/chapters, crates/prober::parse_probe_json), with no subprocess.
